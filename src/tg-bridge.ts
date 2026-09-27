@@ -309,6 +309,10 @@ const capStaleCardIdx = (): number => {
   return drop.length
 }
 let QUEUE_CARD_OWNER = true
+// R1091: 允许各实例自建/自管自己的队列置顶卡（用户确认：三 bot 各置顶自己的队列/状态卡）。
+// 独立开关而非复用 QUEUE_CARD_OWNER —— QUEUE_CARD_OWNER 还承载 ownsAsk/scopeOwn 语义
+//（主实例=跟随前台 + 兜底询问），放开它会让非主实例抢答。env TG_SELF_QUEUE_PIN=0 可关。
+const ALLOW_SELF_QUEUE_PIN = process.env.TG_SELF_QUEUE_PIN !== "0"
 
 const loadFileEnv = (path?: string | null): Record<string, string> => {
   const out: Record<string, string> = {}
@@ -387,8 +391,8 @@ export const configureBot = (cfg: BotConfig, opts: { deferLoad?: boolean } = {})
           /* best-effort */
         }
         // 新实例没有任何 front 时用传入的起始会话兜底（之后完全由自己的 /use 管）
-        if (!QUEUE_CARD_OWNER && queuePin.size > 0) {
-          // 非 owner 不管理队列卡：丢掉历史遗留的卡 id，避免反复尝试编辑别人的消息
+        if (!QUEUE_CARD_OWNER && !ALLOW_SELF_QUEUE_PIN && queuePin.size > 0) {
+          // 非 owner 且未启用自建：不管理队列卡，丢掉历史遗留的卡 id（R1091 前旧行为）
           queuePin.clear()
           queuePinOn.clear()
           try {
@@ -3914,9 +3918,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
   // 队列置顶条：有积压置顶一条显示条数（只改原文不重发），排空即取消置顶并删除
   const refreshQueuePin = async (): Promise<void> => {
-    // 队列置顶卡只由一个 Bot 拥有（默认主 Bot）：Telegram 不允许编辑其它 Bot 发出的消息，
-    // 两个 Bot 各自建卡会互相 400，并在同一个 chat 里出现两条“队列”消息。
-    if (!QUEUE_CARD_OWNER) {
+    // 队列置顶卡归属策略（R1091 起）：默认只由主 Bot 建/编辑一张卡（旧行为）；
+    // 开启 TG_SELF_QUEUE_PIN 后（默认开）各实例自建/自管一张自己的卡 —— Telegram
+    // 不允许编辑其它 Bot 发出的消息，但自己的消息完全可以编辑/置顶/清卡。
+    // QUEUE_CARD_OWNER 语义不受影响（ownsAsk/scopeOwn 仍以它判主实例）。
+    if (!QUEUE_CARD_OWNER && !ALLOW_SELF_QUEUE_PIN) {
     // 非 owner 直接返回是**静默**的 → 日志里看不出"为什么这个 Bot 不建队列置顶"。
     // 队列置顶的归属是每 Bot 配置（注册表 queueCardOwner），必须能从日志确认。
     if (!queueOwnerSkipLogged) {
