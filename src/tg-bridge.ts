@@ -3800,7 +3800,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     haltedSet.add(target)
     savePersistedState()
-    return `[tg-bridge] stopped ${target.slice(0, 12)}（已中断该回合；自动循环不受影响，要停循环请用 /loop stop）`
+    // R1107：⏹ 成功后该会话进入 halted —— auto-continue 读取 halted 数组后不再驱动该会话。
+    // 这是**逐会话**暂停：共享总闸没动，其它会话/Bot 的循环不受影响；用户发新消息
+    //（pump 投递成功清除 halted）或 /loop start 可恢复该会话循环。
+    return `[tg-bridge] stopped ${target.slice(0, 12)}（已中断该回合，并暂停该会话自动循环；新消息或 /loop start 恢复，其它会话不受影响）`
   }
   const retireBar = async (chatID: string): Promise<void> => {
     await unpinPinnedBar(chatID, "retire")
@@ -4167,7 +4170,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         // 完成插入模式只认“回合确实完成”的信号。没有 30 秒无输出兜底，
         // 避免长工具/思考回合尚未结束时把队列内容插进去。
         if (injectMode === "idle") {
-          while (busyTurn.has(sid)) {
+          // R1106: busyTurn 是事件流快速信号，但事件流缺失（回合由非事件流路径发起/
+          // 上报滞后）时为空 ≠ 空闲 —— 此前 `while (busyTurn.has(sid))` 会跳过等待直接注入，
+          // 与 queueAndPump 的提示（busyTurn 空时仍查 turnActuallyIdle 兜底）矛盾：
+          // 提示「回合后自动注入」实际却立即注入。busyTurn 空时先用权威判定兜底。
+          let shouldIdleWait = busyTurn.has(sid)
+          if (!shouldIdleWait) shouldIdleWait = !(await turnActuallyIdle(sid))
+          while (shouldIdleWait) {
             if (loopStopped() && item.ts <= loopStopTimestamp()) break
             if (await turnActuallyIdle(sid)) break
             await new Promise((r) => setTimeout(r, IDLE_POLL_MS))
