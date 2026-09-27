@@ -19,6 +19,20 @@ const ROUND_PROMPT = `继续自动筛查循环（直到用户按 ESC 中断为�
 
 然后基于当前状态(上一轮修复已生效、未完成项与待验证项)进入下一轮:扫描/修复/回归/更新状态/输出本轮报告,继续下一轮,直到用户按 ESC 中断。不要重复已完成轮次的内容,不确定项标记"待验证+验证方法"。`
 
+// R1090: 连续两轮注入的最小间隔。回合完成立即注入会触发模板化重复刷屏
+//（用户反馈「bot3 有很多重复的发送」: 每回合 701+495+tool 固定 pattern）。
+const MIN_ROUND_MS = Number(process.env.AC_MIN_ROUND_MS ?? 90_000)
+const throttleLogAt = new Map<string, number>()
+// R1092: 已判定"仅思考(reasoning)无文本/工具产出"的消息集合 —— 不注入、不计空转
+//（否则纯思考回合会被 refetch 判为"真实产出"注入、或落入 empty-stall 被误熔断[R1065 回归]）。
+const reasoningOnlyMsgs = new Set<string>()
+const noteReasoningOnly = (msgId: string): void => {
+  reasoningOnlyMsgs.add(msgId)
+  if (reasoningOnlyMsgs.size > 500) {
+    const first = reasoningOnlyMsgs.values().next()
+    if (!first.done) reasoningOnlyMsgs.delete(first.value)
+  }
+}
 const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，请忽略该错误，直接继续既定循环规则进入下一轮（直到用户按 ESC 中断）：
 本轮的循环规则与你上次收到的一致，请先复述(a)用户上一次的真实话/指令(若不可辨识注明"自动注入,无新指令")与(b)循环规则，然后扫描/修复/回归/更新 REDACTED_ROOT/.opencode/loop-state.md/输出本轮报告。不要重复已完成轮次的内容。
 
@@ -294,6 +308,17 @@ const hasNonTextWork = (m: any): boolean => {
     const t = String(p?.type ?? "")
     if (t === "text") return String(p?.text ?? "").trim().length > 0
     return t === "tool" || t === "reasoning" || t === "step-finish" || t === "step_finish"
+  })
+}
+// R1092: 只有【工具/步骤产出】才算"实质性干活"；reasoning 纯思考不算。
+// hasNonTextWork 把 reasoning 算进去是为了豁免 empty-stall（防 R1065 熔断误伤），
+// 但不能因此把"还在想的回合"当成完成注入循环文本。
+const hasRealToolWork = (m: any): boolean => {
+  const parts = m?.parts
+  if (!Array.isArray(parts)) return false
+  return parts.some((p: any) => {
+    const t = String(p?.type ?? "")
+    return t === "tool" || t === "step-finish" || t === "step_finish"
   })
 }
 
@@ -1205,9 +1230,22 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               // reasoning 有实质内容 = 模型在思考（回合被截断），不是空转。
               // 此前只看 text/tool，会把"只产出思考"的回合判成空转 → 熔断误伤
               // → 表现为"另一个会话总是不循环"。
-              if (hText > 0 || hTools > 0 || hReason >= 200) {
+              // R1092: 只有【文本/工具】产出才算"回合结束有输出"；纯思考(reasoning)不算——
+              // 用户反馈「AI 没有输出时循环文本仍被注入」→ 仅思考的回合不注入，等待文本/工具产出。
+              if (hText > 0 || hTools > 0) {
                 // 有真实产出：不是空转，清计数并按正常节奏续跑
                 if (!(await injectAllowed(sessionID, msg, "round:refetch"))) return
+                // R1092: refetch 注入也遵守 R1090 最小间隔（此前绕过节流）
+                {
+                  const __acLast = lastRoundAt.get(sessionID) ?? 0
+                  if (__acLast > 0 && Date.now() - __acLast < MIN_ROUND_MS) {
+                    if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+                      throttleLogAt.set(sessionID, Date.now())
+                      await log('info', `auto-continue: round-inject throttled (refetch, session=${sanitizeLog(sessionID).slice(0, 12)}, sinceLast=${Math.round((Date.now() - __acLast) / 1000)}s)`)
+                    }
+                    return
+                  }
+                }
                 emptyStreak.delete(sessionID)
                 pending.delete(msg.id)
                 giveupCount.delete(sessionID)
@@ -1216,6 +1254,16 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
                 settle(msg)
                 const rr2 = await inject(sessionID, msg, ROUND_PROMPT, "round")
                 if (rr2 !== "ok") decided.delete(msg.id)
+                return
+              }
+              if (hReason >= 200) {
+                // 纯思考无产出：AI 还没主动结束回合 → 不注入、不熔断、等待下拍
+                noteReasoningOnly(String(msg.id))
+                pending.delete(msg.id)
+                if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+                  throttleLogAt.set(sessionID, Date.now())
+                  await log('info', `auto-continue: eval session=${sanitizeLog(sessionID).slice(0, 12)} msg=${String(msg.id).slice(0, 14)} -> reasoning-only(${hReason}字, 无文本/工具), 不注入,等待真实产出`)
+                }
                 return
               }
             } else {
@@ -1282,7 +1330,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         // 验尸 00:34:59：曾把首 token 到达 3 秒后的前台直播消息当空转掐掉（Step interrupted 误伤）。
         const completedTs = Number((msg as any)?.time?.completed ?? 0)
         const workedAnyway = hasNonTextWork(msg)
-        if (attempts >= 2 && completedTs > 0 && !workedAnyway) {
+        if (attempts >= 2 && completedTs > 0 && !workedAnyway && !reasoningOnlyMsgs.has(String(msg.id))) {
           const n = (emptyStreak.get(sessionID) ?? 0) + 1
           emptyStreak.set(sessionID, n)
           if (n >= 5) {
@@ -1298,6 +1346,28 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
         if (workedAnyway) {
           if (!(await injectAllowed(sessionID, msg, "round:workedAnyway"))) return
+          // R1092: 只有 reasoning 没有工具/文本 = 还在思考/被截断，不算"主动结束干活"，
+          // 不注入（用户反馈「AI 没有输出时循环文本仍被注入」）；也不计空转（R1065 豁免）。
+          if (!hasRealToolWork(msg) && len === 0) {
+            noteReasoningOnly(String(msg.id))
+            pending.delete(msg.id)
+            if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+              throttleLogAt.set(sessionID, Date.now())
+              await log('info', `auto-continue: eval session=${sanitizeLog(sessionID).slice(0, 12)} msg=${String(msg.id).slice(0, 14)} -> reasoning-only(workedAnyway:无工具产出), 不注入`)
+            }
+            return
+          }
+          // R1092: workedAnyway 注入也遵守 R1090 最小间隔（此前绕过节流）
+          {
+            const __acLast = lastRoundAt.get(sessionID) ?? 0
+            if (__acLast > 0 && Date.now() - __acLast < MIN_ROUND_MS) {
+              if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+                throttleLogAt.set(sessionID, Date.now())
+                await log('info', `auto-continue: round-inject throttled (workedAnyway, session=${sanitizeLog(sessionID).slice(0, 12)}, sinceLast=${Math.round((Date.now() - __acLast) / 1000)}s)`)
+              }
+              return
+            }
+          }
           // 有工具产出 = 在干活：清空空转计数，按正常节奏续跑（不必等 10s+ 重试）
           emptyStreak.delete(sessionID)
           pending.delete(msg.id)
@@ -1315,6 +1385,19 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         return
       }
 
+      // R1090: 注入节流 —— 距上次注入 < MIN_ROUND_MS 时静默跳过本轮,
+      // 由 interval(60s) 下拍再评估(区间节流, 不改变 skipState/熔断语义).
+      {
+        const acLast = lastRoundAt.get(sessionID) ?? 0
+        const acNow = Date.now()
+        if (acLast > 0 && acNow - acLast < MIN_ROUND_MS) {
+          if (acNow - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+            throttleLogAt.set(sessionID, acNow)
+            await log('info', `auto-continue: round-inject throttled (session=${sanitizeLog(sessionID).slice(0, 12)}, sinceLast=${Math.round((acNow - acLast) / 1000)}s < ${MIN_ROUND_MS / 1000}s)`)
+          }
+          return
+        }
+      }
       if (!(await injectAllowed(sessionID, msg, "round:normal"))) return
       emptyStreak.delete(sessionID)
       await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
