@@ -250,6 +250,27 @@ const currentLoopTargets = (): string[] => {
 }
 const currentLoopTarget = (): string => currentLoopTargets()[0] ?? ""
 const isLoopTarget = (sessionID: string): boolean => currentLoopTargets().includes(sessionID)
+// R1107：用户主动中断（⏹ doStop 成功）的会话。halted 逐会话持久化在各 Bot 状态文件的
+// halted 数组里（tg-bridge 侧 doStop → savePersistedState）。auto-continue 必须尊重它，
+// 否则"用户主动终止后循环仍继续"。不清共享总闸 → 其它会话/Bot 不受影响；用户新消息
+//（pump 投递成功）或 /loop start 会清除 halted。2s 缓存避免每次 eval 都重读文件。
+let haltedSessionsCache = { ts: 0, sids: [] as string[] }
+const haltedSessions = (): string[] => {
+  const now = Date.now()
+  if (now - haltedSessionsCache.ts < 2_000) return haltedSessionsCache.sids
+  const out: string[] = []
+  for (const p of [TG_STATE_PATH, ...EXTRA_TARGET_PATHS]) {
+    try {
+      const j = JSON.parse(readFileSync(p, "utf8")) as any
+      const hl = Array.isArray(j?.halted) ? (j.halted as unknown[]) : []
+      for (const s of hl) if (typeof s === "string" && s.startsWith("ses_") && !out.includes(s)) out.push(s)
+    } catch {
+      /* 个别状态文件读不到：跳过该文件 */
+    }
+  }
+  haltedSessionsCache = { ts: now, sids: out }
+  return out
+}
 // 主实例的 front（多实例护栏用）。备用实例若与主实例指向同一会话，两套循环会同时
 // 注入同一个会话 -> 轮次翻倍/互相打断，因此这种情况备用实例直接放弃注入。
 const primaryFront = (): string => {
@@ -864,6 +885,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   // 只能靠猜（本次停摆 5 小时就是这么查不出来的）。现在按 60s 节流记一行。
   let skipTargetLogAt = 0
   let skipLeaseLogAt = 0
+  let skipHaltedLogAt = 0
   // 挂起防护：宿主 HTTP 调用（session.messages / session.prompt）**可能永不 settle**。
   // 一次挂起会把该会话的评估链永久卡死（见 evaluateQueued 的串行链），而且完全静默。
   const HOST_CALL_TIMEOUT_MS = 25_000
@@ -891,6 +913,15 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             "info",
             `auto-continue: eval skipped (not loop target: session=${sanitizeLog(sessionID).slice(0, 14)} target=${sanitizeLog(currentLoopTarget()).slice(0, 14) || "(none)"})`,
           )
+        }
+        return
+      }
+      // R1107：用户 ⏹ 主动终止的会话不驱动 —— 否则"主动终止后自动循环仍进行"。
+      // halted 由 doStop 写各 Bot 状态文件；用户新消息或 /loop start 清除后自然恢复。
+      if (haltedSessions().includes(sessionID)) {
+        if (Date.now() - skipHaltedLogAt > 60_000) {
+          skipHaltedLogAt = Date.now()
+          await log("info", `auto-continue: eval skipped (user-halted: session=${sanitizeLog(sessionID).slice(0, 14)})`)
         }
         return
       }
