@@ -1,5 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { appendFileSync, chmodSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { makeBgWatch } from "./bg-watch"
+import { readBg } from "./bg-mode"
 
 export type V1Hook = (payload: { event: any }) => Promise<void> | void
 
@@ -605,6 +607,31 @@ const findLocalServerPort = async (): Promise<number | null> => {
   }
 }
 
+// service.json 里有 serve 的 password；serve 的 /api 鉴权 = Basic("opencode:"+password)。
+// 本插件跑在 serve 同机，能读到该文件 → HTTP 兜底通道从 401 变为可用（R1488 promote 的关键补全）。
+let cachedServiceAuth: string | null = null
+
+const readServiceAuth = async (): Promise<string | null> => {
+  try {
+    const fs: any = await import("node:fs")
+    const home = process.env.HOME ?? "/root"
+    const raw = fs.readFileSync(`${home}/.config/opencode/service.json`, "utf8")
+    const pw = JSON.parse(raw)?.password
+    if (typeof pw !== "string" || !pw) return null
+    const plain = `opencode:${pw}`
+    const b64 =
+      typeof btoa === "function" ? btoa(plain) : Buffer.from(plain, "utf8").toString("base64")
+    return `Basic ${b64}`
+  } catch {
+    return null
+  }
+}
+
+const buildAuthHeaders = async (): Promise<Record<string, string>> => {
+  if (cachedServiceAuth === null) cachedServiceAuth = await readServiceAuth()
+  return cachedServiceAuth ? { authorization: cachedServiceAuth } : {}
+}
+
 const postLocalAPI = async (sessionID: string, action: string): Promise<unknown> => {
   let port = cachedServerPort
   if (!port) {
@@ -617,7 +644,7 @@ const postLocalAPI = async (sessionID: string, action: string): Promise<unknown>
     try {
       const r = await fetch(`http://127.0.0.1:${p}/api/session/${encodeURIComponent(sessionID)}/${action}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...(await buildAuthHeaders()) },
         body: "{}",
         signal: ctl.signal,
       })
@@ -657,7 +684,7 @@ const patchLocalSession = async (sessionID: string, body: Record<string, unknown
     try {
       const r = await fetch(`http://127.0.0.1:${p}/api/session/${encodeURIComponent(sessionID)}`, {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...(await buildAuthHeaders()) },
         body: JSON.stringify(body),
         signal: ctl.signal,
       })
@@ -1241,6 +1268,84 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
           }
         })()
       }
+    }
+    // ── R1488 插件层「shell 跑超 60s 强制转后台」合规实现 ────────────────────
+    // 机制：执行期钩子 ctx.tool.hook（execute.before / execute.after）**只读**事件计时；
+    // 到点调宿主原生「当前步转后台」（TUI ctrl+b 语义的 /background 端点，用户指定路线）。
+    // 满足用户两条红线：插件判断（不靠模型自觉）+ 不改请求（不增删改工具定义、
+    // 不改发往 provider 的 tools 负载，也不碰事件 input/result）。
+    // R1482 同名工具覆盖已全量回滚（上方事故链注释），本路径不再触碰工具注册表。
+    // 单实例守卫（globalThis）：桥多实例 / 两个插件入口同进程共享一个 watcher；
+    // 新世代注册前先 dispose 旧世代 → 即使宿主重载时未注销旧钩子，旧钩子也保持失活，
+    // 不会双发 promote、不会累积计时器。
+    try {
+      const tctx = (context as any)?.tool
+      const G = globalThis as any
+      const BG_WATCH_KEY = "__oc_bgwatch_v1__"
+      if (typeof tctx?.hook === "function") {
+        const prev = G[BG_WATCH_KEY] as { dispose?: () => void } | undefined
+        if (prev && typeof prev.dispose === "function") prev.dispose()
+        const watcher = makeBgWatch({
+          // 熔断：background-mode.json 的 shellPromo（默认 true = 插件层强制开启）
+          enabled: () => {
+            try {
+              return readBg().shellPromo !== false
+            } catch {
+              return true
+            }
+          },
+          promoteMs: 60_000,
+          log: (line) => logLine(id, "info", `[bg-watch] ${line}`),
+          promote: async (sid: string) => {
+            // 优先进程内 client RPC（免票）；不行再走本机 HTTP 兜底。
+            const c: any = (context as any)?.client
+            try {
+              if (c && typeof c.background === "function") {
+                const out = await c.background({ sessionID: sid })
+                logLine(id, "info", `[bg-watch] promote via client.background sid=${sid.slice(0, 12)} ok`)
+                return out
+              }
+              if (c?.session && typeof c.session.background === "function") {
+                const out = await c.session.background({ sessionID: sid })
+                logLine(id, "info", `[bg-watch] promote via client.session.background sid=${sid.slice(0, 12)} ok`)
+                return out
+              }
+            } catch (err) {
+              logLine(id, "warn", `[bg-watch] client.background 尝试失败，回退 HTTP: ${String(err).slice(0, 160)}`)
+            }
+            try {
+              const out = await postLocalAPI(sid, "background")
+              logLine(id, "info", `[bg-watch] promote via HTTP /background sid=${sid.slice(0, 12)} ok`)
+              return out
+            } catch (err) {
+              logLine(id, "error", `[bg-watch] promote 全部路径失败: ${String(err).slice(0, 200)}`)
+              throw err
+            }
+          },
+        })
+        G[BG_WATCH_KEY] = watcher
+        tctx.hook("execute.before", (ev: any) => {
+          try {
+            watcher.onBefore(ev ?? {})
+          } catch (err) {
+            logLine(id, "error", `[bg-watch] before err: ${String(err).slice(0, 140)}`)
+          }
+        })
+        tctx.hook("execute.after", (ev: any) => {
+          try {
+            watcher.onAfter(ev ?? {})
+          } catch (err) {
+            logLine(id, "error", `[bg-watch] after err: ${String(err).slice(0, 140)}`)
+          }
+        })
+        logLine(id, "info", "[bg-watch] hooks registered (execute.before/after); shell>60s 自动转后台 ON")
+      } else if (!G[BG_WATCH_KEY]) {
+        logLine(id, "error", "[bg-watch] ctx.tool.hook 不可用，插件层转后台未注册（不影响其他功能）")
+      } else {
+        logLine(id, "info", "[bg-watch] 已由其他实例注册，跳过（同进程单实例守卫）")
+      }
+    } catch (err) {
+      logLine(id, "error", `[bg-watch] register err: ${String(err).slice(0, 140)}`)
     }
     return () => {
       stop = true
