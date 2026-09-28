@@ -896,6 +896,22 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
       } catch (err) {
         logLine(id, "error", `ctx.session capability dump failed: ${String(err).slice(0, 160)}`)
       }
+      // R1481 的 ctx.tool 自省探针已整体移除。
+      //
+      // 为什么必须删（不能只加"一次性"守卫）：
+      //   那段探针用 tctx.transform(cb) 注册了一个**常驻**回调，回调里又调 tctx.list()。
+      //   宿主在每次工具 transform 时都会跑该回调，而 list() 会再次进入 transform 管线，
+      //   于是 transform → list() → transform → … 无限递归，最终抛
+      //   RangeError: Maximum call stack size exceeded。
+      //   宿主把 transform 抛错直接判定为插件故障 → 禁用该插件及其全部依赖：
+      //   一次 auto-continue-v2 的探针，连带 opencode.tools、opencode.browser、
+      //   opencode.tool.{edit,glob,grep,patch,question,read,shell,skill,subagent,
+      //   webfetch,websearch,write} 共 15 个插件一起消失（界面上显示为"17 个插件错误"）。
+      //   代价不是日志噪音，而是**整个工具面被摘掉**。
+      //
+      // 教训：setup 里注册的回调是**长期生效**的，不能当作"一次性探针"随手注册；
+      //       任何注册给宿主的回调，一旦内部会再触发宿主管线，就是无限递归。
+      //       确实要摸底就读 ctx 上的注册表属性（如 ed.get），不要走会重入的 API。
     }
     // ── 宿主原生能力清单（只记一次，零副作用）────────────────────────────
     // 为什么必须在这里、而不是在 tg-bridge：tg-bridge 拿到的是**我写的 compat shim**，
@@ -1171,13 +1187,29 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
         },
       },
     }
-    let result: { event?: V1Hook } | undefined
+    let result: { event?: V1Hook; tool?: Record<string, any> } | undefined
     try {
       result = (await run(client)) ?? {}
     } catch (err) {
       logLine(id, "error", `setup crashed: ${String(err).slice(0, 300)}`)
       result = {}
     }
+    // R1483: 同名覆盖内置 shell 的注册已回滚。
+    // 实测（R1482）：editor.add({name:"shell"}) 会顶掉内置 shell，但注册项不被运行时接受，
+    // 结果该名字下无任何可用工具（宿主报 No tool named "shell" is currently available），
+    // 自身 shell 能力被切断；且该改写会变更发往 provider 的 tools 定义。
+    // 按用户指令「不要修改发送到服务器的请求」，此处不做任何 tool 覆盖注册。
+    // R1487 回滚（用户指令：「就是你改的，快改回去」）：本适配器**完全不碰 ctx.tool**
+    //（不 add、不 remove、不 transform），也不再消费 run() 返回的 tool 槽位。
+    // 事故链（保留记录，避免重犯）：
+    //  1) tg-bridge 的 Hooks.tool.shell 在此被注册为同名插件工具 → 顶掉内置 shell，
+    //     宿主报 No tool named "shell" is currently available。
+    //  2) 同一注册改写了发往 provider 的 tools 定义 → Console 免费层判定请求并非
+    //     「来自 OpenCode 内部」，两个会话持续报
+    //     FreeTierError: OpenCode's free tier can only be used from within OpenCode。
+    //  3) 用 editor.remove("shell") 补救无效：它作用在有效工具列表上，连内置 shell 一起删，
+    //     表现为 shell 时好时坏。
+    //  4) 插件 transform 回调留在宿主进程内不可撤销，源码回滚后仍需宿主进程重启才彻底干净。
     const hook = result.event
     if (hook) {
       const iter = (context.event as any).subscribe?.()

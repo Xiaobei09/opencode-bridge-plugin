@@ -5,6 +5,8 @@ import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailabl
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 // 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
 import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG } from "./bg-mode"
+// 插件层强制：shell 跑超 1 分钟由插件转后台（Hooks.tool 同名覆盖内置 shell）。
+import { makeShellPromoTool } from "./shell-promo"
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
 import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
 
@@ -7388,6 +7390,12 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   }
 
   return {
+    // R1487 回滚（用户指令：「就是你改的，快改回去」+「不要修改发送到服务器的请求」）：
+    // 原先这里的 `tool: { shell: makeShellPromoTool(...) }` 走 V1 Hooks.tool 槽位，
+    // 经 v2Bridge 会被注册成同名插件工具 → ①顶掉内置 shell（宿主报 No tool named "shell"），
+    // ②改写发往 provider 的 tools 定义 → Console 免费层判定请求非「来自 OpenCode 内部」，
+    //   报 FreeTierError: OpenCode's free tier can only be used from within OpenCode。
+    // 该机制整体作废，不再返回任何 tool 覆盖。实现保留在 v2lib/shell-promo.ts（未接线）。
     event: async ({ event }) => {
       // Same singleton as poll(): stale stacked instances stay subscribed to
       // framework events after hot-reload; must not push. Silent (hot path).
