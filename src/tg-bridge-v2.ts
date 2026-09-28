@@ -20,8 +20,7 @@
  *   specifier 带 v2lib 源文件 mtime：改源码 → 新模块实例 → 新实例用同一个 Bot
  *   的代号把旧实例判成过期并接管，旧实例自行退出（generation gating）。
  */
-import { readFileSync, statSync, appendFileSync } from "node:fs"
-import { v2Bridge } from "REDACTED_ROOT/.opencode/v2lib/_v2compat.ts"
+import { readFileSync, statSync, appendFileSync, cpSync, rmSync, readdirSync, mkdirSync } from "node:fs"
 
 /** 诊断写文件：插件的 console.error 会进 server 的 stderr（socket），日志里看不到 */
 const DIAG_PATH = "/tmp/opencode/tg-bots-instance.log"
@@ -36,6 +35,61 @@ const diag = (msg: string): void => {
 
 const REGISTRY_PATH = process.env.TG_BOTS_PATH ?? "REDACTED_ROOT/.config/opencode/tg-bots.json"
 const BRIDGE_SRC = "REDACTED_ROOT/.opencode/v2lib/tg-bridge.ts"
+const V2LIB_DIR = "REDACTED_ROOT/.opencode/v2lib"
+/** 快照根目录：必须在项目树内，裸包（@opencode-ai/*）靠向上找 node_modules 解析。 */
+const LIVE_ROOT = "REDACTED_ROOT/.opencode/.v2lib-live"
+
+/** 快照总数上限 3 份（**含本次**）：每份 ~536K，不清会随装载次数无限涨。 */
+const gcLive = (tag: string, keepName: string): void => {
+  try {
+    const dirs = readdirSync(LIVE_ROOT)
+      .filter((n) => n.startsWith(`${tag}-`) && n !== keepName)
+      .map((n) => {
+        const p = `${LIVE_ROOT}/${n}`
+        return { p, m: statSync(p).mtimeMs }
+      })
+      .sort((a, b) => b.m - a.m)
+    // dirs 已排除本次 → slice(2) 才是"总计 3 份（含本次）"。
+    // 曾写成 slice(3) = 实际留 4 份：注释说 3、行为是 4，注释和行为不一致比没注释更坏。
+    for (const d of dirs.slice(2)) {
+      try {
+        rmSync(d.p, { recursive: true, force: true })
+      } catch {
+        /* best-effort */
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * 把 v2lib 整目录快照到全新路径再 import。**热重载能生效的前提**：只给主模块加
+ * cache-bust 不够 —— 共享模块的相对 import 会解析成无 query 的旧 URL 命中缓存，
+ * 于是新增导出在链接期就报「Export named ... not found」（真实事故 2026-09-28 02:33:43）。
+ * 复制失败退回真实目录：会退回吃缓存的旧行为，但绝不能让三个 Bot 一起起不来。
+ */
+const snapshotV2lib = (tag: string): string => {
+  const name = `${tag}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  const dir = `${LIVE_ROOT}/${name}`
+  try {
+    // 只确保根目录存在，**绝不能 rm 整个根**：两个插件可能同一拍重载，会互删快照。
+    mkdirSync(LIVE_ROOT, { recursive: true })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const probe = `${V2LIB_DIR}/tg-bridge.ts`
+      const before = statSync(probe).mtimeMs
+      cpSync(V2LIB_DIR, dir, { recursive: true })
+      // 撕裂快照检查：复制期间源文件被改 → 这份快照半新半旧，删掉重来
+      if (before === statSync(probe).mtimeMs) break
+      rmSync(dir, { recursive: true, force: true })
+    }
+    gcLive(tag, name)
+    return dir
+  } catch (err) {
+    diag(`[tg-bridge] snapshot failed, fallback to live tree: ${String(err).slice(0, 160)}`)
+    return V2LIB_DIR
+  }
+}
 const COMPAT_SRC = "REDACTED_ROOT/.opencode/v2lib/_v2compat.ts"
 
 type BotSpec = {
@@ -168,9 +222,14 @@ export default {
   setup: async (context: any) => {
     const disposers: Array<(() => void) | void> = []
     const version = srcVersion()
+    // 一次 setup 快照一份，三个 Bot 共用；仍按 ?bot= 分成三个模块实例（见上方注释）。
+    const live = snapshotV2lib("bridge")
+    // 不带 query：与 v2lib 内部 "./_v2compat" 同一 URL，避免 _v2compat 出现两个实例
+    // （它有模块级 Map/Set/db 句柄，劈成两半会让 token 统计与 db 缓存各算各的）。
+    const { v2Bridge } = (await import(`${live}/_v2compat.ts`)) as { v2Bridge: (...a: any[]) => any }
     for (const [idx, bot] of bots.entries()) {
       try {
-        const mod: any = await import(`${BRIDGE_SRC}?bot=${bot.id}&v=${version}`)
+        const mod: any = await import(`${live}/tg-bridge.ts?bot=${bot.id}&v=${version}`)
         const configure = mod?.configureBot ?? mod?.default?.configureBot
         const factory = mod?.TgBridgePlugin ?? mod?.default?.TgBridgePlugin
         if (typeof factory !== "function" || typeof configure !== "function") {
@@ -545,3 +604,15 @@ export default {
 // reload(content) 20260927T054815Z [tg-bridge-v2.ts]
 
 // reload(content) 20260927T060922Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T015159Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T015315Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T015534Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T023343Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T024546Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T030022Z [tg-bridge-v2.ts]

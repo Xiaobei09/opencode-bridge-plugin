@@ -2,6 +2,8 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts } from "./_v2compat"
+// 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
+import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl } from "./loop-guard"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
@@ -17,7 +19,12 @@ const ROUND_PROMPT = `继续自动筛查循环（直到用户按 ESC 中断为�
 (a) 复述"用户上一次的真实话/指令"(即最近一条非自动注入的用户消息要点;若不可辨识则注明"自动注入,无新指令");
 (b) 复述"循环规则"(自动续跑直至用户按 ESC 中断;9 个维度轮换扫描;每轮需更新 REDACTED_ROOT/.opencode/loop-state.md;输出 [ROUND n]+[STATUS: CONTINUE/STOP])。
 
-然后基于当前状态(上一轮修复已生效、未完成项与待验证项)进入下一轮:扫描/修复/回归/更新状态/输出本轮报告,继续下一轮,直到用户按 ESC 中断。不要重复已完成轮次的内容,不确定项标记"待验证+验证方法"。`
+然后基于当前状态(上一轮修复已生效、未完成项与待验证项)进入下一轮:扫描/修复/回归/更新状态/输出本轮报告,继续下一轮,直到用户按 ESC 中断。不要重复已完成轮次的内容,不确定项标记"待验证+验证方法"。
+
+【自动停止守卫】以下两种情况**不要**自行续跑，改为宣告（标记只作**独占一行**写在报告末尾；行文或代码块里提及无效）：
+1) 检测到真问题（需要用户决策、或你无法自行解决的阻塞）：末行写 [SIGNAL:PROBLEM: 原因]；
+2) 需要网页搜索（本宿主默认禁止联网搜索）：先在正文写清要查什么，末行写 [SIGNAL:WEBSEARCH: 要查什么]。
+宣告后守卫会自动停止循环并等你在 TG 授权或决策；处理完用 /loop start（或菜单「继续循环」）恢复。`
 
 // R1090: 连续两轮注入的最小间隔。回合完成立即注入会触发模板化重复刷屏
 //（用户反馈「bot3 有很多重复的发送」: 每回合 701+495+tool 固定 pattern）。
@@ -38,6 +45,11 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 
 如果上一轮的错误仍未消除(如 provider 网络错误)，本轮请把错误症状与重试判断写入本轮报告后仍输出 [STATUS: CONTINUE]，继续下一轮；不要因同一错误反复空转。`
 
+// 自动停止守卫：记录「这条消息已因守卫停过一次」。
+// 为什么必须记：恢复循环靠的是同一条最后助手消息判定，一旦 /loop start 清闸，
+// eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
+// 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
+const guardTripped = new Map<string, string>()
 const VERSION = "r1049-loopboth"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
@@ -103,7 +115,10 @@ export const injectGateVerdict = (
   return { go: false, why: `in-flight-${ageS}s` }
 }
 
-const LOOP_PAUSE_RE = /\[LOOP\s*:\s*PAUSE(?::([^\]]+))?\]/i
+// 旧判据曾是子串正则 LOOP_PAUSE_RE，**报告里提及标记就会停机**（真实事故：
+// 2026-09-28 01:57:32，报告里写「与 `[LOOP:PAUSE]` 同一条恢复路径」就把循环停了）。
+// 现在判据在 loop-guard.ts（loopPauseDecl）：独占一行 + 围栏/行内代码挖空 —— 靠判据，
+// 不靠"写报告时记得拆写"的纪律。
 const readCtl = (): any => {
   for (const p of [LOOP_CTL_PATH, LOOP_CTL_LEGACY]) {
     try {
@@ -1173,11 +1188,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
 
       const len = fullText.length
 
-      // AI 自主暂停：助手明确输出 [LOOP: PAUSE[: 原因]] → 与用户暂停同等效力并持久化。
-      // 注意：文档/报告里提及该标记时必须拆写，原文出现即触发。
-      const pm = fullText.match(LOOP_PAUSE_RE)
-      if (pm) {
-        const reason = (pm[1] ?? "").trim().slice(0, 120)
+      // AI 自主暂停：助手**独占一行**宣告 [LOOP: PAUSE[: 原因]] → 与用户暂停同等效力并持久化。
+      // 文档/报告里提及该标记不再误触发（见 loop-guard.ts 的 loopPauseDecl）。
+      const pm = loopPauseDecl(fullText)
+      if (pm.declared) {
+        const reason = pm.reason
         writeCtlStopped(true, "agent", reason)
         settle(msg)
         skipState.set(sessionID, { lastId: newestId, reason: "agent-paused" })
@@ -1229,6 +1244,38 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           return
         }
         return
+      }
+
+      // ── 自动停止守卫（用户 2026-09-28 新增）──────────────────────────────
+      // 检测到「问题」（助手自报 [SIGNAL:PROBLEM] / 本轮宣告 [STATUS: STOP]）或
+      // 「网页搜索请求」（助手自报 [SIGNAL:WEBSEARCH] / 本回合真调了搜索工具）时，
+      // **不再注入下一轮**，改为写停机总闸（by=auto-guard）。恢复路径与 [LOOP:PAUSE]/
+      // /stop 完全同一条：/loop start（菜单「继续循环」）清闸即续跑。
+      //
+      // 位置很讲究：
+      //  · 放在**错误处理之后** —— provider 瞬时错误（ECONNRESET 等）走既有 RECOVER，
+      //    不受守卫影响（用户既有规则：可恢复错误不停机，只记症状继续跑）。
+      //  · 放在**注入之前** —— 守卫的全部意义就是「这一轮不续跑」。
+      //  · 判据只认**独占行**的标记（loop-guard 里有反例护栏）：报告里复述循环规则
+      //    必然出现 [STATUS: CONTINUE/STOP] 的字面文本，子串匹配会让循环一装即死。
+      {
+        const gcfg = readGuard()
+        if (gcfg.problem || gcfg.websearch) {
+          const gsig = detectGuardSignals(fullText, lastAssistant.parts)
+          const gv = guardVerdict(gcfg, gsig)
+          if (gv.trip && guardTripped.get(sessionID) !== msg.id) {
+            guardTripped.set(sessionID, msg.id)
+            writeCtlStopped(true, "auto-guard", gv.reason)
+            noteGuardTrip(gv.kind, gv.reason, sessionID)
+            settle(msg)
+            skipState.set(sessionID, { lastId: newestId, reason: "auto-guard" })
+            await log(
+              "info",
+              `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} -> SKIP(auto-guard ${gv.kind}: ${sanitizeLog(gv.reason).slice(0, 120)}; /loop start or menu resume to continue)`,
+            )
+            return
+          }
+        }
       }
 
       if (len === 0) {

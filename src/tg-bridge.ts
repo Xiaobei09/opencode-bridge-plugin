@@ -1,6 +1,12 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
 import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow } from "./_v2compat"
+// 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
+import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
+// 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
+import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG } from "./bg-mode"
+// 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
+import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
 
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
@@ -221,7 +227,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1054-scopeown"
+const VERSION = "r1055-bgmode"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1883,17 +1889,31 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   help: "/help",
   selfmute: "/selfmute",
   healcards: "/healcards",
+  // 自动停止守卫：两个开关分列（一个只管问题、一个只管搜索），详情单独一条。
+  guardprob: "/autoguard problem toggle",
+  guardweb: "/autoguard web toggle",
+  guardinfo: "/autoguard",
+  // 转后台：裸命令=立刻提升当前阻塞子代理；auto=整体自动配置；status=如实回显能力与原因。
+  bg: "/background",
+  bgauto: "/background auto toggle",
+  bgstatus: "/background status",
   loud: "/loud",
   quiet: "/quiet",
 }
 
 export const buildMenuKeyboard = (
   view: string,
-  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean } = {},
+  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean } = {},
 ): unknown[][] => {
 const paused = Boolean(opts.paused)
 const stopped = Boolean(opts.stopped)
 const selfmute = Boolean(opts.selfmute)
+// 守卫开关是运行期状态（同 paused/stopped 由调用方传入）。**缺省按开**显示：
+// 装守卫的目的是停下来问人，默认显示成「关」会让人以为功能没装。
+const gProblem = opts.guard ? opts.guard.problem !== false : DEFAULT_GUARD.problem
+const gWeb = opts.guard ? opts.guard.websearch !== false : DEFAULT_GUARD.websearch
+// 整体自动转后台开关（默认关：它是行为改变，且实验开关没开时调用注定失败）。
+const bgAutoOn = Boolean(opts.bgAuto)
 // 注意：inline_keyboard 的一"行"必须是**扁平的按钮数组**。
 // 之前写成 [[btn],[btn]]（行里再套数组）→ Telegram 直接 400，菜单发不出去。
 const b = (label: string, data: string): unknown => ({ text: label, callback_data: data })
@@ -1919,6 +1939,10 @@ if (view === "loop") {
   return [
     [b("⏹ 停止当前回合", "ma:stop"), b("🔁 重试上一条", "ma:retry")],
     [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop")],
+    [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
+    [b("🛡 守卫详情/最近触发", "ma:guardinfo")],
+    [b("🧵 转后台", "ma:bg"), b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto")],
+    [b("ℹ️ 后台能力状态", "ma:bgstatus")],
     [b("📋 查看队列", "ma:queue"), b("🚀 立即补发（外发积压+继续注入）", "ma:flush")],
     [b("⬅️ 返回", "m:root")],
   ]
@@ -4593,6 +4617,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /undo — 同上（撤回上一回合）",
     "· /retry — 重发上一次注入（回复机器人消息发“重来”同效）",
     "· /loop [start|stop|status] — 自动循环开关（默认一直跑，用户 /loop stop 才停）",
+    "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
+    "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
     "· /compact — 手动触发压缩（本宿主构建不可用时改用 /migrate）",
@@ -4774,8 +4800,19 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     ].join("\n")
   }
   // 薄包装：把运行期状态喂给模块级的真定义（测试直接调 buildMenuKeyboard）
+  // 后台提升的最近尝试时间（会话级，用于整体自动配置的冷却）与最近一次"为什么没动"的日志节流。
+  const bgLastAttempt = new Map<string, number>()
+  let bgLastWhyLogAt = 0
   const menuKeyboard = (view: string): unknown[][] =>
-    buildMenuKeyboard(view, { paused: pausedMode, stopped: loopStopped(), selfmute: selfMute })
+    // 守卫开关每次渲染现读（文件很小、只在开菜单时读），不做缓存：
+    // 缓存会让刚点完按钮再开菜单看到旧状态，正是「改了没生效」的观感来源。
+    buildMenuKeyboard(view, {
+      paused: pausedMode,
+      stopped: loopStopped(),
+      selfmute: selfMute,
+      guard: readGuard(),
+      bgAuto: readBg().enabled,
+    })
   const handleCallback = async (cq: any): Promise<void> => {
     try {
     const data = String(cq?.data ?? "")
@@ -5678,6 +5715,88 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       await reply(chatID, lines.join("\n"))
       return
     }
+    if (text === "/background" || text.startsWith("/background ") || cmd === "background") {
+      // 转后台（用户 2026-09-28 新增；菜单「🔁 循环」里也有按钮）。
+      // 能力按**运行时探测**（不按版本号猜）：本 build 有 experimental.session.background
+      // （提升），v2 的 session.subagent（创建）当前没有 —— 两者都在就优先提升路径。
+      const curBg = readBg()
+      const shape = bgApiShape(client)
+      const envOn = bgEnvOn()
+      const bgStatus = (extra = ""): string =>
+        `[tg-bridge] 后台能力：${bgApiLabel(shape)}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）${extra}\n` +
+        "· 提升：把**正在阻塞**的同步子代理转后台（无阻塞子代理时端点无事可做）\n" +
+        "· 开关：/background auto on|off（整体配置）｜状态：/background status"
+      const bgPromote = async (sid: string, why: string): Promise<string> => {
+        const fn = (client as any)?.experimental?.session?.background
+        if (typeof fn !== "function") return `✗ 本 build 无 background 提升端点（client 上没有该方法）`
+        try {
+          const r = await fn.call((client as any).experimental.session, { sessionID: sid })
+          const errTxt = String((r as any)?.data?.message ?? (r as any)?.data?.error ?? "").slice(0, 120)
+          if (errTxt) return `✗ 提升被拒：${errTxt}`
+          return `✓ 已请求转后台（${why}）会话 ${sid.slice(0, 12)}${envOn ? "" : `；⚠ 实验开关未开（${BG_ENV_VAR}），失败多半与此有关`}`
+        } catch (err) {
+          return `✗ 提升失败：${sanitizeLog(String(err)).slice(0, 120)}`
+        }
+      }
+      const bgArg = (text.startsWith("/background ") ? text.slice(11).trim() : "")
+      const bgAct = parseBgArg(bgArg, curBg)
+      if (bgAct.kind === "help") {
+        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background status\n${bgStatus()}`)
+        return
+      }
+      if (bgAct.kind === "status") {
+        await reply(chatID, bgStatus())
+        return
+      }
+      if (bgAct.kind === "set") {
+        writeBg({ ...curBg, enabled: bgAct.enabled })
+        await reply(chatID, `[tg-bridge] 自动转后台 → ${bgAct.enabled ? "开" : "关"}\n${bgStatus()}`)
+        return
+      }
+      const bgTarget = fixedTarget ?? (await activeFront())
+      if (!bgTarget) {
+        await reply(chatID, "[tg-bridge] 无法解析目标会话（没有任何已知会话）")
+        return
+      }
+      bgLastAttempt.set(bgTarget, Date.now())
+      await reply(chatID, await bgPromote(bgTarget, "手动按钮/命令"))
+      return
+    }
+    if (text === "/autoguard" || text.startsWith("/autoguard ") || cmd === "autoguard") {
+      // 自动停止守卫的开关/状态（用户 2026-09-28 新增，菜单「🔁 循环」里也有两枚按钮）。
+      // 语义：problem = 助手宣告 [SIGNAL:PROBLEM] 或本轮 [STATUS: STOP] 时停循环；
+      //       websearch = 助手请求网页搜索或真调了搜索工具时停循环（等用户授权）。
+      const arg = (text.startsWith("/autoguard ") ? text.slice(11).trim() : "").toLowerCase()
+      const cur = readGuard()
+      const onoff = (w: string): string => (w ? "开" : "关")
+      const show = (): string => {
+        const c = readGuard()
+        const trip = readGuardLastTrip()
+        const t = trip?.at ? `\n· 最近触发：${String(trip.kind ?? "?")}｜${String(trip.reason ?? "").slice(0, 100)}（${new Date(Number(trip.at)).toISOString().slice(11, 19)}Z 会话 ${String(trip.sid ?? "?").slice(0, 12)}）` : "\n· 最近触发：无"
+        return `[tg-bridge] 自动停止守卫：问题即停=${onoff(c.problem)}｜搜索即停=${onoff(c.websearch)}${t}\n` +
+          "· 触发后循环停住等你处理；恢复用 /loop start（菜单「继续循环」）\n" +
+          "· 改开关：/autoguard on|off（全部）、/autoguard problem on|off、/autoguard web on|off"
+      }
+      // 解析交给共享纯函数（loop-guard.ts）：菜单按钮投送的正是「头 + 值」三段式，
+      // 这条路径必须能被单测覆盖，不能只靠"看着对"。
+      const act = parseGuardArg(arg, cur)
+      if (act.kind === "status") {
+        await reply(chatID, show())
+        return
+      }
+      if (act.kind === "help") {
+        await reply(chatID, `[tg-bridge] 用法：/autoguard [on|off|status] | problem on|off | web on|off\n${show()}`)
+        return
+      }
+      writeGuard(act.cfg)
+      const changed = act.cfg.problem !== cur.problem || act.cfg.websearch !== cur.websearch
+      const head = act.what === "all" ? "守卫" : act.what === "problem" ? "问题即停" : "搜索即停"
+      await reply(
+        chatID,
+        `[tg-bridge] ${head} → 问题=${onoff(act.cfg.problem)}｜搜索=${onoff(act.cfg.websearch)}${changed ? "" : "（无变化）"}\n${show()}`,
+      )
+      return
+    }
     if (text === "/replay" || text.startsWith("/replay ") || text === "/reload" || text.startsWith("/reload ") || cmd === "replay" || cmd === "reload") {
       const target = (fixedTarget?.length ?? 0) > 0 ? fixedTarget : await activeFront()
       if (!target) {
@@ -6173,7 +6292,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       await log("info", `healcards: checked=${checked} fixed=${fixed}`)
       return
     }
-    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "addbot", "botname", "botdesc"])
+    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "addbot", "botname", "botdesc", "autoguard", "background"])
     if (text.startsWith("/")) {
       if (!KNOWN_CMDS.has(cmd)) {
         await reply(chatID, `❓ 未知命令 /${clean(cmd || text.slice(1).split(/\s/)[0], 30)}（发送 /help 查看列表）`)
@@ -6561,6 +6680,44 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
   setInterval(() => {
     void askReconcile()
   }, ASK_RECONCILE_MS)
+  // ── 整体自动转后台（60s 拍）────────────────────────────────────────────
+  // 只在**确有阻塞中的同步子代理**时才动：没有阻塞就没有"转后台"这回事，
+  // 无条件调用只会刷无意义请求。冷却 + 会话级去重，避免同一阻塞被反复提升。
+  const BG_AUTO_MS = 60_000
+  const bgAutoTick = async (): Promise<void> => {
+    try {
+      const cfg = readBg()
+      const sid = fixedTarget ?? frontSessionID ?? persistedFront ?? ""
+      if (!cfg.enabled || !sid) return
+      const msgs = await fetchTail(sid, 1)
+      const parts: any[] = Array.isArray(msgs) ? (msgs[0]?.parts ?? []) : []
+      const d = shouldAutoPromote(parts, cfg, Date.now(), bgLastAttempt.get(sid) ?? 0, bgEnvOn(), bgApiShape(client))
+      if (!d.go) {
+        if (Date.now() - bgLastWhyLogAt > 10 * 60_000) {
+          bgLastWhyLogAt = Date.now()
+          await log("info", `bg-auto idle: session=${sanitizeLog(sid).slice(0, 12)} why=${sanitizeLog(d.why)}`)
+        }
+        return
+      }
+      bgLastAttempt.set(sid, Date.now())
+      const fn = (client as any)?.experimental?.session?.background
+      if (typeof fn !== "function") {
+        await log("info", `bg-auto skipped: no background endpoint on client (session=${sanitizeLog(sid).slice(0, 12)})`)
+        return
+      }
+      try {
+        await fn.call((client as any).experimental.session, { sessionID: sid })
+        await log("info", `bg-auto promoted: session=${sanitizeLog(sid).slice(0, 12)} why=${sanitizeLog(d.why)}`)
+      } catch (err) {
+        await log("error", `bg-auto failed: session=${sanitizeLog(sid).slice(0, 12)} err=${sanitizeLog(String(err)).slice(0, 120)}`)
+      }
+    } catch (err) {
+      await log("error", `bg-auto tick error: ${sanitizeLog(String(err)).slice(0, 120)}`)
+    }
+  }
+  setInterval(() => {
+    void bgAutoTick()
+  }, BG_AUTO_MS)
   // ── ctx 周期刷新（5 分钟） ────────────────────────────────────────────
   // `backfillCtxUsage` 原先只在**完全没有值**时才触发（兜底），所以事件路径一旦给出值，
   // 兜底就不再跑 → 刷新节奏取决于"哪些轮次带 token 数据"，实测最长可达 7 分钟，
@@ -6597,27 +6754,17 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     lastCompactTotal.set(sid, after)
     const u = ctxUsage.get(sid)
     const win = u ? windowFor(u.modelID, u.providerID) : 0
-    const pctOf = (n: number): string => (win > 0 && n > 0 ? `${Math.round((n / win) * 100)}%` : "?")
     const nm = clean(sessionNameOf(sid) || "", 40) || sid.slice(0, 12)
     const exact = how === "api" ? `${new Date(atMs).toISOString().replace("T", " ").slice(0, 16)}Z` : "刚刚（宿主未给出精确时间）"
+    // 数字段与"怎么发现的"两段都交给纯函数判（v2lib/compact-notice.ts + 单测）。
+    // 关键修正：`after <= 0` 是"**未知**"，对**所有**路成立（不只是 event）——
+    // api 路拿不到 usage 时同样传 0，内联旧写法会显示"现在只占 0B"= 假数据。
     const body = [
-      `<b>${how === "ctxdrop" ? "🗜 上下文骤降（疑似压缩）" : "🗜 上下文已压缩"}</b> · ${htmlEsc(nm)}`,
+      `<b>${compactTitle(how)}</b> · ${htmlEsc(nm)}`,
       ``,
-      // R1035：event 这一路在**清零之后**才发卡 → after 天然未知。
-      // 绝不能让它落进下面那个 `现在只占 ${fmtK(after)}`（会显示"现在只占 0B"= 假数据）。
-      // event 路：after>0（重建成功）→ 与其它路一样显示箭头；
-      // after<=0（重建没拿到可信值）→ 只显示压缩前，**不编造**。
-      how === "event" && after <= 0
-        ? `压缩前占 ${fmtK(before)}　（${pctOf(before)}）`
-        : before > 0 && after > 0
-          ? `${fmtK(before)} → ${fmtK(after)}　（${pctOf(before)} → ${pctOf(after)}）`
-          : `现在只占 ${fmtK(after)}`,
+      compactWaterLine(before, after, win),
       ``,
-      how === "api"
-        ? `压缩接口报告的时间：${exact}`
-        : how === "event"
-          ? `<i>宿主直接报告了压缩事件（最可靠的信号）—— 压缩后的水位由下一条回复重建。</i>`
-          : `<i>这次是靠 ctx 骤降发现的 —— 压缩接口没报这个事件（已记进日志，属接口漏报）。</i>`,
+      compactHowLine(how, exact),
     ]
       .filter((l) => l !== "")
       .join("\n")
@@ -6628,7 +6775,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     await log(
       "info",
       `compaction notice (session=${sanitizeLog(sid).slice(0, 14)}, how=${how}, ` +
-        `${fmtK(before)}->${fmtK(after)}, result=${r.r}, at=${atMs})`,
+        `${compactLogDelta(before, after)}, result=${r.r}, at=${atMs})`,
     )
   }
   setInterval(() => {
