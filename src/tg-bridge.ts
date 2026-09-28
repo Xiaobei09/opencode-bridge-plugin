@@ -5,8 +5,6 @@ import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailabl
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 // 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
 import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG } from "./bg-mode"
-// 插件层强制：shell 跑超 1 分钟由插件转后台（Hooks.tool 同名覆盖内置 shell）。
-import { makeShellPromoTool } from "./shell-promo"
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
 import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
 
