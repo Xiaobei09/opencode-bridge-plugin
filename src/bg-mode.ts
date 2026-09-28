@@ -28,14 +28,21 @@ export type BgCfg = {
   enabled: boolean
   /** 自动模式的冷却（同一次阻塞不该被反复提升）。 */
   cooldownMs: number
+  /**
+   * shell 自动后台（用户 2026-09-28 追加）：循环里的 shell 调用是否默认转后台。
+   * 与 enabled（子代理提升）**互不依赖**：shell 是 agent 自检文件里的偏好，桥侧不旁路执行。
+   * 默认**关**：后台化会改变响应时序（命令立即返回、输出后台收集），开关才改行为。
+   */
+  shellAuto: boolean
 }
 
-export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000 }
+export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false }
 
 export const normalizeBg = (j: any): BgCfg => ({
   enabled: typeof j?.enabled === "boolean" ? j.enabled : DEFAULT_BG.enabled,
   cooldownMs:
     Number.isFinite(Number(j?.cooldownMs)) && Number(j.cooldownMs) >= 0 ? Number(j.cooldownMs) : DEFAULT_BG.cooldownMs,
+  shellAuto: typeof j?.shellAuto === "boolean" ? j.shellAuto : DEFAULT_BG.shellAuto,
 })
 
 export const readBg = (path: string = BG_PATH): BgCfg => {
@@ -126,6 +133,7 @@ export type BgAction =
   | { kind: "status" }
   | { kind: "help" }
   | { kind: "set"; enabled: boolean }
+  | { kind: "setshell"; enabled: boolean }
 
 export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
   const toks = String(arg ?? "")
@@ -142,6 +150,13 @@ export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
     if (val === "on" || val === "开" || val === "1" || val === "true") return { kind: "set", enabled: true }
     if (val === "off" || val === "关" || val === "0" || val === "false") return { kind: "set", enabled: false }
     if (val === "toggle" || val === "") return { kind: "set", enabled: !cur.enabled }
+    return { kind: "help" }
+  }
+  if (head === "shell") {
+    // shell 自动后台（单独偏好，与子代理提升 enabled 互不依赖）。
+    if (val === "on" || val === "开" || val === "1" || val === "true") return { kind: "setshell", enabled: true }
+    if (val === "off" || val === "关" || val === "0" || val === "false") return { kind: "setshell", enabled: false }
+    if (val === "toggle" || val === "") return { kind: "setshell", enabled: !cur.shellAuto }
     return { kind: "help" }
   }
   if (head === "on" || head === "开") return { kind: "set", enabled: true }
