@@ -39,9 +39,9 @@ export const compactWaterLine = (before: number, after: number, win: number): st
   return `现在只占 ${fmtK(after)}　（${pctOf(after, win)}）`
 }
 
-/** 日志里的箭头串：未知端用 "?"，避免以后 grep 到 `->0` 误读成"真的降到 0"。 */
+/** 日志里的箭头串：未知端用 "?"，避免以后 grep 到 `->0` 或 `0B->` 误读成"真的 0"。 */
 export const compactLogDelta = (before: number, after: number): string =>
-  `${fmtK(before)}->${after > 0 ? fmtK(after) : "?"}`
+  `${before > 0 ? fmtK(before) : "?"}->${after > 0 ? fmtK(after) : "?"}`
 
 /** 第二段：这条压缩是怎么发现的（决定用户该信多少）。 */
 export const compactHowLine = (how: CompactHow, exact: string): string => {
