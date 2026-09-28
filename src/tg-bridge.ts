@@ -1920,9 +1920,10 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   guardprob: "/autoguard problem toggle",
   guardweb: "/autoguard web toggle",
   guardinfo: "/autoguard",
-  // 转后台：裸命令=立刻提升当前阻塞子代理；auto=整体自动配置；status=如实回显能力与原因。
+  // 转后台：裸命令=立刻提升当前阻塞子代理；auto=整体自动配置；shell=shell 自动后台；status=如实回显能力与原因。
   bg: "/background",
   bgauto: "/background auto toggle",
+  bgshell: "/background shell toggle",
   bgstatus: "/background status",
   loud: "/loud",
   quiet: "/quiet",
@@ -1930,7 +1931,7 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
 
 export const buildMenuKeyboard = (
   view: string,
-  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean } = {},
+  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean } = {},
 ): unknown[][] => {
 const paused = Boolean(opts.paused)
 const stopped = Boolean(opts.stopped)
@@ -1941,6 +1942,8 @@ const gProblem = opts.guard ? opts.guard.problem !== false : DEFAULT_GUARD.probl
 const gWeb = opts.guard ? opts.guard.websearch !== false : DEFAULT_GUARD.websearch
 // 整体自动转后台开关（默认关：它是行为改变，且实验开关没开时调用注定失败）。
 const bgAutoOn = Boolean(opts.bgAuto)
+// shell 自动后台开关（默认关：后台化改变响应时序，必须用户显式开）。
+const bgShellAuto = Boolean(opts.bgShellAuto)
 // 注意：inline_keyboard 的一"行"必须是**扁平的按钮数组**。
 // 之前写成 [[btn],[btn]]（行里再套数组）→ Telegram 直接 400，菜单发不出去。
 const b = (label: string, data: string): unknown => ({ text: label, callback_data: data })
@@ -1969,6 +1972,7 @@ if (view === "loop") {
     [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
     [b("🛡 守卫详情/最近触发", "ma:guardinfo")],
     [b("🧵 转后台", "ma:bg"), b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto")],
+    [b(bgShellAuto ? "🖥 shell 自动后台：开" : "🖥 shell 自动后台：关", "ma:bgshell")],
     [b("ℹ️ 后台能力状态", "ma:bgstatus")],
     [b("📋 查看队列", "ma:queue"), b("🚀 立即补发（外发积压+继续注入）", "ma:flush")],
     [b("⬅️ 返回", "m:root")],
@@ -4884,6 +4888,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       selfmute: selfMute,
       guard: readGuard(),
       bgAuto: readBg().enabled,
+      bgShellAuto: readBg().shellAuto,
     })
   const handleCallback = async (cq: any): Promise<void> => {
     try {
@@ -5796,9 +5801,9 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const envOn = bgEnvOn()
       const capLabel = bgApiLabel(shape) === "无（不支持）" ? "无（不支持）·HTTP直连可用" : bgApiLabel(shape)
       const bgStatus = (extra = ""): string =>
-        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）${extra}\n` +
+        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellAuto ? "开" : "关"}${extra}\n` +
         "· 提升：把**正在阻塞**的同步子代理转后台（无端点时走宿主 HTTP 直连）\n" +
-        "· 开关：/background auto on|off（整体配置）｜状态：/background status"
+        "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
         const sessAny = (client as any)?.session
         const expSess = (client as any)?.experimental?.session
@@ -5819,7 +5824,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const bgArg = (text.startsWith("/background ") ? text.slice(11).trim() : "")
       const bgAct = parseBgArg(bgArg, curBg)
       if (bgAct.kind === "help") {
-        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background status\n${bgStatus()}`)
+        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background status\n${bgStatus()}`)
         return
       }
       if (bgAct.kind === "status") {
@@ -5829,6 +5834,11 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       if (bgAct.kind === "set") {
         writeBg({ ...curBg, enabled: bgAct.enabled })
         await reply(chatID, `[tg-bridge] 自动转后台 → ${bgAct.enabled ? "开" : "关"}\n${bgStatus()}`)
+        return
+      }
+      if (bgAct.kind === "setshell") {
+        writeBg({ ...curBg, shellAuto: bgAct.enabled })
+        await reply(chatID, `[tg-bridge] shell 自动后台 → ${bgAct.enabled ? "开" : "关"}\n${bgStatus()}`)
         return
       }
       const bgTarget = fixedTarget ?? (await activeFront())
