@@ -3103,7 +3103,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         }
         if (id > 0) protoMap.set(key, { id, text: item.text, fallback: r.fallback === true })
         const h = hashText(item.text)
-        if (h) sentHash.add(h)
+        // R1444：判重键绑定 key，与 protoSend 检查身一致（见前文注释）
+        if (h) sentHash.add(`${key}#${h}`)
         lastPushAt = new Date().toISOString()
         lastRealPush.set(key.split(":")[0] ?? "", Date.now())
         touchActivity(key.split(":")[0] ?? "")
@@ -3272,7 +3273,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // 之前判断"是不是重复发送"只能拿 len 当**代理**，而长度相同**不等于**内容相同
     //（两次真内容不同的卡片也可能等长）→ 那条 :ask: 疑点既证不实也排除不了。
     // 日志里带上 h 之后，判重就是**测量**而不是推断。
-    if (!noDedup && h && sentHash.has(h)) {
+    // R1444：判重键必须**绑定 key**（`${key}#${h}`），不能只比全局 hash——
+    // 否则不同 part 的**同文本**卡（如每轮收尾的「✅ 已完成 · 用时约 X 分钟」
+    // 「✅ 队列已空（复用）」等完成卡，key 各异、内容相同）会被跨 key 误吞：
+    // 首张发出后 hash 进全局集合，后续所有同内容卡被静默跳过 → 用户视角
+    // 「输出结束的前几条总是不发」。绑定 key 后：同 key 同文本仍防重（防流式
+    // 尾巴/重试用例），跨 key 同文本正常放行。
+    if (!noDedup && h && sentHash.has(`${key}#${h}`)) {
       await log("info", `proto hash-dup skip (${sanitizeLog(key)}) len=${text.length}`)
       return
     }
@@ -3350,7 +3357,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const silent = key.includes(":thinking:") || key.includes(":tool:") || key.includes(":status")
     const noteHash = (): void => {
       if (!h) return
-      sentHash.add(h)
+      // R1444：判重键绑定 key（防跨 key 同文本误吞，见前文注释）
+      sentHash.add(`${key}#${h}`)
       if (sentHash.size > 1500) {
         const arr = [...sentHash]
         for (const x of arr.slice(0, arr.length - 1500)) sentHash.delete(x)
