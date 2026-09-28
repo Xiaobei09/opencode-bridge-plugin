@@ -4,10 +4,10 @@
  * 需求（用户 2026-09-28 原话）：
  *   「shell 增加一个按钮为后台，另外增加一个整体配置自动转换后台，注意，这是 v2」
  *
- * 资料来源与**本地查证**（opencode 1.18.32，REDACTED_ROOT/.opencode/bin/opencode 二进制内检索）：
- *   · `POST /experimental/session/{sessionID}/background` —— ✅ 存在。SDK 入口
- *     `client.experimental.session.background({sessionID, directory?, workspace?})`，
- *     **只有 path/query、无 body**：语义就是"把当前正在阻塞主会话的同步子代理提升为后台"。
+ * 资料来源与**本地查证**（v1=opencode 1.18.32 二进制：/experimental 前缀；v2=opencode v2.0.10：
+ *   /openapi.json 顶层 `POST /api/session/{sessionID}/background`，operationId `session.background`）：
+ *   · v1 入口 `client.experimental.session.background(...)`，v2.0.10 入口 `client.session.background(...)`
+ *     —— 语义同为“把当前正在阻塞主会话的同步子代理提升为后台”，**探测双路兼容、不写死版本**。
  *   · `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` —— ✅ 变量名存在；TUI 的
  *     `session.background` 命令是 hidden 且 `enabled: <开关非空>`（必须开关打开才可用）。
  *   · v2 的 `session.subagent`（直接创建后台子代理）—— ❌ 本 build 内检索不到
@@ -61,7 +61,10 @@ export type BgApiShape = { subagent: boolean; promote: boolean }
 
 export const bgApiShape = (client: any): BgApiShape => ({
   subagent: typeof client?.session?.subagent === "function",
-  promote: typeof client?.experimental?.session?.background === "function",
+  // 双路兼容（R1394 实证）：v2.0.10 OpenAPI=顶层 session.background；v1.18.32=experimental 前缀。
+  promote:
+    typeof client?.session?.background === "function" ||
+    typeof client?.experimental?.session?.background === "function",
 })
 
 /** 实验开关是否已开。**必须**由启动 opencode 时就带上**，事后设 process.env 无效。 */

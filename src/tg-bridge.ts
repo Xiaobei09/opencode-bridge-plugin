@@ -5717,8 +5717,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     }
     if (text === "/background" || text.startsWith("/background ") || cmd === "background") {
       // 转后台（用户 2026-09-28 新增；菜单「🔁 循环」里也有按钮）。
-      // 能力按**运行时探测**（不按版本号猜）：本 build 有 experimental.session.background
-      // （提升），v2 的 session.subagent（创建）当前没有 —— 两者都在就优先提升路径。
+      // 能力按**运行时探测**（不按版本号猜）：v2.0.10 OpenAPI=顶层 session.background，
+      // v1.18.32=experimental.session.background（双路兼容）；session.subagent（创建）不在 API 面。
       const curBg = readBg()
       const shape = bgApiShape(client)
       const envOn = bgEnvOn()
@@ -5727,10 +5727,12 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         "· 提升：把**正在阻塞**的同步子代理转后台（无阻塞子代理时端点无事可做）\n" +
         "· 开关：/background auto on|off（整体配置）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
-        const fn = (client as any)?.experimental?.session?.background
+        const sessAny = (client as any)?.session
+        const expSess = (client as any)?.experimental?.session
+        const fn = sessAny?.background ?? expSess?.background
         if (typeof fn !== "function") return `✗ 本 build 无 background 提升端点（client 上没有该方法）`
         try {
-          const r = await fn.call((client as any).experimental.session, { sessionID: sid })
+          const r = await fn.call(sessAny?.background ? sessAny : expSess, { sessionID: sid })
           const errTxt = String((r as any)?.data?.message ?? (r as any)?.data?.error ?? "").slice(0, 120)
           if (errTxt) return `✗ 提升被拒：${errTxt}`
           return `✓ 已请求转后台（${why}）会话 ${sid.slice(0, 12)}${envOn ? "" : `；⚠ 实验开关未开（${BG_ENV_VAR}），失败多半与此有关`}`
@@ -6700,13 +6702,15 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return
       }
       bgLastAttempt.set(sid, Date.now())
-      const fn = (client as any)?.experimental?.session?.background
+      const sessAny = (client as any)?.session
+      const expSess = (client as any)?.experimental?.session
+      const fn = sessAny?.background ?? expSess?.background
       if (typeof fn !== "function") {
         await log("info", `bg-auto skipped: no background endpoint on client (session=${sanitizeLog(sid).slice(0, 12)})`)
         return
       }
       try {
-        await fn.call((client as any).experimental.session, { sessionID: sid })
+        await fn.call(sessAny?.background ? sessAny : expSess, { sessionID: sid })
         await log("info", `bg-auto promoted: session=${sanitizeLog(sid).slice(0, 12)} why=${sanitizeLog(d.why)}`)
       } catch (err) {
         await log("error", `bg-auto failed: session=${sanitizeLog(sid).slice(0, 12)} err=${sanitizeLog(String(err)).slice(0, 120)}`)
