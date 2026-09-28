@@ -295,6 +295,12 @@ export default {
 
 // reload 1790363768
 
+// reload(content) 1790411999 R1484 revert shell tool override (kills builtin shell; do not modify requests to provider)
+
+// reload(content) 1790412205 R1485 remove stale shell override from plugin tool registry
+
+// reload(content) 1790412600 R1487 FULL REVERT: no ctx.tool add/remove/transform, no Hooks.tool.shell (restore builtin shell + provider request untouched)
+
 // reload(content) 1790388715
 
 // reload(content) 1790388902
@@ -626,8 +632,28 @@ export default {
 // reload(content) 20260928T052142Z [tg-bridge-v2.ts]
 
 // reload(content) 20260928T072128Z [tg-bridge-v2.ts]
-2026-09-28T18:04:43Z addbot reload R1445 sentHash-key-bound
+// 2026-09-28T18:04:43Z addbot reload R1445 sentHash-key-bound (R1444 手写漏了 // 前缀 → 语法错误 → 整个插件加载失败；已修复)
 
 // reload(content) 20260928T100742Z [tg-bridge-v2.ts]
 
 // reload(content) 20260928T110948Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T114015Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T114424Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T114525Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T114623Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T114959Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T120637Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T123646Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T124415Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T131633Z [tg-bridge-v2.ts]
+
+// reload(content) 20260928T131854Z [tg-bridge-v2.ts]

@@ -34,15 +34,22 @@ export type BgCfg = {
    * 默认**关**：后台化会改变响应时序（命令立即返回、输出后台收集），开关才改行为。
    */
   shellAuto: boolean
+  /**
+   * 插件层强制：shell 跑超 1 分钟由**插件**转后台（用户 2026-09-28：「我说的不是模型判断，
+   * 是插件判断」）。由桥的 Hooks.tool 同名覆盖 shell 实现，execute 由插件掌控才能中途计时提升。
+   * 默认**开**=用户既定口径；置 false 即整体熔断（覆盖立即退出、回退宿主行为）。
+   */
+  shellPromo: boolean
 }
 
-export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false }
+export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false, shellPromo: true }
 
 export const normalizeBg = (j: any): BgCfg => ({
   enabled: typeof j?.enabled === "boolean" ? j.enabled : DEFAULT_BG.enabled,
   cooldownMs:
     Number.isFinite(Number(j?.cooldownMs)) && Number(j.cooldownMs) >= 0 ? Number(j.cooldownMs) : DEFAULT_BG.cooldownMs,
   shellAuto: typeof j?.shellAuto === "boolean" ? j.shellAuto : DEFAULT_BG.shellAuto,
+  shellPromo: typeof j?.shellPromo === "boolean" ? j.shellPromo : DEFAULT_BG.shellPromo,
 })
 
 export const readBg = (path: string = BG_PATH): BgCfg => {
