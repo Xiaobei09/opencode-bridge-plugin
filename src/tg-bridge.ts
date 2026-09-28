@@ -3931,18 +3931,17 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       if (current === id) queuePinOn.set(chat, false)
       if (current === id) {
-        // 保留消息本体，改成空态文案；失败也只算清理未完成，不删消息。
-        const e = await editTextRaw(chat, id, "✅ 队列已空（这条消息会在下次排队时复用）", undefined, false)
-        if (e.r !== "sent") {
-          // drop = 永久失败（400/403：这条消息不再归我们——另一个 Bot 发的 / 已被删 /
-          // 不可编辑）。继续 defer 会永远卡住：直接放弃这条 id，下次排队重新建卡。
-          if (e.r === "drop") {
-            queuePin.delete(chat)
-            queuePinOn.delete(chat)
-            void log("info", `queue pin dropped (not editable by this bot, mid=${id})`)
-          } else {
-            cleared = false
-          }
+        // R1420：排空/停止时把卡**删除**，不再保留「队列已空（复用）」残留消息。
+        // 用户明确反馈：残留卡带着括号注释，误导为「还有 1 条在队列」，且永远躺在聊天里。
+        // 删除失败仍按「清理未完成」处置（保留 hist 下轮重试）；400/403 视为已不可见。
+        const d = await tgFetch("deleteMessage", { chat_id: Number(chat) || chat, message_id: id })
+        if (d.ok || d.status === 400 || d.status === 403) {
+          queuePin.delete(chat)
+          queuePinOn.delete(chat)
+          qpinEmptyShownFor.delete(chat)
+        } else {
+          cleared = false
+          await log("info", `queue pin delete failed (current mid=${id}, status=${d.status ?? "network"}); 保留记录下轮重试`)
         }
       } else {
         // 历史遗留的旧卡（换代前建的）直接删掉，避免又出现第二条队列消息
@@ -3974,8 +3973,37 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     lastQPinCount = 0
     savePersistedState()
-    await log("info", `queue pin cleared (${reason}, msgs=${ids.length}, kept for reuse)`)
+    await log("info", `queue pin cleared (${reason}, msgs=${ids.length}, deleted)`)
     return true
+  }
+  // R1420：状态推导（供置顶卡首行展示）。
+  // 语义：loopStopped→已取消；否则看 front 会话最后一条 assistant 消息——
+  //   info.time.completed 有值=已终态，再查其 part.state.status==="error" 区分“完成/错误”；
+  //   无 completed（或读失败/无消息）→ 保守标“进行中”（与 turnActuallyIdle 同口径）。
+  const qpinStatusFor = async (sid: string): Promise<string> => {
+    if (loopStopped()) return "⏸ 已取消（循环停止）"
+    try {
+      const res = await client.session.messages({ path: { id: sid } })
+      const rows = Array.isArray(res?.data) ? res.data : []
+      let lastAssistant: any = null
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i]?.info?.role === "assistant") {
+          lastAssistant = rows[i]
+          break
+        }
+      }
+      if (!lastAssistant) return "⏳ 进行中"
+      if (!(Number(lastAssistant?.info?.time?.completed ?? 0) > 0)) return "⏳ 进行中"
+      const parts = partsOf(lastAssistant)
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const stt = String((parts[i] as any)?.state?.status ?? "")
+        if (stt === "error") return "❌ 错误"
+        if (stt === "completed") break
+      }
+      return "✅ 完成"
+    } catch {
+      return "⏳ 进行中"
+    }
   }
   // 队列置顶条：有积压置顶一条显示条数（只改原文不重发），排空即取消置顶并删除
   const refreshQueuePin = async (): Promise<void> => {
@@ -4085,7 +4113,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             qpinDirty = true
             return
           }
-          const r = await editTextRaw(chat, mid, `📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`)
+          const statusLine = await qpinStatusFor((fixedTarget ?? frontSessionID ?? persistedFront) ?? "")
+          const r = await editTextRaw(chat, mid, `${statusLine}\n📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`)
           if (r.r === "sent") {
             lastQPinEdit = now
             lastQPinCount = n
@@ -4095,9 +4124,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           return
         }
         try {
+          const statusLine = await qpinStatusFor((fixedTarget ?? frontSessionID ?? persistedFront) ?? "")
           const r = await tgFetch("sendMessage", {
             chat_id: Number(chat) || chat,
-            text: `📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`,
+            text: `${statusLine}\n📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`,
             disable_notification: true,
           })
           if (r.ok && r.id) {
@@ -7062,7 +7092,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
               r = await editTextRaw(
                 chat,
                 msgId,
-                `${real === "completed" ? "✅ 已完成" : "❌ 失败"} · 用时约 ${mins} 分钟（header-only 模式，不展开正文）`,
+                `${real === "completed" ? "✅ 已完成" : "❌ 失败"} · 用时约 ${mins} 分钟`,
                 undefined,
                 fb,
               )
@@ -7248,7 +7278,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
               const r1 = await editTextRaw(
                 chat,
                 rec.id,
-                `${stt === "completed" ? "✅ 已完成" : "❌ 失败"} · 用时约 ${mins} 分钟（header-only 模式，不展开正文）`,
+                `${stt === "completed" ? "✅ 已完成" : "❌ 失败"} · 用时约 ${mins} 分钟`,
                 undefined,
                 rec.fallback === true,
               )
