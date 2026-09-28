@@ -8,6 +8,33 @@ import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAut
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
 import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
 
+// ── R1399：插件 client 白名单无 background 端点时的直连宿主 HttpApi 兜底 ────────
+// 背景：R1398 实证 v2.0.10 的插件 client 只含白名单子集（session 键无 background/），
+// 「转后台」在桥内必须走 HTTP 直连。凭证=opencode2 自己的服务注册
+// ~/.local/state/opencode/service.json（url+password）；鉴权=Basic base64("opencode:"+pw)
+// （2026-09-28 curl 实证：POST /api/session/{sid}/background → 204，空闲会话 no-op）。
+const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }> => {
+  try {
+    const home = process.env.HOME ?? "/root"
+    const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
+      url?: string
+      password?: string
+    }
+    const url = String(reg?.url ?? "").replace(/\/+$/, "")
+    const pw = String(reg?.password ?? "")
+    if (!url || !pw) return { ok: false, text: "✗ 服务注册不可读（service.json 缺 url/password）" }
+    const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
+    const r = await fetch(`${url}/api/session/${encodeURIComponent(sid)}/background`, {
+      method: "POST",
+      headers: { Authorization: `Basic ${token}` },
+    })
+    if (!r.ok) return { ok: false, text: `✗ HttpApi 提升被拒：HTTP ${r.status}` }
+    return { ok: true, text: `✓ 已请求转后台（直连宿主 HttpApi，HTTP ${r.status}）` }
+  } catch (err) {
+    return { ok: false, text: `✗ 直连失败：${String(err).slice(0, 120)}` }
+  }
+}
+
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
 // 分母 = 模型 limit.context（provider.list 实取，取不到回落 1M）。
@@ -1974,6 +2001,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const banner = `[tg-bridge] plugin loaded (bot=${BOT_ID}, ver=${VERSION}, token=${TOKEN ? "set" : "MISSING"}, fallback=${fallbackApiBase ? "set" : "none"}, allowed=${allowedNorm.size} chat(s), push=${PUSH_CHAT || "(none)"}, watch=${watchedSessions.size}, state=${STATE_PATH}, source=${SOURCE})`
   try {
     await client.app.log({ body: { service: "tg-bridge", level: "info", message: banner } })
+    // R1398 诊断：load 时 dump 客户端真实形状（session / experimental.session 键），
+    // 实证 v2.0.10 运行态下 background/subagent 挂在哪个路径（免猜、免等用户）。
+    try {
+      const sessK = Object.keys(((client as any)?.session) ?? {}).slice(0, 40)
+      const expK = Object.keys(((client as any)?.experimental?.session) ?? {}).slice(0, 40)
+      await client.app.log({ body: { service: "tg-bridge", level: "info", message: `[tg-bridge] bg shape-dump: session=[${sessK.join(",")}] exp=[${expK.join(",")}]` } })
+    } catch { /* 诊断失败不阻断启动 */ }
     // 启动自检：备用投递通道到底有没有被打开。此前"横幅 set / 运行时 no"自相矛盾，
     // 根因是 recomputeIdentity() 会在 configureBot 之后**再次**从 process.env 读
     // TG_FALLBACK_BOT_TOKEN（旧入口时代写进 env 的残留），把已关闭的备用通道又打开了。
@@ -5722,15 +5756,19 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const curBg = readBg()
       const shape = bgApiShape(client)
       const envOn = bgEnvOn()
+      const capLabel = bgApiLabel(shape) === "无（不支持）" ? "无（不支持）·HTTP直连可用" : bgApiLabel(shape)
       const bgStatus = (extra = ""): string =>
-        `[tg-bridge] 后台能力：${bgApiLabel(shape)}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）${extra}\n` +
-        "· 提升：把**正在阻塞**的同步子代理转后台（无阻塞子代理时端点无事可做）\n" +
+        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）${extra}\n` +
+        "· 提升：把**正在阻塞**的同步子代理转后台（无端点时走宿主 HTTP 直连）\n" +
         "· 开关：/background auto on|off（整体配置）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
         const sessAny = (client as any)?.session
         const expSess = (client as any)?.experimental?.session
         const fn = sessAny?.background ?? expSess?.background
-        if (typeof fn !== "function") return `✗ 本 build 无 background 提升端点（client 上没有该方法）`
+        if (typeof fn !== "function") {
+          const viaHttp = await bgHttpPromote(sid)
+          return viaHttp.ok ? viaHttp.text : `${viaHttp.text}（client 亦无该方法）`
+        }
         try {
           const r = await fn.call(sessAny?.background ? sessAny : expSess, { sessionID: sid })
           const errTxt = String((r as any)?.data?.message ?? (r as any)?.data?.error ?? "").slice(0, 120)
@@ -6706,7 +6744,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const expSess = (client as any)?.experimental?.session
       const fn = sessAny?.background ?? expSess?.background
       if (typeof fn !== "function") {
-        await log("info", `bg-auto skipped: no background endpoint on client (session=${sanitizeLog(sid).slice(0, 12)})`)
+        const hr = await bgHttpPromote(sid)
+        await log(hr.ok ? "info" : "warn", `bg-auto http-fallback: ${hr.text.slice(0, 140)} (session=${sanitizeLog(sid).slice(0, 12)})`)
         return
       }
       try {
