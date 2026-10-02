@@ -1848,6 +1848,63 @@ export const validateHtmlText = (text: string): string | null => {
   return null
 }
 
+// R1636：纯函数 —— 速率限制（429）时"下一次循环该等多久"的**指数退避**。
+// 背景：原 floodWaitSeconds 是**平**的 —— 不管连着挨几次 429，只要 Telegram
+// 给的 retry_after 一样大，等待就一样长，于是"冷却结束→再打一次→再 429"以
+// 固定节奏无限循环，把 bot 永久锁在限流里（Telegram 反而越给越长的 retry_after）。
+// 现在：连续第 n 次 429 的等待 = max(指数项 base·2^(n-1), Telegram 的 retry_after)，
+// 封顶 cap；**成功一次即清零** attempt。抖动（jitter）让多 Bot / 多会话的重试
+// 不在同一个毫秒撞上，避免"齐步走"再次触发限流。
+// 不变量：返回值**永远 ≥ Telegram 要求的 retry_after**（抖动因子 ≥1），
+// 所以退避只会让我们更慢、更少请求，绝不会早于 Telegram 允许的时间再打。
+export const FLOOD_BACKOFF_BASE_S = 60
+export const FLOOD_BACKOFF_CAP_S = 900
+export const FLOOD_BACKOFF_FLOOR_S = 5
+export const FLOOD_BACKOFF_JITTER = 0.25
+
+export type FloodBackoffInput = {
+  /** Telegram 给的 retry_after（秒）；0/缺省/非法 = 未给。 */
+  retryAfter?: number
+  /** 已连续挨到的 429 次数（首次 = 1）。0/缺省按"首次"处理。 */
+  attempt?: number
+  /** 退避基数（秒），默认 60。 */
+  baseSeconds?: number
+  /** 封顶（秒），默认 900；小于 base 时按 base 处理。 */
+  capSeconds?: number
+  /** 抖动比例 0..1，默认 0.25。0 = 无抖动（完全确定）。 */
+  jitter?: number
+  /** 注入 [0,1) 随机数，供测试确定化；缺省取 0.5。 */
+  rand?: number
+}
+
+export const floodBackoffSeconds = (input: FloodBackoffInput = {}): number => {
+  const posOr = (v: unknown, dflt: number): number => {
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? n : dflt
+  }
+  const base = posOr(input.baseSeconds, FLOOD_BACKOFF_BASE_S)
+  const cap = Math.max(base, posOr(input.capSeconds, FLOOD_BACKOFF_CAP_S))
+  const jitter = Math.min(1, Math.max(0, Number(input.jitter ?? FLOOD_BACKOFF_JITTER)))
+  const attempt = Math.max(0, Math.floor(posOr(input.attempt, 0)))
+
+  // 指数项 base·2^(attempt-1)。shift 先夹到 30，避免 attempt 很大时
+  // 2^attempt 直接溢出成 Infinity（min 能兜住，但先夹更清楚、也让日志好看）。
+  const shift = Math.min(Math.max(attempt, 1) - 1, 30)
+  const exponential = attempt <= 0 ? base : Math.min(cap, base * Math.pow(2, shift))
+
+  // Telegram 项：尊重 retry_after，仍夹在 [floor, cap]（与限流等待旧公式一致）。
+  const ra = Number(input.retryAfter ?? 0)
+  const telegram = Number.isFinite(ra) && ra > 0 ? Math.min(cap, Math.max(FLOOD_BACKOFF_FLOOR_S, Math.ceil(ra))) : 0
+
+  // 取两者较大者：我们自己退避可以比 Telegram 更保守，但**不能更激进**。
+  const wait = Math.max(exponential, telegram)
+  if (jitter <= 0) return Math.round(wait)
+  const r = Number(input.rand)
+  const u = Number.isFinite(r) && r >= 0 && r < 1 ? r : 0.5
+  // u ≥ 0 ⇒ 因子 ≥ 1 ⇒ 结果 ≥ wait ≥ retry_after（不变量成立）。
+  return Math.min(cap, Math.round(wait * (1 + jitter * u)))
+}
+
 export const validateInlineKeyboard = (kb: unknown): string | null => {
   if (kb === undefined || kb === null) return null
   if (!Array.isArray(kb)) return "inline_keyboard 不是数组"
@@ -2559,18 +2616,22 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   let floodNoticeFor: { chat: string; since: number; queued: number } | null = null
   // 限流期内“本 Bot 不可用”提示的节流（每分钟最多一条）
   let lastUnavailableNoticeAt = 0
+  // R1636：连续 429 计数（指数退避的 attempt 来源）。主 Bot / 备用 Bot 各算各的 ——
+  // 备用通道健康不代表主通道健康，混算会让主 Bot 恢复后仍被"连坐"继续长退避。
+  // 任一次成功即清零该通道的计数（真正恢复，而不是"等够了就再试"）。
+  let primary429Streak = 0
+  let fallback429Streak = 0
   // 限流等待：**尊重** Telegram 给的 retry_after，下限 5s、上限 15 分钟。
   // 此前是四处各写一遍"封顶 120s / 下限 60s"的公式。retry_after 最大可到 3600 秒，
   // 封顶 120 秒意味着限流期内我们每隔 2 分钟就发一次**注定失败**的请求，Telegram 往往
   // 会把 retry_after 越给越长。等待期由本地闸门挡着（根本不发请求），所以放大上限
   // 不增加请求量，只会少挨几次 429，并让内容在允许的第一时间送达。
-  const FLOOD_WAIT_FLOOR_S = 5
-  const FLOOD_WAIT_CAP_S = 900
-  const floodWaitSeconds = (retryAfter?: number): number => {
-    const ra = Number(retryAfter ?? 0)
-    if (!Number.isFinite(ra) || ra <= 0) return 60
-    return Math.min(FLOOD_WAIT_CAP_S, Math.max(FLOOD_WAIT_FLOOR_S, Math.ceil(ra)))
-  }
+  // R1636：现在**指数退避**（不再是平的）：连续第 n 次 429 等 base·2^(n-1)，
+  // 与 Telegram 的 retry_after 取大者。attempt 由 tgFetch 的连续计数传入，
+  // 一旦成功就清零 —— 详见 floodBackoffSeconds（唯一实现，本处只做转发）。
+  const FLOOD_WAIT_CAP_S = FLOOD_BACKOFF_CAP_S
+  const floodWaitSeconds = (retryAfter?: number, attempt = 1): number =>
+    floodBackoffSeconds({ retryAfter, attempt })
   type TelegramResult = { ok: boolean; id?: number; status?: number; desc?: string; retryAfter?: number; viaFallback?: boolean }
   const callTelegram = async (base: string, method: string, body: Record<string, unknown>): Promise<TelegramResult> => {
     const res = await fetch(`${base}/${method}`, {
@@ -2635,9 +2696,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (preferFallback && fallbackApiBase && method === "editMessageText") {
         if (now < fallbackUntil) return { ok: false, status: 429, desc: "local fallback flood gate active" }
         const direct = await callTelegram(fallbackApiBase, method, fbBody)
-        if (direct.ok) return { ...direct, viaFallback: true }
+        if (direct.ok) {
+          fallback429Streak = 0
+          return { ...direct, viaFallback: true }
+        }
         if (direct.status === 429) {
-          const wait = floodWaitSeconds(direct.retryAfter)
+          const wait = floodWaitSeconds(direct.retryAfter, ++fallback429Streak)
           fallbackUntil = Date.now() + (wait + 1) * 1000
           return { ok: false, status: direct.status, desc: direct.desc, viaFallback: true }
         }
@@ -2649,26 +2713,35 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       let primary: TelegramResult
       if (now < floodUntil && canFallback) {
         primary = await callTelegram(fallbackApiBase, method, fbBody)
-        if (primary.ok) return { ...primary, viaFallback: true }
+        if (primary.ok) {
+          fallback429Streak = 0
+          return { ...primary, viaFallback: true }
+        }
         if (primary.status === 429) {
-          const wait = floodWaitSeconds(primary.retryAfter)
+          const wait = floodWaitSeconds(primary.retryAfter, ++fallback429Streak)
           fallbackUntil = Date.now() + (wait + 1) * 1000
         }
         return { ok: false, status: primary.status, desc: primary.desc, viaFallback: true }
       }
 
       primary = await callTelegram(apiBase, method, body)
-      if (primary.ok) return primary
+      if (primary.ok) {
+        primary429Streak = 0
+        return primary
+      }
       if (primary.status === 429 && canFallback) {
         const secondary = await callTelegram(fallbackApiBase, method, fbBody)
-        if (secondary.ok) return { ...secondary, viaFallback: true }
+        if (secondary.ok) {
+          fallback429Streak = 0
+          return { ...secondary, viaFallback: true }
+        }
         if (secondary.status === 429) {
-          const wait = floodWaitSeconds(secondary.retryAfter)
+          const wait = floodWaitSeconds(secondary.retryAfter, ++fallback429Streak)
           fallbackUntil = Date.now() + (wait + 1) * 1000
         }
       }
       if (primary.status === 429) {
-        const waitSeconds = floodWaitSeconds(primary.retryAfter)
+        const waitSeconds = floodWaitSeconds(primary.retryAfter, ++primary429Streak)
         floodUntil = Math.max(floodUntil, Date.now() + (waitSeconds + 1) * 1000)
         if (Date.now() - lastFloodLogAt > 10_000) {
           lastFloodLogAt = Date.now()
@@ -2677,7 +2750,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             Number.isFinite(rawRa) && rawRa > FLOOD_WAIT_CAP_S ? ` (已按 ${FLOOD_WAIT_CAP_S}s 封顶，原始 ${rawRa}s)` : ""
           await log(
             "info",
-            `telegram 429 cooldown=${waitSeconds}s rawRetryAfter=${primary.retryAfter || "none"}${capped} fallback=${canFallback ? "yes" : "no"}`,
+            `telegram 429 cooldown=${waitSeconds}s rawRetryAfter=${primary.retryAfter || "none"}${capped} fallback=${canFallback ? "yes" : "no"} streak=${primary429Streak}`,
           )
         }
       }
