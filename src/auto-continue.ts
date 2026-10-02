@@ -508,6 +508,11 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const coldCompacted = new Set<string>()
   const lastCompactCount = new Map<string, number>()
   const lastCompactAttempt = new Map<string, number>()
+  // R-pending：宿主在部分事件里会把"会话生命周期累计 token"报成 input
+  // （实测 f339 报 ~24.9M / 窗口 1M = 2490%，tg-bridge 的 ctxUsage 早已 reject 同族值）。
+  // 误用累计值判压缩会**强压还有大量 headroom 的会话、清空其上下文** —— 用户视角就是
+  // "这个 bot 的自动循环没了"。守卫：单次调用输入不可能超过窗口，超过即累计值，丢弃。
+  let ctxLifetimeRejected = 0
   const COMPACT_RETRY_MS = 30 * 60_000
   // Per-invocation identity (module top-level may be shared across hot-reloads
   // via ESM cache): newest instantiation in this process wins.
@@ -699,12 +704,29 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     // 会永远判超限 → 每 30 分钟撞一次注定失败的压缩。事件口径才是真实窗口。
     let u = Number(usage)
     let uSrc = "event"
+    // R-pending：口径守卫（与 tg-bridge 同族）。事件 input 被宿主报成寿命累计值时
+    // u > CONTEXT_WINDOW（单次调用输入不可能超过模型窗口）→ 判为累计值，丢弃并退回 ledger。
+    let rejectedLifetime = false
+    if (Number.isFinite(u) && u > CONTEXT_WINDOW) {
+      rejectedLifetime = true
+      ctxLifetimeRejected++
+      if (ctxLifetimeRejected <= 5 || ctxLifetimeRejected % 50 === 0) {
+        await log(
+          "error",
+          `auto-continue: ctx usage rejected (lifetime counter, not window): sid=${sanitizeLog(sessionID).slice(0, 12)} u=${Math.round(u)} win=${CONTEXT_WINDOW} (rejected x${ctxLifetimeRejected})`
+        )
+      }
+    }
     try {
       const db = await readSessionUsage(sessionID)
       const cum = db ? db.input + db.output + db.reasoning : 0
-      if (!(u > 0) && cum > 0 && cum < CONTEXT_WINDOW) {
+      if ((!(u > 0) || rejectedLifetime) && cum > 0 && cum < CONTEXT_WINDOW) {
         u = cum
-        uSrc = "ledger"
+        uSrc = rejectedLifetime ? "ledger(rejected)" : "ledger"
+      } else if (rejectedLifetime) {
+        // 事件是累计值、ledger 也不可信：放弃本轮回压缩，交由宿主自身自动压缩。
+        u = 0
+        uSrc = "rejected"
       }
     } catch {
       /* keep event value */
@@ -1092,6 +1114,30 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           if (!isNeutralUserText(t) && !isSyntheticPrompt(t)) {
             latestUserText = t
             if (Number.isFinite(created) && created > newestUserTs) newestUserTs = created
+          }
+        }
+      }
+      // R-1720：全局 /loop stop 期间由 readCtl 分支写入的 "loop-stopped" 粘性条目，
+      // 在 /loop start 重开闸后必须立即失效 —— 否则闸已开而 newestId 无新消息时，
+      // 每拍命中下方 `skip.lastId === newestId` 静默 return，会话永久停摆
+      // （实测 f1f1829d：13:52 停环期写入 → 14:47 /loop start 后至今零 eval，
+      //   与 f260d5c5「熔断后再没循环过」同类，只有来新用户消息才侥幸解锁）。
+      // 闸仍关（stop 未解除）时保持粘性静默；闸方开时清单条目一次性失效。
+      {
+        const loopStoppedSkip = skipState.get(sessionID)
+        if (loopStoppedSkip && loopStoppedSkip.reason === "loop-stopped") {
+          let gateOpen = false
+          try {
+            gateOpen = (readCtl()?.stopped ?? false) !== true
+          } catch {
+            gateOpen = true
+          }
+          if (gateOpen) {
+            skipState.delete(sessionID)
+            await log(
+              "info",
+              `auto-continue: loop-stopped skip cleared (gate reopened, session=${sanitizeLog(sessionID).slice(0, 12)})`
+            )
           }
         }
       }
