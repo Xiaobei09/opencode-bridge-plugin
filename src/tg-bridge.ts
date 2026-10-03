@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1084-addbot-env"
+const VERSION = "r1085-diag-redact"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1389,14 +1389,11 @@ const loadPersistedState = (): void => {
     //    完全无法区分。与 savePersistedState 的失败留痕同策略：必须在 RESTORE_DIAG 留痕。
     try {
       readFileSync(STATE_PATH, "utf8") // 能再次读到 → 失败发生在 JSON.parse（文件存在但坏）
-      const msg = `${new Date().toISOString()} state load FAILED: ${STATE_PATH} 存在但无法解析 — 已从默认值启动（front/pinned/watch/队列可能被清空）`
+      const msg = `state load FAILED: ${STATE_PATH} 存在但无法解析 — 已从默认值启动（front/pinned/watch/队列可能被清空）`
+      // diag() 自带时间戳 + 统一脱敏（R1853）
+      diag(msg)
       try {
-        appendFileSync(RESTORE_DIAG_PATH, `${msg}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
-      } catch {
-        /* best-effort */
-      }
-      try {
-        console.error(msg)
+        console.error(`${new Date().toISOString()} ${msg}`)
       } catch {
         /* ignore */
       }
@@ -1547,14 +1544,11 @@ const savePersistedState = (): void => {
     // 十几分钟都没人发现，而它的后果是：队列条目留在文件里 → 重载后重复注入、
     // 计数/历史不落盘、置顶记录清不掉。现在必须留痕。
     stateSaveFails++
-    const msg = `${new Date().toISOString()} state save FAILED x${stateSaveFails}: ${String(err).slice(0, 160)}`
+    const msg = `state save FAILED x${stateSaveFails}: ${String(err).slice(0, 160)}`
+    // diag() 自带时间戳 + 统一脱敏（R1853）
+    diag(msg)
     try {
-      appendFileSync(RESTORE_DIAG_PATH, `${msg}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
-    } catch {
-      /* best-effort */
-    }
-    try {
-      console.error(msg)
+      console.error(`${new Date().toISOString()} ${msg}`)
     } catch {
       /* ignore */
     }
