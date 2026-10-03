@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1097-poll-reentrancy"
+const VERSION = "r1098-menu-qpin"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2254,7 +2254,7 @@ if (view === "loop") {
 if (view === "sys") {
   return [
     [b("ℹ️ 目标详情", "ma:info"), b("🕒 最近动态", "ma:digest")],
-    [b("📡 队列置顶", "ma:queue"), b("🧽 清理旧按钮", "ma:stripall")],
+    [b("📡 队列置顶", "qpin"), b("🧽 清理旧按钮", "ma:stripall")],
     [b("🚀 立即补发并继续注入", "ma:flush"), b("🗑 丢弃外发队列", "ma:drop")],
     [b("🗑 丢弃注入队列", "ma:dropq")],
     [b("❌ 错误日志", "ma:errors"), b("📜 运行日志", "ma:logs")],
@@ -5502,6 +5502,20 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       await answer("已排队")
       await queueAndPump(cchat, target, last, "")
       await log("info", `cb retry -> ${target.slice(0, 12)} queued`)
+      return
+    }
+    if (parts[0] === "qpin") {
+      // R1871：菜单「📡 队列置顶」原先与「📋 查看队列」同绑 `ma:queue`（点哪个都只是看队列），
+      // 文案承诺"置顶"却无实际动作 —— 两个并列按钮行为相同是死按钮。这里改成真实触发
+      // 队列置顶卡刷新（与自动路径同一函数），并如实回报队列是否为空。
+      const n = pinQueue.length + outQueue.length
+      if (n === 0) {
+        await answer("队列为空，无需置顶")
+        return
+      }
+      void refreshQueuePin()
+      await answer(`已请求刷新队列置顶（${n} 条）`)
+      await log("info", `cb qpin -> refresh requested (queued=${n})`)
       return
     }
     if (parts[0] === "full" && parts[1]) {
