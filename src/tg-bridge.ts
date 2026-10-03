@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1103-primary-push"
+const VERSION = "r1104-edit-degrade-drop"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3750,14 +3750,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         rollback()
         await log("error", `proto edit failed (${sanitizeLog(key)}) → degrade send`)
         const n = await sendTextRaw(chatID, text, kb, silent)
-        if (n.r === "sent" && n.id) {
+        // R1877：降级新发也走**同一条送达判定**（`protoDeliveryVerdict`），不再手写 if/else。
+        const ndv = protoDeliveryVerdict(n)
+        if (ndv.delivered && !ndv.degraded && n.id) {
           protoMap.set(key, { id: n.id, text, fallback: n.fallback === true })
           noteHash()
           savePersistedState()
           if (kb && n.fallback !== true) await trackReplyButtons(sess, chatID, n.id, kb, key)
-        } else if (n.r === "retry") {
-          scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true)
-        } else if (n.r === "sent") {
+        } else if (ndv.delivered) {
           // R1868：降级新发命中"TG 2xx 但无 message_id"（`callTelegram` 两条产路：result 缺
           // `message_id` / `res.json()` 抛异常）。旧代码只有上面两个分支 → 这条**静默**什么都不做：
           //   • 不刷新 `lastProtoSendAt` → 污染 R1728 静默断流 watchdog 基线（会误报"断流"）；
@@ -3769,7 +3769,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           lastPushAt = new Date().toISOString()
           if (sess) touchActivity(sess)
           lastProtoSendAt = Date.now()
-          await log("warn", `proto edit-degrade delivered (${sanitizeLog(key)}) no message_id, 无法锚定卡片`)
+          await log("warn", `proto edit-degrade delivered (${sanitizeLog(key)}) no message_id, 无法锚定卡片: ${ndv.why}`)
+        } else if (n.r === "retry") {
+          scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true)
+        } else {
+          // R1877：降级新发**永久失败**（4xx/drop）。旧写法只匹配 sent+id / retry / sent，`drop`
+          // 三支全不中 → **静默丢弃**：既不排重试、不进 dropRing、也没日志。用户视角是"编辑失败后
+          // 连降级新发也彻底没送到"，而日志里只有一句 `proto edit failed`，看不出新发也丢了。
+          // 与主发送路径的 else（`proto send ${r.r}`）同款：**永久失败必须留痕 + 记账**。
+          noteDrop("edit-degrade", `key=${sanitizeLog(key)} desc=${sanitizeLog((n as { desc?: string }).desc ?? "").slice(0, 120)}`)
+          await log("error", `proto edit-degrade dropped (${sanitizeLog(key)}) desc=${sanitizeLog((n as { desc?: string }).desc ?? "").slice(0, 120)}`)
         }
       }
       return
