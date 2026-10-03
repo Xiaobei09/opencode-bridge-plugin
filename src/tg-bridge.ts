@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1099-session-exists"
+const VERSION = "r1100-log-line-integrity"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1813,8 +1813,11 @@ export const redactSecrets = (s: string): string =>
     .replace(/\/bot\d{5,}:[A-Za-z0-9_-]{8,}/g, "/bot<redacted>")
     .replace(/\bbot\d{5,}:[A-Za-z0-9_-]{8,}\b/g, "bot<redacted>")
     .replace(/\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g, "<redacted>")
+// R1873：日志"去控制字符"的**单一来源**（`sanitizeLog` 与 `log()` 出口共用）。目的：
+// 任何进日志的文本都必须是单行（`\n`/控制字符 → 空格），否则外部文本可撕裂/伪造日志行。
+export const stripLogControls = (s: string): string => s.replace(/[\u0000-\u001f\u007f]/g, " ")
 const sanitizeLog = (s: unknown): string => {
-  let out = String(s).replace(/[\u0000-\u001f\u007f]/g, " ")
+  let out = stripLogControls(String(s))
   // 再兜一层：把本进程真实持有的 token 值直接抹掉（不依赖它长得像不像 token）
   if (TOKEN.length >= 20) out = out.split(TOKEN).join("<TOKEN>")
   return redactSecrets(out).slice(0, 300)
@@ -2342,7 +2345,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     `${lvl}|${msg.replace(/[0-9a-f]{8,}|[0-9]+/gi, "#").slice(0, 120)}`
   const log = async (level: "info" | "warn" | "error", rawMessage: string) => {
     // 出口脱敏：任何新增日志语句都不可能绕过（此前只有部分调用点用了 sanitizeLog）
-    const message = redactSecrets(rawMessage)
+    // R1873：脱敏之外还要**去控制字符**。redactSecrets 只认 token 形态；而外部文本
+    // （TG API 的 `desc`、反代响应 body、异常 message）可含 `\n`/控制字符 → 撕裂或伪造日志行，
+    // 而"近 N 分钟 0 error"正是靠**可 grep 的单行**日志判定健康。出口统一置为空格，调用点无法绕过。
+    const message = stripLogControls(redactSecrets(rawMessage))
     if (level === "error") noteError(message)
     // 爆发折叠（只对 error）：前 5 次逐条记，之后每 20 次记一条带计数的汇总。
     let outMessage = message
