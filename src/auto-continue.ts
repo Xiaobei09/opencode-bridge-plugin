@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
-import { statSync, readFileSync, writeFileSync, appendFileSync } from "node:fs"
+import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl } from "./loop-guard"
@@ -50,7 +50,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1051-loop-merge"
+const VERSION = "r1052-loop-atomic"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
@@ -59,6 +59,27 @@ const stripLoopTitle = (title: string): string => {
 }
 const AC_GEN_KEY = process.env.AC_GEN_KEY ?? "__acGen"
 const PRIVATE_FILE_MODE = 0o600
+
+// R1847：原子写 JSON（tmp 带 pid + rename），用于**跨进程共享**的注册表文件。
+// loop-sessions.json / loop-sessions-off.json 被三个 Bot 各自的 auto-continue 进程
+// 与 tg-bridge 同时读写；旧的裸 writeFileSync 先 O_TRUNC 再写，并发读者在窗口内
+// 读到空/半截 → JSON.parse 抛错 → 被 catch 当成"没有登记项" → 该轮 loop=no
+//（症状："自动循环莫名其妙停一轮/粘性丢失"）。rename 原子，读者只见旧版或新版。
+export const atomicWriteJson = (path: string, value: unknown): void => {
+  const tmp = `${path}.tmp-${process.pid}`
+  try {
+    writeFileSync(tmp, JSON.stringify(value), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+    renameSync(tmp, path)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      /* best-effort */
+    }
+    throw err
+  }
+}
+export const LOOP_SESSIONS_CAP = 16
 
 // 记录“被本插件打过 [LOOP] 标记的会话”集合。热重载后内存态丢失，若不落盘，
 // 旧目标上的 [LOOP] 会永久残留成假标记。集合而非单值：历史上可能同时存在
@@ -477,10 +498,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   }
   const persistLoopOff = (): void => {
     try {
-      writeFileSync(LOOP_OFF_PATH, JSON.stringify([...loopOffSessions].slice(-16)), {
-        encoding: "utf8",
-        mode: PRIVATE_FILE_MODE,
-      })
+      atomicWriteJson(LOOP_OFF_PATH, [...loopOffSessions].slice(-LOOP_SESSIONS_CAP))
     } catch (err) {
       void log("error", `loop off list persist failed: ${sanitizeLog(err).slice(0, 100)}`)
     }
@@ -490,9 +508,19 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const persistLoopSessions = (): void => {
     if (!loopSessionsDirty) return
     loopSessionsDirty = false
-    const keep = mergeLoopRegistry(loopSessions, currentLoopTargets(), 8)
+    // R1847：落盘前先并入**盘上**注册表。三个 Bot 各一份 auto-continue 进程共享同一文件，
+    // 纯内存 sticky 落盘时，别进程刚写的条目会被本进程覆盖（后写者胜）。先读盘并集，
+    // 再走"目标保命"合并（R1839）。cap 也从 8 对齐到 16 —— 桥的 writeIdList 用的是 16，
+    // 旧 cap 8 会在每次 auto-continue 落盘时把第 9..16 条历史直接截掉（跨进程名单震荡）。
     try {
-      writeFileSync(LOOP_SESSIONS_PATH, JSON.stringify(keep), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+      const arr = JSON.parse(readFileSync(LOOP_SESSIONS_PATH, "utf8"))
+      if (Array.isArray(arr)) for (const x of arr) if (typeof x === "string" && x.startsWith("ses_")) loopSessions.add(x)
+    } catch {
+      /* 读不到 = 无盘上条目 */
+    }
+    const keep = mergeLoopRegistry(loopSessions, currentLoopTargets(), LOOP_SESSIONS_CAP)
+    try {
+      atomicWriteJson(LOOP_SESSIONS_PATH, keep)
       void log("info", `loop sessions persisted: ${keep.map((x) => x.slice(0, 12)).join(",")}`)
     } catch (err) {
       // 静默失败会让"粘性标志"变成死代码而无人察觉
