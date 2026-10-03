@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1088-retry-evict"
+const VERSION = "r1089-poll-5xx"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2011,6 +2011,18 @@ export const isRoutinePollError = (why: string): boolean => {
   if (!s) return false
   if (/timeout|timed out|timeouterror|aborted|abort/i.test(s)) return true
   return /econnreset|econnrefused|epipe|enetunreach|enetdown|ehostunreach|eai_again|socket hang up|fetch failed|premature|gnutls|ssl|tls/i.test(s)
+}
+
+// R1861：非 2xx 响应的**状态码**判据（纯函数）—— 与 isRoutinePollError 同族。
+// getUpdates 收到 5xx（Telegram/反代 500/502/503/504）是**服务端瞬时**错误：本轮未消费任何
+// update、offset 不变，下一次轮询立即重试即可自愈。旧实现把**任何**非 2xx 一律
+// `getUpdates failed: …` 打 error（5xx 也照打）→ 服务端抖动一次就污染"近 N 分钟 0 error"
+// 健康信号（R1850 已在 catch 路径修过同一族，这里补全响应分支）。
+// 但 409（同一 token 有第二个轮询者）、401/400/403 是**真错误/真配置问题**，必须保留 error。
+// 故判据**只认 5xx** 为 routine。
+export const isRoutinePollStatus = (status: number): boolean => {
+  const s = Number(status)
+  return Number.isFinite(s) && s >= 500 && s < 600
 }
 
 // R1823：群聊命令的 @botname 后缀剥离（纯函数）。Telegram 在群聊会把命令改写成 `/cmd@BotName`；
@@ -6878,10 +6890,17 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         } catch {
           /* unreadable */
         }
-        await log(
-          "error",
-          `getUpdates failed: ${res.status} (status=${res.status}, holder=${holder.slice(0, 8)}, me=${shortId}, gen=${myGen}, pid=${process.pid})`,
-        )
+        const detail = `getUpdates failed: ${res.status} (status=${res.status}, holder=${holder.slice(0, 8)}, me=${shortId}, gen=${myGen}, pid=${process.pid})`
+        if (isRoutinePollStatus(res.status)) {
+          // R1861：5xx 是服务端瞬时（本轮未消费 update、offset 不变，下一轮自愈）。
+          // 降级 info + 节流（复用 pollTimeoutLogAt），不再污染健康信号；409/4xx 仍走 error。
+          if (Date.now() - pollTimeoutLogAt > 5 * 60_000) {
+            pollTimeoutLogAt = Date.now()
+            await log("info", `long poll server error (routine, will retry): ${detail}`)
+          }
+        } else {
+          await log("error", detail)
+        }
         return
       }
       const j = (await res.json()) as any
