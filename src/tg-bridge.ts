@@ -49,6 +49,21 @@ const bgHttpAvail = (): boolean => {
   }
 }
 
+// R1635/R1834：Telegram 429 响应解析与冷却（纯函数，供 bot 改名使用）。
+export const parseTgRetryAfter = (text: string): number => {
+  try {
+    const j = JSON.parse(text) as { parameters?: { retry_after?: number } }
+    if (j && typeof j === "object") return Number(j?.parameters?.retry_after) || 0
+  } catch { /* 非 JSON 响应 */ }
+  return 0
+}
+export const renameCooling = (until: number, now: number): boolean => until > now
+export const rename429Seconds = (status: number, retryAfterSec: number, fallbackS = 300): number => {
+  const ra = Number(retryAfterSec)
+  if (Number.isFinite(ra) && ra > 0) return Math.max(1, Math.floor(ra))
+  return status === 429 ? Math.max(1, Math.floor(fallbackS)) : 0
+}
+
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
 // 分母 = 模型 limit.context（provider.list 实取，取不到回落 1M）。
@@ -268,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1067-bghttp-timeout"
+const VERSION = "r1068-rename429"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2612,29 +2627,64 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const sig = `${sid.slice(0, 12)}|${title}`
     if (sig === lastRenameSig) return false
     if (renameInFlight) await renameInFlight
-    lastRenameSig = sig
     const name = title.slice(0, 64)
     const short = `TG \\u2192 ${sid.slice(0, 12)}`
-    const run = async (): Promise<boolean> => {
+    // R1635：setMyName 响应校验 + 429 冷却跨重载持久化。
+    //   * 检查 HTTP status 与响应体 {ok:false, error_code, parameters.retry_after}；
+    //   * 429 时把冷却截止时间按 BOT_ID 写入 botname-429.json（reload 后仍记得）；
+    //   * lastRenameSig 仅在**两请求都成功**后推进，失败留空 → 下轮 poll 自动重试。
+    const RENAME_429_PATH = "/root/.config/opencode/botname-429.json"
+    let rename429Until = 0
+    let rename429LogAt = 0
+    {
       try {
-        await fetch(`https://api.telegram.org/bot${TOKEN}/setMyName`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name }),
-          signal: AbortSignal.timeout(15000),
-        })
-        await fetch(`https://api.telegram.org/bot${TOKEN}/setMyShortDescription`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ short_description: short }),
-          signal: AbortSignal.timeout(15000),
-        })
-        await log("info", `bot renamed to "${title.slice(0, 30)}" (sid=${sid.slice(0, 12)})`)
-        return true
+        const j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until?: number }>
+        rename429Until = Number(j?.[BOT_ID]?.until ?? 0) || 0
+      } catch { rename429Until = 0 }
+    }
+    const noteRename429 = (retryAfterSec: number): void => {
+      rename429Until = Date.now() + Math.max(1, Math.floor(retryAfterSec)) * 1000
+      try {
+        let j: Record<string, { until: number }> = {}
+        try { j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until: number }> } catch { j = {} }
+        j[BOT_ID] = { until: rename429Until }
+        writeFileSync(RENAME_429_PATH, JSON.stringify(j), { encoding: "utf8", mode: 0o600 })
+      } catch { /* 非致命：冷却仍在本进程内存生效 */ }
+    }
+    const postJson = async (path: string, body: object): Promise<void> => {
+      const res = await fetch(`https://api.telegram.org/bot${TOKEN}/${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        const retryAfter = parseTgRetryAfter(text)
+        // R1834：429 必须始终装冷却（响应体读不到 retry_after 时用兜底 300s）。
+        const coolSec = rename429Seconds(res.status, retryAfter)
+        if (coolSec > 0) noteRename429(coolSec)
+        throw new Error(`TG ${path} HTTP ${res.status}${retryAfter > 0 ? ` retry_after=${retryAfter}s` : ""}: ${text.slice(0, 80)}`)
+      }
+    }
+    const run = async (): Promise<boolean> => {
+      if (renameCooling(rename429Until, Date.now())) {
+        if (Date.now() - rename429LogAt > 60_000) {
+          rename429LogAt = Date.now()
+          await log("warn", `bot rename rate-limited (bot=${BOT_ID}, until ${new Date(rename429Until).toISOString().slice(11, 19)}, sid=${sid.slice(0, 12)})`)
+        }
+        return false
+      }
+      try {
+        await postJson("setMyName", { name })
+        await postJson("setMyShortDescription", { short_description: short })
       } catch (err) {
         await log("error", `bot rename failed: ${sanitizeLog(err).slice(0, 120)}`)
         return false
       }
+      lastRenameSig = sig
+      await log("info", `bot renamed to "${title.slice(0, 30)}" (sid=${sid.slice(0, 12)})`)
+      return true
     }
     renameInFlight = run()
     const ok = await renameInFlight
