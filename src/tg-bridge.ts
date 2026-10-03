@@ -24,9 +24,11 @@ const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }
     const pw = String(reg?.password ?? "")
     if (!url || !pw) return { ok: false, text: "✗ 服务注册不可读（service.json 缺 url/password）" }
     const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
+    // R1833：必须显式超时（理由见 live v2lib/tg-bridge.ts 同名注释）。本文件其余网络调用均有 15s 超时。
     const r = await fetch(`${url}/api/session/${encodeURIComponent(sid)}/background`, {
       method: "POST",
       headers: { Authorization: `Basic ${token}` },
+      signal: AbortSignal.timeout(15_000),
     })
     if (!r.ok) return { ok: false, text: `✗ HttpApi 提升被拒：HTTP ${r.status}` }
     return { ok: true, text: `✓ 已请求转后台（直连宿主 HttpApi，HTTP ${r.status}）` }
@@ -266,7 +268,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1066-redact"
+const VERSION = "r1067-bghttp-timeout"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
