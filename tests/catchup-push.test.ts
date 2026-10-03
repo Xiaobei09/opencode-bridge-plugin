@@ -12,8 +12,8 @@ import { readFileSync } from "node:fs"
 const src = readFileSync(new URL("../src/tg-bridge.ts", import.meta.url), "utf8")
 const lines = src.split("\n")
 
-test("VERSION 已推进到 r1063-catchup", () => {
-  expect(src).toContain('const VERSION = "r1063-catchup"')
+test("VERSION 行存在且为 r 前缀版本号（与特性解耦，避免每次 bump 误报）", () => {
+  expect(src).toMatch(/^const VERSION = "r[0-9A-Za-z._-]+"$/m)
 })
 
 test("补扫间隔存在且有 R1827 标记", () => {
