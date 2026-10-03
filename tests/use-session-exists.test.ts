@@ -17,7 +17,8 @@ test("R1829：存在性判定纯函数已接线", () => {
   expect(src).toMatch(/return knownIds\.includes\(id\)/)
 })
 
-test("R1829：文本 /use 在钉选前核对会话存在性", () => {
-  expect(src).toContain("if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true))")
+test("R1829/R1874：文本 /use 在钉选前核对会话存在性，listOk 取真实刷新结果", () => {
+  expect(src).toContain("const listOk = await refreshSessionTitles()")
+  expect(src).toContain("if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk))")
   expect(src).toContain("会话不存在：")
 })

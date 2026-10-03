@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1100-log-line-integrity"
+const VERSION = "r1101-session-listok"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2695,10 +2695,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
   const sessionTitleCache = new Map<string, string>()
   const cachedSessionList: Array<{ id: string; title?: string }> = []
-  const refreshSessionTitles = async (): Promise<void> => {
+  // R1874：返回**本轮刷新是否成功**。此前返回 void，而 5 个存在性闸都把 `sessionIdAcceptable`
+  // 的第三参 `listOk` 硬编码为 `true` —— 参数形同虚设：`session.list` 失败时缓存里可能仍是
+  // **旧的非空列表**，于是把"新建/未在旧缓存里的有效会话"误判成"不存在"并拒绝，恰好违背
+  // R1829 写明的"拉不到列表时保守放行、不误伤"策略。改为返回 boolean，闸口按真实结果传参。
+  const refreshSessionTitles = async (): Promise<boolean> => {
     try {
       const res = await (client as any).session.list?.({})
-      const arr = Array.isArray(res?.data) ? res.data : []
+      const ok = Array.isArray(res?.data)
+      const arr = ok ? res.data : []
       cachedSessionList.length = 0
       for (const s of arr) {
         const id = String(s?.id ?? "")
@@ -2710,8 +2715,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       for (const [sid, ts] of lastActivity) {
         if (Date.now() - ts > ACTIVE_WINDOW_MS) lastActivity.delete(sid)
       }
+      return ok
     } catch {
       /* non-fatal: titles stay empty */
+      return false
     }
   }
   const sessionNameOf = (sid: string): string => {
@@ -5430,8 +5437,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // 此前回调只校验 `ses_` 前缀：会话被删除后，早年渲染的旧按钮仍可把前台钉到死会话，
       // 表现为"切过去后消息发不出去"（正是 R1819「不能正确选择会话」的回调侧残留）。
       // 保守放行：refreshSessionTitles 失败/列表为空时 sessionIdAcceptable 返回 true，不误伤。
-      await refreshSessionTitles()
-      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+      const listOk = await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk)) {
         await answer("会话不存在")
         await reply(cchat, `❌ 会话不存在：${id.slice(0, 12)}（可能已删除；用 /sessions 查看列表）`)
         return
@@ -5884,8 +5891,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // R1829：只接受列表里**真实存在**的会话。此前仅校验 `ses_` 前缀 —— 粘贴一个
       // 已删除/不存在的完整 ID 会被静默钉选，之后消息发不出去（R1819「不能正确选择会话」的残留分支）。
       // 保守放行：refreshSessionTitles 失败/列表为空时 sessionIdAcceptable 返回 true，不误伤。
-      await refreshSessionTitles()
-      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+      const listOk = await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk)) {
         await reply(chatID, `❌ 会话不存在：${clean(want, 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
@@ -6006,8 +6013,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       // R1872：与 /use（R1829）同一存在性不变量 —— 仅校验 `ses_` 前缀会把已删除/不存在的
       // 完整 ID 静默加入附加镜像（占用 WATCH_MAX、持久化、永远收不到消息）。列表可用时必须在列。
-      await refreshSessionTitles()
-      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+      const listOk = await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk)) {
         await reply(chatID, `❌ 会话不存在：${clean(want, 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
@@ -6156,8 +6163,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       // R1872：与 /use（R1829）同一存在性不变量 —— 别名指向已删除/不存在的完整 ID 会成为
       // "毒别名"：/use 名字会报错（好），但 /watch 名字会经 aliasHit 直接拿到该死 id。
-      await refreshSessionTitles()
-      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+      const listOk = await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk)) {
         await reply(chatID, `❌ 会话不存在：${clean(arg, 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
@@ -6808,8 +6815,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       // R1872：与 /use（R1829）同一存在性不变量 —— 否则 /sendto 一个已删除的完整 ID 会把
       // 消息塞进不存在的会话，用户只看到后续投递失败，却没有"会话不存在"的明确拒绝。
-      await refreshSessionTitles()
-      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+      const listOk = await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), listOk)) {
         await reply(chatID, `❌ 会话不存在：${clean(rest.slice(0, sp), 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
