@@ -1867,8 +1867,10 @@ export const validateHtmlText = (text: string): string | null => {
 // 现在：连续第 n 次 429 的等待 = max(指数项 base·2^(n-1), Telegram 的 retry_after)，
 // 封顶 cap；**成功一次即清零** attempt。抖动（jitter）让多 Bot / 多会话的重试
 // 不在同一个毫秒撞上，避免"齐步走"再次触发限流。
-// 不变量：返回值**永远 ≥ Telegram 要求的 retry_after**（抖动因子 ≥1），
-// 所以退避只会让我们更慢、更少请求，绝不会早于 Telegram 允许的时间再打。
+// 不变量：返回值**永远 ≥ min(cap, Telegram 要求的 retry_after)**（抖动因子 ≥1）。
+// ⚠️ retry_after > cap（默认 900s）时**不**成立 —— 超大 retry_after 会被 cap 收敛
+// （有意为之，见测试"retry_after 巨大时按 cap 收敛"）。准确表述是"最慢每 cap 秒重试一次"，
+// 而非"绝不早于 Telegram 允许的时间"。
 export const FLOOD_BACKOFF_BASE_S = 60
 export const FLOOD_BACKOFF_CAP_S = 900
 export const FLOOD_BACKOFF_FLOOR_S = 5
