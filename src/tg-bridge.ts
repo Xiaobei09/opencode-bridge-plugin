@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1073-full-chunk"
+const VERSION = "r1074-atomic-pid"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1390,22 +1390,18 @@ const loadPersistedState = (): void => {
  * 表现为"循环莫名停了一下又自己好了"，极难归因。
  * rename 在同一文件系统内是原子的，读者要么看到旧内容要么看到新内容。
  */
-const atomicWrite = (path: string, body: string, mode?: number): void => {
-  const tmp = `${path}.tmp`
+export const atomicWrite = (path: string, body: string, mode?: number): void => {
+  // R1841：tmp 名带 pid —— 与 `writeIdList` 同约定。reload 期间旧/新插件进程可能并存，
+  // 固定 `.tmp` 会让两者互相截断对方正在写的临时文件，rename 后可能落一个半截状态文件。
+  const tmp = `${path}.tmp-${process.pid}`
   try {
     writeFileSync(tmp, body, mode === undefined ? { encoding: "utf8" } : { encoding: "utf8", mode })
-    try {
-      renameSync(tmp, path)
-    } catch {
-      // 极个别文件系统不支持 rename 覆盖：退回直写（并留下 tmp 清理）
-      writeFileSync(path, body, mode === undefined ? { encoding: "utf8" } : { encoding: "utf8", mode })
-      try {
-        unlinkSync(tmp)
-      } catch {
-        /* ignore */
-      }
-    }
+    renameSync(tmp, path)
   } catch {
+    // R1841：不再"退回直写"。直写非原子，一旦中途失败（ENOSPC/EIO/权限）会把**原文件**
+    // 截断写坏且无法回滚 —— 比"这次没保存"严重得多（状态文件损坏 = 队列/置顶全丢）。
+    // 宁可本次保存失败并抛错（调用方 catch 记日志、下一拍重试），也要保证读者看到的
+    // 永远是"旧的完整内容或新的完整内容"。
     try {
       unlinkSync(tmp)
     } catch {
