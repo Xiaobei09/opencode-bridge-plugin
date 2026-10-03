@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1068-rename429"
+const VERSION = "r1069-addbot-tokdel"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2633,7 +2633,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     //   * 检查 HTTP status 与响应体 {ok:false, error_code, parameters.retry_after}；
     //   * 429 时把冷却截止时间按 BOT_ID 写入 botname-429.json（reload 后仍记得）；
     //   * lastRenameSig 仅在**两请求都成功**后推进，失败留空 → 下轮 poll 自动重试。
-    const RENAME_429_PATH = "/root/.config/opencode/botname-429.json"
+    const RENAME_429_PATH = "REDACTED_ROOT/.config/opencode/botname-429.json"
     let rename429Until = 0
     let rename429LogAt = 0
     {
@@ -5859,7 +5859,18 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     }
     if (text.startsWith("/addbot") || cmd === "addbot") {
       const rest = text.slice("/addbot".length).trim()
-      await handleAddBot(rest ? rest.split(/\s+/) : [], chatID)
+      const args = rest ? rest.split(/\s+/) : []
+      // R1835：/addbot 的用户消息里是**明文 token**。登记前先尽力删除这条消息，缩短 token
+      // 在 TG 历史里的暴露窗口（私聊中 Bot 可删除自己收到的消息；群聊 / 超 48h / 失败则静默忽略）。
+      // 仅在确实带了参数（疑似 token）时删；纯 `/addbot` 用法提示消息不删。
+      if (args[0] && inboundMsgID > 0) {
+        try {
+          await tgFetch("deleteMessage", { chat_id: Number(chatID) || chatID, message_id: inboundMsgID })
+        } catch {
+          /* best-effort：删不掉不影响登记 */
+        }
+      }
+      await handleAddBot(args, chatID)
       return
     }
     const listSessions = async (limit: number): Promise<{ text: string; kb?: unknown }> => {
