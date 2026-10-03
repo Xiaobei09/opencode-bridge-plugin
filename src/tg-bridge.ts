@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1096-seen-ring"
+const VERSION = "r1097-poll-reentrancy"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -6881,6 +6881,16 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
 
   const poll = async (): Promise<void> => {
     if (polling) return
+    // R1870：`polling` 必须在进入本函数的**第一个 await 之前**置位。它一身两职：
+    //   (a) setInterval(POLL_MS=2s) 的防重入闸；
+    //   (b) sanityCheckOffset / peekLatestUpdateId 判定"轮询在飞"（否则并发 getUpdates → 409）。
+    // 旧实现把它写在若干 await（循环停止态每拍 `clearPinnedBars` 的 TG 网络往返、
+    // `reply`、log）**之后** → 只要其中任一 await 超过 2s，下一拍 interval 看到 polling
+    // 仍为 false 就会再进一个 poll，两路 getUpdates 并发，Telegram 对同一 token 回 409
+    // 并掐断在飞的那一个（**静默丢轮**）。现在整个函数体包进 try/finally，任何 early
+    // return 都会在 finally 复位，杜绝该窗口。
+    polling = true
+    try {
     if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) {
       stopPolling()
       // 正常交接（热重载）不是错误：记 info，否则真错误会被淹没在换代噪声里。
@@ -6932,8 +6942,6 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const cur = fixedTarget ?? frontSessionID ?? persistedFront
       if (typeof cur === "string" && cur.startsWith("ses_")) void renameBotToSession(cur)
     }
-    polling = true
-    try {
       const url = `${apiBase}/getUpdates?offset=${encodeURIComponent(offset)}&limit=10&timeout=20`
       pollAbort = new AbortController()
       const res = await fetch(url, {
