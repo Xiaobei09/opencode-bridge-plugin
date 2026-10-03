@@ -50,7 +50,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1050-markergen"
+const VERSION = "r1051-loop-merge"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
@@ -265,6 +265,27 @@ const currentLoopTargets = (): string[] => {
 }
 const currentLoopTarget = (): string => currentLoopTargets()[0] ?? ""
 const isLoopTarget = (sessionID: string): boolean => currentLoopTargets().includes(sessionID)
+
+/**
+ * R1839：合并 loop 注册表时的「当前目标保命」规则。
+ *
+ * 旧实现 `[...new Set([...currentLoopTargets(), ...loopSessions])].slice(-8)` 把**当前目标放在最前**，
+ * 再用 `slice(-8)` 取最后 8 条 —— 当 sticky 注册表已有 ≥8 条时，`currentLoopTargets()` 会被**整体挤掉**。
+ * 后果：用户刚 `/use` 钉选的新前台（未发过标记词、只靠本函数“粘”进注册表）永远进不了注册表 →
+ * 下一轮 `loop = loopSessions.has(sid)` 为假 → `eval begin … loop=no -> skip` → 症状正是「自动循环没了」。
+ * 修法：把目标从 sticky 里剔除后**追加到末尾**，保证它们优先占据 cap 的末尾名额（目标 ≤3、cap 8，恒能容纳）。
+ * 纯函数、无 IO，可单测。
+ */
+export const mergeLoopRegistry = (
+  sticky: Iterable<string>,
+  targets: readonly string[],
+  cap = 8,
+): string[] => {
+  const tg = [...new Set(targets.filter((x) => typeof x === "string" && x.startsWith("ses_")))]
+  const others = [...new Set([...sticky])].filter((x) => !tg.includes(x))
+  const room = Math.max(0, cap - tg.length)
+  return [...others.slice(-room), ...tg].slice(-cap)
+}
 // R1107：用户主动中断（⏹ doStop 成功）的会话。halted 逐会话持久化在各 Bot 状态文件的
 // halted 数组里（tg-bridge 侧 doStop → savePersistedState）。auto-continue 必须尊重它，
 // 否则"用户主动终止后循环仍继续"。不清共享总闸 → 其它会话/Bot 不受影响；用户新消息
@@ -469,7 +490,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const persistLoopSessions = (): void => {
     if (!loopSessionsDirty) return
     loopSessionsDirty = false
-    const keep = [...new Set([...currentLoopTargets(), ...loopSessions])].slice(-8)
+    const keep = mergeLoopRegistry(loopSessions, currentLoopTargets(), 8)
     try {
       writeFileSync(LOOP_SESSIONS_PATH, JSON.stringify(keep), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
       void log("info", `loop sessions persisted: ${keep.map((x) => x.slice(0, 12)).join(",")}`)
