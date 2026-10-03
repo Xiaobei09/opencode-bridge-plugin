@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1057-useindex"
+const VERSION = "r1058-shellpromo"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -4973,7 +4973,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       selfmute: selfMute,
       guard: readGuard(),
       bgAuto: readBg().enabled,
-      bgShellAuto: readBg().shellAuto,
+      bgShellAuto: readBg().shellPromo !== false,
     })
   const handleCallback = async (cq: any): Promise<void> => {
     try {
@@ -5908,7 +5908,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const envOn = bgEnvOn()
       const capLabel = bgApiLabel(shape) === "无（不支持）" ? "无（不支持）·HTTP直连可用" : bgApiLabel(shape)
       const bgStatus = (extra = ""): string =>
-        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellAuto ? "开" : "关"}${extra}\n` +
+        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellPromo !== false ? "开" : "关"}${extra}\n` +
         "· 提升：把**正在阻塞**的同步子代理转后台（无端点时走宿主 HTTP 直连）\n" +
         "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
@@ -5929,7 +5929,9 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         }
       }
       const bgArg = (text.startsWith("/background ") ? text.slice(11).trim() : "")
-      const bgAct = parseBgArg(bgArg, curBg)
+      // R1822：shell 开关的 toggle 基准改用真正生效的 shellPromo（菜单「shell 自动后台」据此显示），
+      // 否则按钮显示的开/关与实际插件强制提升状态不一致（用户反馈"转后台按钮不能实际控制"）。
+      const bgAct = parseBgArg(bgArg, { ...curBg, shellAuto: curBg.shellPromo !== false })
       if (bgAct.kind === "help") {
         await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background status\n${bgStatus()}`)
         return
@@ -5944,7 +5946,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return
       }
       if (bgAct.kind === "setshell") {
-        writeBg({ ...curBg, shellAuto: bgAct.enabled })
+        writeBg({ ...curBg, shellAuto: bgAct.enabled, shellPromo: bgAct.enabled })
         await reply(chatID, `[tg-bridge] shell 自动后台 → ${bgAct.enabled ? "开" : "关"}\n${bgStatus()}`)
         return
       }
