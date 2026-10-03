@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1078-logs-redact"
+const VERSION = "r1079-cmd-lowercase"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1999,6 +1999,16 @@ export const commandArg = (text: string): string => {
   if (!t.startsWith("/")) return ""
   const m = /^\/[^\s]+/.exec(t)
   return m ? t.slice(m[0].length).trim() : ""
+}
+
+// R1846：命令 token 归一（小写）。Telegram **原样投递**用户键入的大小写（只有菜单自动补全才是小写），
+// 而命令名恒为小写。旧实现 cmd 不做 toLowerCase：`/Menu`、`/USE`、`/U` 既不命中任何命令块，
+// 也不在 KNOWN_CMDS 内 → 被回成「❓ 未知命令 /Menu」（用户明明敲的是正确命令），且永远走不到
+// 真实处理。此处在**入口**统一归一，别名表 CMD_ALIAS（键本就小写）随之自然命中。
+export const normalizeCmd = (text: string): string => {
+  const t = String(text ?? "")
+  if (!t.startsWith("/")) return ""
+  return t.slice(1).split(/[\s@]/)[0].toLowerCase()
 }
 
 export const floodBackoffSeconds = (input: FloodBackoffInput = {}): number => {
@@ -5580,7 +5590,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     currentInbound = Number.isFinite(inboundMsgID) && inboundMsgID > 0 ? { chat: chatID, msgID: inboundMsgID } : null
     // R1823：群聊命令可能带 @botname 后缀；解析前先剥离，否则参数切片失配（详见 stripCmdBotSuffix）。
     const text = stripCmdBotSuffix((typeof msg.text === "string" ? msg.text : typeof msg.caption === "string" ? msg.caption : "").trim())
-    let cmd = text.startsWith("/") ? text.slice(1).split(/[\s@]/)[0] : ""
+    let cmd = normalizeCmd(text)
     if (cmd && CMD_ALIAS[cmd]) cmd = CMD_ALIAS[cmd]
     if (!text) {
       const kind = msg.photo ? "photo" : msg.sticker ? "sticker" : msg.voice ? "voice" : msg.video ? "video" : msg.document ? "document" : msg.location ? "location" : msg.contact ? "contact" : "empty-text"
