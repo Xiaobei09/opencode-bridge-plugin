@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1095-edit-degrade"
+const VERSION = "r1096-seen-ring"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -595,6 +595,12 @@ try {
 const OWNER_STALE_MS = 60_000
 // 每个 Bot 实例一个独立的代号命名空间：多 Bot 同进程并存时，后加载的实例
 // 不能把先加载的实例判成“过期实例”并抢走它的轮询。
+// R1869：真实 update_id 去重环容量。**内存 / 落盘 / 读回必须同源** —— 旧实现内存硬上限
+// 500（超限 trim 回落到 300），但落盘与读回都写死 `.slice(-300)`：热重载后环会静默缩水
+// 最多 200 个 id。落在被截窗口里的重投 update 会被**再次处理**（"同一条命令触发两次"）。
+// 注意：合成事件（菜单）不入环（见 handleUpdateInner），故这里只装真实 update_id。
+const SEEN_RING_MAX = 500
+const SEEN_RING_KEEP = 300
 const seenUpdates = new Set<number>()
 type FilterMode = 0 | 1 | 2
 // 推送过滤：0=不发，1=只发标题行，2=正常发送
@@ -1229,7 +1235,7 @@ const loadPersistedState = (): void => {
     }
     const su = j?.seen
     if (Array.isArray(su)) {
-      for (const x of su.slice(-300)) if (Number.isInteger(x)) seenUpdates.add(x)
+      for (const x of su.slice(-SEEN_RING_MAX)) if (Number.isInteger(x)) seenUpdates.add(x)
     }
     const fk = j?.fullkeys
     if (fk && typeof fk === "object") {
@@ -1537,7 +1543,7 @@ const savePersistedState = (): void => {
         hashes: [...sentHash].slice(-1500),
         rounds: Object.fromEntries([...lastRound.entries()].slice(-200)),
         // 只落盘真实 update_id（负数是菜单合成事件，见 handleUpdateInner）
-        seen: [...seenUpdates].filter((x) => x >= 0).slice(-300),
+        seen: [...seenUpdates].filter((x) => x >= 0).slice(-SEEN_RING_MAX),
         fullkeys: Object.fromEntries(fullKeyStore),
         lastreply: Object.fromEntries(lastReply),
         stripkb: [...strippedKb].slice(-200),
@@ -5629,9 +5635,9 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     const uid = Number(u?.update_id ?? 0)
     if (!Number.isFinite(uid)) return
     // 合成事件（菜单按钮把动作转成文本命令再喂回来）**不进真实去重环**。
-    // 原因：seenUpdates 只有 300 格且会落盘，合成 id 也在里面；菜单点得多了会把
-    // 真实 update_id 挤出环外，Telegram 重投同一条时就会被处理第二次 —— 症状正是
-    // "同一条命令触发两次"。合成事件不会被 Telegram 重投，本来就不需要去重。
+    // 原因：去重环容量有上限且会落盘，若把合成 id 也塞进去，菜单点多了会把真实
+    // update_id 挤出环外（或落盘截断），Telegram 重投同一条时就会被处理第二次 ——
+    // 症状正是"同一条命令触发两次"。合成事件不会被 Telegram 重投，本来就不需要去重。
     if (!opts?.synthetic) {
       if (seenUpdates.has(uid)) {
         inboundCounters.droppedDupe++
@@ -5651,8 +5657,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       lastRealUpdateId = uid
       savePersistedState()
     }
-    if (seenUpdates.size > 500) {
-      const arr = [...seenUpdates].slice(-300)
+    if (seenUpdates.size > SEEN_RING_MAX) {
+      const arr = [...seenUpdates].slice(-SEEN_RING_KEEP)
       seenUpdates.clear()
       for (const x of arr) seenUpdates.add(x)
     }
