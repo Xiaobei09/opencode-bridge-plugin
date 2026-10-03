@@ -34,6 +34,18 @@ const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }
     return { ok: false, text: `✗ 直连失败：${String(err).slice(0, 120)}` }
   }
 }
+// 直连宿主 HttpApi 是否可用（service.json 同时含 url 与 password）。手动提升与自动提升共用此判据。
+const bgHttpAvail = (): boolean => {
+  try {
+    const reg = JSON.parse(readFileSync(`${process.env.HOME ?? "/root"}/.local/state/opencode/service.json`, "utf8")) as {
+      url?: string
+      password?: string
+    }
+    return Boolean(String(reg?.url ?? "").replace(/\/+$/, "") && reg?.password)
+  } catch {
+    return false
+  }
+}
 
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
@@ -254,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1055-bgmode"
+const VERSION = "r1056-bgauto-http"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -6860,7 +6872,21 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       if (!cfg.enabled || !sid) return
       const msgs = await fetchTail(sid, 1)
       const parts: any[] = Array.isArray(msgs) ? (msgs[0]?.parts ?? []) : []
-      const d = shouldAutoPromote(parts, cfg, Date.now(), bgLastAttempt.get(sid) ?? 0, bgEnvOn(), bgApiShape(client))
+      // R1820：插件 client 白名单**没有** background 端点（load 时 shape-dump 实证：
+      // session 键无 background、experimental.session 为空），唯一可用路是 HTTP 直连
+      // （与手动「立即转后台」同路；对不存在会话探测得 404 SessionNotFound → 路由存在，不经实验开关）。
+      // 修复用户反馈「菜单里的转后台按钮不能实际控制是否自动转后台」：此前把 client shape / 实验开关
+      // 当硬门槛，shouldAutoPromote 第一步就判「本 build client 无后台 API」或「实验开关未开启」
+      // → 开关打开也永不触发。直连可用 ⇒ 视为具备能力、且不要求实验开关。
+      const httpAvail = bgHttpAvail()
+      const d = shouldAutoPromote(
+        parts,
+        cfg,
+        Date.now(),
+        bgLastAttempt.get(sid) ?? 0,
+        bgEnvOn() || httpAvail,
+        httpAvail ? undefined : bgApiShape(client),
+      )
       if (!d.go) {
         if (Date.now() - bgLastWhyLogAt > 10 * 60_000) {
           bgLastWhyLogAt = Date.now()
