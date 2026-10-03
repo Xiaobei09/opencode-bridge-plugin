@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1077-rename429-atomic"
+const VERSION = "r1078-logs-redact"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1764,7 +1764,7 @@ const SOURCE = (() => {
 // 只要任何一条日志带上 URL（fetch 异常、错误对象、调试打印），token 就落盘了。
 // 某些运行时（Node/undici）会把 URL 塞进 error.cause；用户也可能自己粘贴 token。
 // 因此脱敏放在**日志出口**而不是各个调用点 —— 新增日志语句不可能忘记。
-const redactSecrets = (s: string): string =>
+export const redactSecrets = (s: string): string =>
   s
     .replace(/\/bot\d{5,}:[A-Za-z0-9_-]{8,}/g, "/bot<redacted>")
     .replace(/\bbot\d{5,}:[A-Za-z0-9_-]{8,}\b/g, "bot<redacted>")
@@ -6594,7 +6594,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         await reply(chatID, "[tg-bridge] logs（空）")
         return
       }
-      await reply(chatID, `[tg-bridge] logs（近${lines.length}行）\n${lines.join("\n").slice(-3500)}`)
+      // R1845：/logs 读的是**宿主**插件日志（TAP_PATH）—— 里面可能夹带其它插件/undici 写的
+      // 原始 fetch URL（含 bot token）或用户粘贴的密钥，这些行**没经过**本插件的 log() 出口脱敏。
+      // 直接把原文发到 Telegram = 把可能泄露的密钥送到 TG 服务器。发送前统一脱敏：
+      //   redactSecrets 抹 token 形态；再按本进程真实 TOKEN 精确抹除（不赌形态匹配）。
+      const dump = lines.join("\n")
+      const safeDump = TOKEN.length >= 20 ? dump.split(TOKEN).join("<TOKEN>") : dump
+      await reply(chatID, `[tg-bridge] logs（近${lines.length}行）\n${redactSecrets(safeDump).slice(-3500)}`)
       return
     }
     if (text === "/errors" || text.startsWith("/errors ") || cmd === "errors") {
