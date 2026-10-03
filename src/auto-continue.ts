@@ -50,7 +50,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1049-loopboth"
+const VERSION = "r1050-markergen"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
@@ -544,6 +544,8 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
 
   const markerApplied = new Map<string, string>()
   const applyMarker = async (sessionID: string, enabled: boolean): Promise<void> => {
+    // R1832：换代护栏（唯一写入入口统一拦截，理由见 live v2lib/auto-continue.ts 同名注释）。
+    if ((globalThis as Record<string, unknown>)[AC_GEN_KEY] !== myGenAc) return
     if (!isSessionID(sessionID)) return
     const sessionAny = (client as any)?.session
     const get = sessionAny?.get
