@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1089-poll-5xx"
+const VERSION = "r1090-ask-inline"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1822,6 +1822,16 @@ const makeQ = (sid: string, answer: string): string => {
     if (Buffer.byteLength(inline, "utf8") <= 64) return inline
   }
   return `q:${token}`
+}
+// R1862：解析内联作答回调 `qa:<sid>|<答案>`（makeQ 的逆）。**答案可以是任意选项文本**
+// （用户问题的 label），里面可能含 `:`；而 callback_data 以 `:` 分隔字段，若调用方只取
+// `data.split(":")[1]`，答案会在**首个冒号处被静默截断**（例：选项 "A: B" 实际只发出 "A"）。
+// 这里从首个 `|` 切分（sid 恒为 `ses_…`，不含 `|`/`:`），`|` 之后的全部（含冒号）都是答案。
+export const parseAskInline = (data: string): { sid: string; ans: string } => {
+  const s = String(data ?? "")
+  const rest = s.startsWith("qa:") ? s.slice(3) : ""
+  const sep = rest.indexOf("|")
+  return sep >= 0 ? { sid: rest.slice(0, sep), ans: rest.slice(sep + 1) } : { sid: rest, ans: "" }
 }
 const isAllowed = (chat: any): boolean => {
   const id = String(chat?.id ?? "")
@@ -5529,10 +5539,9 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (parts[0] === "qa" && parts[1]) {
-      // 内联作答：<sid>|<答案>。不依赖任何服务端状态，热重载后依然有效。
-      const sep = parts[1].indexOf("|")
-      const sid = sep >= 0 ? parts[1].slice(0, sep) : parts[1]
-      const ans = sep >= 0 ? parts[1].slice(sep + 1) : ""
+      // 内联作答：`qa:<sid>|<答案>`。不依赖任何服务端状态，热重载后依然有效。
+      // R1862：用 parseAskInline 重组被 `:` 拆散的答案（原 `parts[1]` 会在答案含冒号时截断）。
+      const { sid, ans } = parseAskInline(data)
       if (!sid.startsWith("ses_") || !ans) {
         await answer("按钮数据已损坏，请直接发文字")
         return
