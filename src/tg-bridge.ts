@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1092-log-hardening"
+const VERSION = "r1093-answer-transient"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5223,18 +5223,25 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       if (!qid) return
       // 只重试一次、间隔 1.2s：answerCallback 迟迟不到，Telegram 会让按钮一直转圈，
       // 用户看到的就是"按钮点了没反应"。重试成本极低。
+      // R1865：瞬时/确定性分流复用 R1842 的 isTransientStripFailure（0/undefined/429/5xx 为瞬时）。
+      // 旧内联判据 `r.status !== 0 && r.status !== 429 && r.status < 500` 与它等价，但
+      // **瞬时重试与终态失败都记 error** —— 与 sendMessage/editTextRaw 的"瞬时只记 info（will retry）"
+      // 不一致，也与 R1861（getUpdates 5xx 归 routine）同族：服务端抖一下就把"近 N 分钟 0 error"
+      // 健康信号打脏。瞬时耗尽会随用户下次点击自愈 → warn；确定性 4xx 才是真 error。
+      let lastStatus: number | undefined
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           if (attempt > 0) await new Promise((r2) => setTimeout(r2, 1200))
           const r = await tgFetch("answerCallbackQuery", t ? { callback_query_id: qid, text: t.slice(0, 190) } : { callback_query_id: qid })
           if (r.ok) return
-          if (r.status !== 0 && r.status !== 429 && r.status < 500) break
-          await log("error", `answerCallback retry (attempt=${attempt + 1}, data=${sanitizeLog(data).slice(0, 30)}, status=${r.status ?? "?"})`)
+          lastStatus = r.status
+          if (!isTransientStripFailure(r.status)) break
+          await log("info", `answerCallback retry (attempt=${attempt + 1}, data=${sanitizeLog(data).slice(0, 30)}, status=${r.status ?? "?"})`)
         } catch {
           /* best-effort */
         }
       }
-      await log("error", `answerCallback failed (data=${sanitizeLog(data).slice(0, 30)})`)
+      await log(isTransientStripFailure(lastStatus) ? "warn" : "error", `answerCallback failed (data=${sanitizeLog(data).slice(0, 30)})`)
     }
     if (!data || !cchat) {
       await answer()
