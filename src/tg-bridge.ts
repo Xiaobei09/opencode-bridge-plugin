@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1087-own-lru"
+const VERSION = "r1088-retry-evict"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3348,6 +3348,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const oldItem = protoRetry.get(oldKey)
       if (oldItem?.timer) clearTimeout(oldItem.timer)
       protoRetry.delete(oldKey)
+      // R1857：淘汰最旧待重发内容**必须留痕** —— 与 abandon / permanent-drop 同族。
+      // 旧实现静默 clearTimeout+delete：重试队列积压超 200 时，最旧那条消息就凭空消失，
+      // 事后从日志完全看不出（正是用户体感的"部分消息不发送"）。上限本身可以接受，
+      // 但"丢弃"这个动作不能无声。
+      void log(
+        "warn",
+        `proto retry evicted (cap 200, oldest): ${sanitizeLog(oldKey)} attempts=${oldItem?.attempt ?? 0} len=${(oldItem?.text ?? "").length}`,
+      )
     }
     const run = async (): Promise<void> => {
       const retrySid = key.split(":")[0] ?? ""
