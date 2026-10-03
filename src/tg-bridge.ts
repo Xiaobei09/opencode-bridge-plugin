@@ -64,6 +64,23 @@ export const rename429Seconds = (status: number, retryAfterSec: number, fallback
   return status === 429 ? Math.max(1, Math.floor(fallbackS)) : 0
 }
 
+// R1844：纯函数 —— botname-429.json 的写入合并。冷却截止是**单调**时间戳，逐 bot 取 max。
+// 账本跨 bot/跨实例（重载）共享且是 read-modify-write：取 max 保证并发写不会把某 bot 的冷却改小，
+// 顺带规范化掉非正/非法条目。返回值可直接 atomicWrite 落盘。
+export const mergeRename429Until = (
+  disk: Record<string, { until?: number } | undefined>,
+  bot: string,
+  until: number,
+): Record<string, { until: number }> => {
+  const out: Record<string, { until: number }> = {}
+  for (const [k, v] of Object.entries(disk)) {
+    const u = Number(v?.until) || 0
+    if (u > 0) out[k] = { until: u }
+  }
+  out[bot] = { until: Math.max(out[bot]?.until ?? 0, Number(until) || 0) }
+  return out
+}
+
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
 // 分母 = 模型 limit.context（provider.list 实取，取不到回落 1M）。
@@ -283,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1076-peer-atomic-merge"
+const VERSION = "r1077-rename429-atomic"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2643,12 +2660,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       } catch { rename429Until = 0 }
     }
     const noteRename429 = (retryAfterSec: number): void => {
-      rename429Until = Date.now() + Math.max(1, Math.floor(retryAfterSec)) * 1000
+      const until = Date.now() + Math.max(1, Math.floor(retryAfterSec)) * 1000
+      // R1844：冷却截止单调，写入前与磁盘现状逐 bot 取 max 合并（只延长不缩短），
+      // 并用 atomicWrite（tmp+rename）落盘。旧写法原地 read-modify-write：多 bot/重载并存时
+      // ① 互相覆盖对方 bot 的冷却键（丢更新 → 那个 bot 反复打 429）；
+      // ② 读侧可能读到半截 JSON → catch 归 0 → **冷却被静默遗忘** → 重载后又 hammer 429。
+      rename429Until = Math.max(rename429Until, until)
       try {
-        let j: Record<string, { until: number }> = {}
-        try { j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until: number }> } catch { j = {} }
-        j[BOT_ID] = { until: rename429Until }
-        writeFileSync(RENAME_429_PATH, JSON.stringify(j), { encoding: "utf8", mode: 0o600 })
+        let j: Record<string, { until?: number }> = {}
+        try { j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until?: number }> } catch { j = {} }
+        const merged = mergeRename429Until(j, BOT_ID, until)
+        atomicWrite(RENAME_429_PATH, JSON.stringify(merged), 0o600)
+        rename429Until = Math.max(rename429Until, merged[BOT_ID]?.until ?? 0)
       } catch { /* 非致命：冷却仍在本进程内存生效 */ }
     }
     const postJson = async (path: string, body: object): Promise<void> => {
