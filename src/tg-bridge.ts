@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1091-cmd-case-arg"
+const VERSION = "r1092-log-hardening"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1411,7 +1411,7 @@ const loadPersistedState = (): void => {
       // diag() 自带时间戳 + 统一脱敏（R1853）
       diag(msg)
       try {
-        console.error(`${new Date().toISOString()} ${msg}`)
+        console.error(`${new Date().toISOString()} ${redactSecrets(msg)}`)
       } catch {
         /* ignore */
       }
@@ -1566,7 +1566,7 @@ const savePersistedState = (): void => {
     // diag() 自带时间戳 + 统一脱敏（R1853）
     diag(msg)
     try {
-      console.error(`${new Date().toISOString()} ${msg}`)
+      console.error(`${new Date().toISOString()} ${redactSecrets(msg)}`)
     } catch {
       /* ignore */
     }
@@ -2268,7 +2268,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       },
     })
   } catch (err) {
-    console.log(`${banner} (app.log failed: ${String(err)})`)
+    console.log(`${banner} (app.log failed: ${redactSecrets(String(err))})`)
   }
   if (!TOKEN || allowedNorm.size === 0) {
     try {
@@ -2311,7 +2311,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const burstCount = new Map<string, number>()
   const burstSig = (lvl: string, msg: string): string =>
     `${lvl}|${msg.replace(/[0-9a-f]{8,}|[0-9]+/gi, "#").slice(0, 120)}`
-  const log = async (level: "info" | "error", rawMessage: string) => {
+  const log = async (level: "info" | "warn" | "error", rawMessage: string) => {
     // 出口脱敏：任何新增日志语句都不可能绕过（此前只有部分调用点用了 sanitizeLog）
     const message = redactSecrets(rawMessage)
     if (level === "error") noteError(message)
@@ -2332,7 +2332,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // 带上 bot 标识：多 Bot 共用一个日志文件时，否则无法分辨是哪条实例写的
       await client.app.log({ body: { service: `tg-bridge/${BOT_ID}`, level, message: `[${BOT_ID}] ${outMessage}` } })
     } catch (err) {
-      console.error(`[tg-bridge] ${level}: ${message} (log failed: ${String(err)})`)
+      console.error(`[tg-bridge] ${level}: ${message} (log failed: ${redactSecrets(String(err))})`)
     }
   }
 
@@ -2769,7 +2769,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return false
       }
       lastRenameSig = sig
-      await log("info", `bot renamed to "${title.slice(0, 30)}" (sid=${sid.slice(0, 12)})`)
+      await log("info", `bot renamed to "${sanitizeLog(title).slice(0, 30)}" (sid=${sid.slice(0, 12)})`)
       return true
     }
     renameInFlight = run()
