@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1101-session-listok"
+const VERSION = "r1103-primary-push"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -460,6 +460,15 @@ export const sessionIdAcceptable = (id: string, knownIds: readonly string[], lis
   if (knownIds.length === 0) return true
   return knownIds.includes(id)
 }
+
+/**
+ * R1876：**未认领会话**（本实例没有 front / fixedTarget）时，谁负责投递。
+ * 单 Bot 时代恒真（谁在跑谁发）；多 Bot 时代只有**主实例**（QUEUE_CARD_OWNER）兜底 ——
+ * 否则每个"front 为空"的实例都会把全局事件流里的任意会话当自己的主目标**全量推送**，
+ * 多实例并存即跨 Bot 串台/重复。与 `ownsAsk` 的"都不负责时由主实例兜底"是同一条规则
+ * （ownsAsk = isPrimaryPush || isWatched || QUEUE_CARD_OWNER）。
+ */
+export const unownedFrontOwner = (queueCardOwner: boolean): boolean => queueCardOwner
 
 export const configureBot = (cfg: BotConfig, opts: { deferLoad?: boolean } = {}): void => {
   if (cfg.id) BOT_ID = cfg.id
@@ -4128,7 +4137,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     if (fixedTarget) return sessionID === fixedTarget
     const front = frontSessionID || persistedFront
     if (front) return sessionID === front
-    return true
+    // R1876：front 为空 → 只有主实例兜底。此前 `return true` 让**每个**空 front 的实例都把
+    // 全局事件流里的任意会话当作自己的主目标 → 多 Bot 并存时跨 Bot 全量串台/重复
+    //（实测会互抢 front 推错聊天）。与 ownsAsk 的"主实例兜底"同源。
+    return unownedFrontOwner(QUEUE_CARD_OWNER)
   }
   const isWatched = (sessionID: string): boolean => watchedSessions.has(sessionID)
   // 询问（question）必须**只有一个** Bot 负责。
