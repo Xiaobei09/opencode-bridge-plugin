@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1063-catchup"
+const VERSION = "r1064-use-exists"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -396,6 +396,19 @@ const recomputeIdentity = (): void => {
 }
 
 /** 显式配置本模块实例代表的 Bot。必须在 TgBridgePlugin() 之前调用。 */
+/**
+ * R1829：`/use` 目标「是否存在」的判定（纯函数，便于回归）。
+ * 返回 true = 接受该 id；false = 明确不存在 → 调用方应报错且**不改动**当前目标。
+ * 保守放行策略：`listOk=false`（会话列表查询失败）或 `knownIds` 为空时不阻断，
+ * 以免把「拉不到列表」误判成「会话不存在」而拒绝一个有效 id。
+ */
+export const sessionIdAcceptable = (id: string, knownIds: readonly string[], listOk: boolean): boolean => {
+  if (!String(id).startsWith("ses_")) return false
+  if (!listOk) return true
+  if (knownIds.length === 0) return true
+  return knownIds.includes(id)
+}
+
 export const configureBot = (cfg: BotConfig, opts: { deferLoad?: boolean } = {}): void => {
   if (cfg.id) BOT_ID = cfg.id
   if (typeof cfg.queueCardOwner === "boolean") QUEUE_CARD_OWNER = cfg.queueCardOwner
@@ -5597,6 +5610,14 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // （用户反馈"不能正确选择会话"）。未命中必须明确报错且**不改动**当前目标。
       if (!id.startsWith("ses_")) {
         await reply(chatID, `❌ 未找到匹配的会话：${clean(want, 40)}（用 /sessions 查看列表，或直接粘贴完整 ses_… ID）`)
+        return
+      }
+      // R1829：只接受列表里**真实存在**的会话。此前仅校验 `ses_` 前缀 —— 粘贴一个
+      // 已删除/不存在的完整 ID 会被静默钉选，之后消息发不出去（R1819「不能正确选择会话」的残留分支）。
+      // 保守放行：refreshSessionTitles 失败/列表为空时 sessionIdAcceptable 返回 true，不误伤。
+      await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+        await reply(chatID, `❌ 会话不存在：${clean(want, 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
       fixedTarget = id
