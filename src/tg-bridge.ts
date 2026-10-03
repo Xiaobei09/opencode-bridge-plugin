@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1098-menu-qpin"
+const VERSION = "r1099-session-exists"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5998,6 +5998,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         await reply(chatID, `❌ 未找到匹配的会话：${clean(want, 40)}（用 /sessions 查看列表）`)
         return
       }
+      // R1872：与 /use（R1829）同一存在性不变量 —— 仅校验 `ses_` 前缀会把已删除/不存在的
+      // 完整 ID 静默加入附加镜像（占用 WATCH_MAX、持久化、永远收不到消息）。列表可用时必须在列。
+      await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+        await reply(chatID, `❌ 会话不存在：${clean(want, 40)}（可能已删除；用 /sessions 查看列表）`)
+        return
+      }
       if (watchedSessions.has(id)) {
         await reply(chatID, `📎 已在附加镜像：${sessionTag(id)} (${id.slice(0, 12)})`)
         return
@@ -6139,6 +6146,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const id = await resolveSessionID(arg)
       if (!id.startsWith("ses_")) {
         await reply(chatID, `❌ 未找到匹配的会话：${clean(arg, 40)}（用 /sessions 查看列表）`)
+        return
+      }
+      // R1872：与 /use（R1829）同一存在性不变量 —— 别名指向已删除/不存在的完整 ID 会成为
+      // "毒别名"：/use 名字会报错（好），但 /watch 名字会经 aliasHit 直接拿到该死 id。
+      await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+        await reply(chatID, `❌ 会话不存在：${clean(arg, 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
       aliasMap.set(name, id)
@@ -6784,6 +6798,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       if (!id.startsWith("ses_")) {
         await reply(chatID, `❌ 未找到匹配的会话：${clean(rest.slice(0, sp), 40)}（用 /sessions 查看列表）`)
+        return
+      }
+      // R1872：与 /use（R1829）同一存在性不变量 —— 否则 /sendto 一个已删除的完整 ID 会把
+      // 消息塞进不存在的会话，用户只看到后续投递失败，却没有"会话不存在"的明确拒绝。
+      await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+        await reply(chatID, `❌ 会话不存在：${clean(rest.slice(0, sp), 40)}（可能已删除；用 /sessions 查看列表）`)
         return
       }
       await queueAndPump(chatID, id, body, replyCtxOf(msg))
