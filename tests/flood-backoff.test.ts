@@ -48,7 +48,7 @@ test("retry_after 下限 5s：比下限小的值被抬到下限", () => {
   expect(nb(1, 1)).toBe(FLOOD_BACKOFF_BASE_S)
 })
 
-test("不变量：返回值永远 ≥ Telegram 给的 retry_after（含抖动）", () => {
+test("不变量：返回值永远 ≥ min(cap, Telegram 给的 retry_after)（含抖动）", () => {
   for (const ra of [1, 5, 30, 300, 3600]) {
     for (let attempt = 1; attempt <= 8; attempt++) {
       for (const rand of [0, 0.25, 0.5, 0.999]) {
