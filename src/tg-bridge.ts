@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1072-table-esc"
+const VERSION = "r1073-full-chunk"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5375,8 +5375,10 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // 分片路必须**主动去排版**：原文是 HTML，按 3800 切片后每片都会被 `balanceHtmlTags`
       // 逐片处理 —— 片首的落单闭标签被删、片尾的开标签被补 → 代码块跨片彻底散架。
       // 与其让用户看到一堵被撕碎的排版，不如给纯文本并**说明**为什么。
-      const htmlToPlain = (t: string): string =>
-        t.replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+      // R1840：**只剥标签、不还原实体**。原文里的字面 `<` 本就以 `&lt;` 存储；旧实现把它
+      // 还原成裸 `<` 再以 HTML parse_mode 发送 → TG 400，而降级分支的 `/<[^>]*>/g` 会把这
+      // 段内容**整段删掉**（点了「看完整版」反而丢内容）。保留实体则 TG 按字面渲染 `<`，零丢失。
+      const htmlToPlain = (t: string): string => t.replace(/<[^>]*>/g, "")
       const full = htmlToPlain(entry.full)
       await answer(`内容较长（${entry.full.length} 字），分段发送（已去掉排版以免跨片错乱）`)
       const chunks: string[] = []
@@ -5388,7 +5390,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       for (const ln of full.split("\n")) {
         if (ln.length > 3800) {
           push()
-          for (let i = 0; i < ln.length; i += 3800) chunks.push(ln.slice(i, i + 3800))
+          // R1840：用 safeHtmlCut 保证不把实体（`&amp;` 等）劈成两半；否则片尾 `&am`
+          // 无 `<`，发送 400 时降级分支（要求含 `<`）不触发 → 该片被整片丢弃。
+          for (let i = 0; i < ln.length; ) {
+            const end = safeHtmlCut(ln, i, 3800)
+            chunks.push(ln.slice(i, end))
+            i = end
+          }
           continue
         }
         if (cur && cur.length + 1 + ln.length > 3800) push()
