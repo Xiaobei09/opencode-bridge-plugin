@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1064-use-exists"
+const VERSION = "r1065-alias-arg"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1954,6 +1954,18 @@ export type FloodBackoffInput = {
 // 对普通文本、已含空格的命令、以及参数里出现的 @ 均零影响（正则要求 @ 紧跟命令 token、中间不能有空格）。
 export const stripCmdBotSuffix = (text: string): string =>
   text.replace(/^(\/[A-Za-z0-9_]+)@[A-Za-z0-9_]+/, "$1")
+
+// R1830：取「命令 token 之后的参数」的通用纯函数，取代各块硬编码的 `text.startsWith("/cmd ")` 切片。
+// 动机（R1823 同一缺陷类的**残余分支**）：命令名经 CMD_ALIAS 归一（/u→use）、且 stripCmdBotSuffix 已剥 @suffix 后，
+// 文本可能仍是 `/u 3`；此时按 `/use ` 切片得到空串 → `/u 3` 静默退化成"看当前目标"，`/r 10` 退化成默认 5。
+// 规则：去首部空白 → 必须 `/` 开头 → 跳过第一个非空白 token（命令名）→ 返回其余（保留内部空格）。
+// 对普通文本、无参命令、参数内 @ 均零副作用。
+export const commandArg = (text: string): string => {
+  const t = String(text ?? "").trimStart()
+  if (!t.startsWith("/")) return ""
+  const m = /^\/[^\s]+/.exec(t)
+  return m ? t.slice(m[0].length).trim() : ""
+}
 
 export const floodBackoffSeconds = (input: FloodBackoffInput = {}): number => {
   const posOr = (v: unknown, dflt: number): number => {
@@ -5591,7 +5603,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/use" || cmd === "use" || text.startsWith("/use ")) {
-      const want = text.startsWith("/use ") ? text.slice(5).trim() : ""
+      const want = commandArg(text)
       if (!want) {
         const cur = fixedTarget ?? (await activeFront())
         if (!cur) {
@@ -5720,7 +5732,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/watch" || text.startsWith("/watch ") || cmd === "watch") {
-      const want = text.startsWith("/watch ") ? text.slice(7).trim() : ""
+      const want = commandArg(text)
       if (!want) {
         const list = [...watchedSessions]
         const head = `[tg-bridge] 附加镜像 ${list.length}/${WATCH_MAX}（只发最终回复正文，标题带会话名）`
@@ -5749,7 +5761,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/unwatch" || text.startsWith("/unwatch ") || cmd === "unwatch") {
-      const want = text.startsWith("/unwatch ") ? text.slice(9).trim() : ""
+      const want = commandArg(text)
       if (!want) {
         if (watchedSessions.size === 0) {
           await reply(chatID, "[tg-bridge] 附加镜像为空")
@@ -5836,7 +5848,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/alias" || text.startsWith("/alias ") || cmd === "alias") {
-      const rest = text.startsWith("/alias ") ? text.slice(7).trim() : ""
+      const rest = commandArg(text)
       if (!rest) {
         const lines = ["🏷 会话别名（/alias [名] [会话] 设置；/use [名] 使用）"]
         if (aliasMap.size === 0) lines.push("（暂无）")
@@ -6079,7 +6091,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         await reply(chatID, "[tg-bridge] no session to replay (none active/front/pinned)")
         return
       }
-      const argText = (text.startsWith("/replay ") || text.startsWith("/reload ")) ? text.slice(8).trim() : ""
+      const argText = commandArg(text)
       const nMax = (t: string): number => /^\d+$/.test(t) ? Math.min(Number(t), 200) : 0
       const n = argText === "all" || argText === "everything" ? 200 : (nMax(argText) || 5)
       const msgs = await fetchTail(target, n)
@@ -6486,7 +6498,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/sendto" || text.startsWith("/sendto ") || cmd === "sendto") {
-      const rest = text === "/sendto" ? "" : text.slice(8).trim()
+      const rest = commandArg(text)
       const sp = rest.search(/\s/)
       if (sp < 0) {
         await reply(chatID, "📌 用法：/sendto [会话] [文本]（如：/sendto 2 你好；只发这一次，不改钉选）")
