@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1085-diag-redact"
+const VERSION = "r1086-cmd-sentinel"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5950,7 +5950,11 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       await reply(chatID, HELP_TEXT)
       return
     }
-    if (text.startsWith("/addbot") || cmd === "addbot") {
+    // R1854：补空格哨兵。其余命令块都写成 `text === "/cmd" || text.startsWith("/cmd ") || cmd === "cmd"`，
+    // 只有 /addbot 漏了空格 → `/addbotx`、`/addbots` 等**前缀相同的误敲命令**会被吞进 addbot 分支
+    // （args[0] 成垃圾 token），而不是回「❓ 未知命令」。`cmd === "addbot"` 已覆盖正常拼写，
+    // 前缀仅用于"命令带参数"这一情形。
+    if (text === "/addbot" || text.startsWith("/addbot ") || cmd === "addbot") {
       const rest = text.slice("/addbot".length).trim()
       const args = rest ? rest.split(/\s+/) : []
       // R1835：/addbot 的用户消息里是**明文 token**。登记前先尽力删除这条消息，缩短 token
