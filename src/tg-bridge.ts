@@ -5515,6 +5515,14 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       const prevUse = fixedTarget ?? frontSessionID ?? persistedFront
       const id = await resolveSessionID(want)
+      // R1819：文本 /use 必须与回调 /use 同一不变量 —— 只接受真实 ses_ 目标。
+      // 此前 resolveSessionID 未命中时原样返回 want（拼错的名称 / 越界序号 / 命中不到的片段），
+      // 这里却无条件 fixedTarget=id → 钉到一个不存在的会话，之后消息"发不出去 / 发错会话"
+      // （用户反馈"不能正确选择会话"）。未命中必须明确报错且**不改动**当前目标。
+      if (!id.startsWith("ses_")) {
+        await reply(chatID, `❌ 未找到匹配的会话：${clean(want, 40)}（用 /sessions 查看列表，或直接粘贴完整 ses_… ID）`)
+        return
+      }
       fixedTarget = id
       persistedFront = id
       savePersistedState()
