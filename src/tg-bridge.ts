@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1074-atomic-pid"
+const VERSION = "r1075-strip-transient"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1007,6 +1007,10 @@ export const patchStillNote = (text: string, status: string, mins: number): stri
   )
 }
 const STRIP_FAIL_MAX = 5
+// R1842：判断 backfillStrip 的失败是否**瞬时**（可重试）。瞬时失败**不计入** stripFail/放弃阈值：
+// 0/undefined = 网络层没拿到响应；429 = 限流；5xx = 服务端瞬时。其余（404 等）为确定性失败。
+export const isTransientStripFailure = (status: number | undefined): boolean =>
+  status === undefined || status === 0 || status === 429 || (status >= 500 && status < 600)
 // 当前 TG 输入（命令回执引用它）；回调走独立分支时置空
 let currentInbound: { chat: string; msgID: number } | null = null
 let commandReplyMode = false
@@ -3428,25 +3432,32 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
               }
               continue
             }
+            const status = r.status ?? 0
+            // R1842：**瞬时**失败（429 限流 / 5xx / status 0 网络层无响应）**不计入** stripFail。
+            // 原实现把它们跟"确定性失败"一起累加，达到 STRIP_FAIL_MAX(5) 就**永久放弃**该消息
+            // （mark stripped，按钮再也删不掉）—— 与紧邻的 "网络层失败可重试" 日志**自相矛盾**；
+            // 且 stripFail 跨重启持久化（sidecar），于是**有网络抖动的那台机反而更容易永久残留旧按钮**
+            // （正是用户报的"按钮越堆越多"）。瞬时失败只 defer，不累计、不放弃。
+            const transientStripFail = isTransientStripFailure(status)
+            if (transientStripFail) {
+              if (status === 429) {
+                await log("error", `backfill strip deferred (mid=${v.id}, status=429; flood gate, 瞬时失败不计入放弃)`)
+                break
+              }
+              const kind = status === 0 ? `network/no-response${r.desc ? ` (${r.desc})` : ""}` : `status=${status}`
+              const why = status === 0 ? "网络层失败可重试" : "服务端瞬时失败可重试"
+              await log("error", `backfill strip failed (mid=${v.id}, ${kind}; ${why}，不计入放弃)`)
+              continue
+            }
+            // 到此为**非瞬时**且非 400/403（例如 404 message not found）：确定性失败，累计用于放弃。
             const failures = (stripFail.get(k) ?? 0) + 1
             stripFail.set(k, failures)
-            const lastStatus = r.status ?? 0
-            const lastDesc = r.desc
-            if (r.status === 429) {
-              await log("error", `backfill strip deferred (mid=${v.id}, status=429 try=${failures}; flood gate)`)
-              break
-            }
             if (failures >= STRIP_FAIL_MAX) {
               stripFail.delete(k)
               strippedKb.add(k)
-              await log("error", `backfill strip abandoned (mid=${v.id}, fails=${failures}, lastStatus=${lastStatus}, desc=${sanitizeLog(String(lastDesc ?? "")).slice(0, 60)})`)
+              await log("error", `backfill strip abandoned (mid=${v.id}, fails=${failures}, lastStatus=${status}, desc=${sanitizeLog(String(r.desc ?? "")).slice(0, 60)})`)
             } else {
-              // `status=?` 毫无信息量（实测 4 条如此）。区分开：
-              // 0/undefined = **网络层没拿到响应**（可重试）；其余按真实状态码记录。
-              const kind = r.status === undefined || r.status === 0
-                ? `network/no-response${r.desc ? ` (${r.desc})` : ""}`
-                : `status=${r.status}`
-              await log("error", `backfill strip failed (mid=${v.id}, ${kind} try=${failures}; 网络层失败可重试)`)
+              await log("error", `backfill strip failed (mid=${v.id}, status=${status} try=${failures}; 确定性失败)`)
             }
             continue
           }
