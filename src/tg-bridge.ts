@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1090-ask-inline"
+const VERSION = "r1091-cmd-case-arg"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5776,8 +5776,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       return id
     }
-    if (text === "/raw" || text.startsWith("/raw ")) {
-      const raw = text === "/raw" ? "" : text.slice(5).trim()
+    if (text === "/raw" || text.startsWith("/raw ") || cmd === "raw") {
+      const raw = commandArg(text)
       if (!raw) {
         await reply(chatID, "📌 用法：/raw [文本]（纯文本注入，不解析命令）")
         return
@@ -5838,7 +5838,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/botname" || text.startsWith("/botname ") || cmd === "botname") {
-      const arg = text.startsWith("/botname ") ? text.slice(9).trim() : text === "/botname" ? "" : ""
+      const arg = commandArg(text)
       if (!arg) {
         // 只读：显示当前值（getMe 不落 token）
         try {
@@ -5875,7 +5875,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/botdesc" || text.startsWith("/botdesc ") || cmd === "botdesc") {
-      const arg = text.startsWith("/botdesc ") ? text.slice(9).trim() : text === "/botdesc" ? "" : ""
+      const arg = commandArg(text)
       if (!arg) {
         try {
           const r = await fetch(`https://api.telegram.org/bot${TOKEN}/getMe`, { signal: AbortSignal.timeout(15000) })
@@ -6106,16 +6106,16 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       await reply(chatID, await doStop(target))
       return
     }
-    if (text === "/loop on" || cmd === "loopon" || (text.startsWith("/loop ") && text.slice(6).trim().toLowerCase() === "on")) {
+    if (text === "/loop on" || cmd === "loopon" || (cmd === "loop" && commandArg(text).toLowerCase() === "on")) {
       await handleLoopScope(true, chatID)
       return
     }
-    if (text === "/loop off" || cmd === "loopoff" || (text.startsWith("/loop ") && text.slice(6).trim().toLowerCase() === "off")) {
+    if (text === "/loop off" || cmd === "loopoff" || (cmd === "loop" && commandArg(text).toLowerCase() === "off")) {
       await handleLoopScope(false, chatID)
       return
     }
     if (text === "/loop" || text.startsWith("/loop ") || cmd === "loop") {
-      const arg = (text.startsWith("/loop ") ? text.slice(6).trim() : "").toLowerCase()
+      const arg = commandArg(text).toLowerCase()
       const ctlPath = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
       const ctlLegacy = "/tmp/opencode/loop-ctl.json"
       const readCtl = (): any => {
@@ -6222,7 +6222,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
           return `✗ 提升失败：${sanitizeLog(String(err)).slice(0, 120)}`
         }
       }
-      const bgArg = (text.startsWith("/background ") ? text.slice(11).trim() : "")
+      const bgArg = commandArg(text)
       // R1822：shell 开关的 toggle 基准改用真正生效的 shellPromo（菜单「shell 自动后台」据此显示），
       // 否则按钮显示的开/关与实际插件强制提升状态不一致（用户反馈"转后台按钮不能实际控制"）。
       const bgAct = parseBgArg(bgArg, { ...curBg, shellAuto: curBg.shellPromo !== false })
@@ -6257,7 +6257,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // 自动停止守卫的开关/状态（用户 2026-09-28 新增，菜单「🔁 循环」里也有两枚按钮）。
       // 语义：problem = 助手宣告 [SIGNAL:PROBLEM] 或本轮 [STATUS: STOP] 时停循环；
       //       websearch = 助手请求网页搜索或真调了搜索工具时停循环（等用户授权）。
-      const arg = (text.startsWith("/autoguard ") ? text.slice(11).trim() : "").toLowerCase()
+      const arg = commandArg(text).toLowerCase()
       const cur = readGuard()
       const onoff = (w: string): string => (w ? "开" : "关")
       const show = (): string => {
@@ -6441,7 +6441,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/selfmute" || cmd === "selfmute") {
-      const arg = text.startsWith("/selfmute ") ? text.slice("/selfmute ".length).trim().toLowerCase() : ""
+      const arg = commandArg(text).toLowerCase()
       if (arg === "on" || arg === "off") selfMute = arg === "on"
       else selfMute = !selfMute
       savePersistedState()
@@ -6511,7 +6511,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/new" || text.startsWith("/new ") || cmd === "new") {
-      const title = text.startsWith("/new ") ? text.slice(5).trim() : ""
+      const title = commandArg(text)
       const fn = (client as any)?.session?.createSession
       if (typeof fn !== "function") {
         await reply(chatID, "[tg-bridge] new unavailable (compat too old)")
@@ -6635,7 +6635,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/inject" || cmd === "inject" || text.startsWith("/inject ")) {
-      const want = (text.startsWith("/inject ") ? text.slice(8) : "").trim().toLowerCase()
+      const want = commandArg(text).toLowerCase()
       if (want === "now" || want === "idle") {
         injectMode = want
         savePersistedState()
@@ -6666,7 +6666,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/logs" || text.startsWith("/logs ") || cmd === "logs") {
-      const arg = text.startsWith("/logs ") ? text.slice(6).trim() : ""
+      const arg = commandArg(text)
       const n = /^\d+$/.test(arg) ? Math.min(Number(arg), 40) : 20
       let lines: string[] = []
       try {
@@ -6690,7 +6690,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     if (text === "/errors" || text.startsWith("/errors ") || cmd === "errors") {
-      const arg = text.startsWith("/errors ") ? text.slice(8).trim() : ""
+      const arg = commandArg(text)
       const n = /^\d+$/.test(arg) ? Math.min(Number(arg), 30) : 5
       if (errorRing.length === 0) {
         await reply(chatID, "[tg-bridge] errors（0 — 无近期错误）")
