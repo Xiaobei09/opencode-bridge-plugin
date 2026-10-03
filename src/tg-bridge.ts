@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1079-cmd-lowercase"
+const VERSION = "r1080-full-honest"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5420,7 +5420,6 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // 段内容**整段删掉**（点了「看完整版」反而丢内容）。保留实体则 TG 按字面渲染 `<`，零丢失。
       const htmlToPlain = (t: string): string => t.replace(/<[^>]*>/g, "")
       const full = htmlToPlain(entry.full)
-      await answer(`内容较长（${entry.full.length} 字），分段发送（已去掉排版以免跨片错乱）`)
       const chunks: string[] = []
       let cur = ""
       const push = (): void => {
@@ -5443,7 +5442,17 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         cur = cur ? `${cur}\n${ln}` : ln
       }
       push()
-      for (const c of chunks.slice(0, 10)) await sendQueued(cchat, c)
+      // R1848：把"截断事实"如实告诉用户。旧实现硬 `slice(0, 10)`（≈38k 字符）却只说"分段发送"，
+      // 一旦 entry.full 超过 10 片（长回复/长工具输出均可超过 TOOL_OUT_FULL=30000），第 11 片起
+      // 被**静默丢弃** —— 与「看完整版」的语义、以及本模块 R1840 的「不许把没做到的事说成做到了」
+      // 直接冲突。保留 10 片上限（防 TG 刷屏），但必须如实说明只发了前 N 片。
+      const FULL_CHUNK_CAP = 10
+      if (chunks.length > FULL_CHUNK_CAP) {
+        await answer(`内容极长（共 ${chunks.length} 段），仅发送前 ${FULL_CHUNK_CAP} 段；其余请查看会话记录`)
+      } else {
+        await answer(`内容较长（${entry.full.length} 字），分段发送（已去掉排版以免跨片错乱）`)
+      }
+      for (const c of chunks.slice(0, FULL_CHUNK_CAP)) await sendQueued(cchat, c)
       return
     }
     if (parts[0] === "fold" && parts[1]) {
