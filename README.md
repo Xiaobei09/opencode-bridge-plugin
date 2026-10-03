@@ -10,6 +10,10 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | `src/auto-continue.ts` | 自动循环：evaluate/注入闸/租约/熔断 |
 | `src/tg-bridge-v2.ts` | 插件装载入口（bot 配置与 env 读取） |
 | `src/_v2compat.ts` | 兼容层 |
+| `src/bg-mode.ts` | 「转后台」能力：原生后台子代理的提升（promote）与整体自动配置 |
+| `src/bg-watch.ts` | 插件层「shell 跑超 N 秒强制转后台」的合规实现 |
+| `src/compact-notice.ts` | 「上下文已压缩」通知的文案判据（纯函数） |
+| `src/loop-guard.ts` | 循环「自动停止守卫」（检测到问题 / 网页搜索请求即停） |
 
 ## 脱敏声明
 
