@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1058-shellpromo"
+const VERSION = "r1059-cmdbotsuffix"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1890,6 +1890,13 @@ export type FloodBackoffInput = {
   /** 注入 [0,1) 随机数，供测试确定化；缺省取 0.5。 */
   rand?: number
 }
+
+// R1823：群聊命令的 @botname 后缀剥离（纯函数）。Telegram 在群聊会把命令改写成 `/cmd@BotName`；
+// 各命令块的参数切片按 "/cmd " 前缀做，带 @ 后缀时前缀失配 → 参数被吞空（/use、/watch、/alias）
+// 或错位（/sendto 把 "botname" 当成会话名）。只剥离**紧跟在首个命令 token 后**的 @后缀：
+// 对普通文本、已含空格的命令、以及参数里出现的 @ 均零影响（正则要求 @ 紧跟命令 token、中间不能有空格）。
+export const stripCmdBotSuffix = (text: string): string =>
+  text.replace(/^(\/[A-Za-z0-9_]+)@[A-Za-z0-9_]+/, "$1")
 
 export const floodBackoffSeconds = (input: FloodBackoffInput = {}): number => {
   const posOr = (v: unknown, dflt: number): number => {
@@ -5392,7 +5399,8 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     const chatID = chatTarget(msg.chat)
     const inboundMsgID = Number(msg?.message_id ?? 0)
     currentInbound = Number.isFinite(inboundMsgID) && inboundMsgID > 0 ? { chat: chatID, msgID: inboundMsgID } : null
-    const text = (typeof msg.text === "string" ? msg.text : typeof msg.caption === "string" ? msg.caption : "").trim()
+    // R1823：群聊命令可能带 @botname 后缀；解析前先剥离，否则参数切片失配（详见 stripCmdBotSuffix）。
+    const text = stripCmdBotSuffix((typeof msg.text === "string" ? msg.text : typeof msg.caption === "string" ? msg.caption : "").trim())
     let cmd = text.startsWith("/") ? text.slice(1).split(/[\s@]/)[0] : ""
     if (cmd && CMD_ALIAS[cmd]) cmd = CMD_ALIAS[cmd]
     if (!text) {
