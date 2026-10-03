@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1094-catchup-tail"
+const VERSION = "r1095-edit-degrade"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3729,6 +3729,19 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           if (kb && n.fallback !== true) await trackReplyButtons(sess, chatID, n.id, kb, key)
         } else if (n.r === "retry") {
           scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true)
+        } else if (n.r === "sent") {
+          // R1868：降级新发命中"TG 2xx 但无 message_id"（`callTelegram` 两条产路：result 缺
+          // `message_id` / `res.json()` 抛异常）。旧代码只有上面两个分支 → 这条**静默**什么都不做：
+          //   • 不刷新 `lastProtoSendAt` → 污染 R1728 静默断流 watchdog 基线（会误报"断流"）；
+          //   • 不留任何日志 → 事后完全看不出"有内容已送达但无法锚定"。
+          // 与主发送路径 R1802 同款处理：**已送达就得记账 + 留痕**；绝不能因无 id 就 rollback/重发
+          //（那会把已送达当未投递，造成双发）。
+          noteHash()
+          savePersistedState()
+          lastPushAt = new Date().toISOString()
+          if (sess) touchActivity(sess)
+          lastProtoSendAt = Date.now()
+          await log("warn", `proto edit-degrade delivered (${sanitizeLog(key)}) no message_id, 无法锚定卡片`)
         }
       }
       return
