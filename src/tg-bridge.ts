@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1059-cmdbotsuffix"
+const VERSION = "r1060-stateloaddiag"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1328,7 +1328,27 @@ const loadPersistedState = (): void => {
     }
     watchSnapshot = [...watchedSessions]
   } catch {
-    /* first run: no state file yet */
+    // 区分两种"读不到"：
+    //  - ENOENT（首次运行，文件还没生成）：正常，静默。
+    //  - 文件**存在但解析失败**（截断/损坏/半写）：此前与首次运行同形静默吞掉，
+    //    表现为 front/pinned/watch/入站 offset/队列**无痕归零**，与"用户自己改坏了"
+    //    完全无法区分。与 savePersistedState 的失败留痕同策略：必须在 RESTORE_DIAG 留痕。
+    try {
+      readFileSync(STATE_PATH, "utf8") // 能再次读到 → 失败发生在 JSON.parse（文件存在但坏）
+      const msg = `${new Date().toISOString()} state load FAILED: ${STATE_PATH} 存在但无法解析 — 已从默认值启动（front/pinned/watch/队列可能被清空）`
+      try {
+        appendFileSync(RESTORE_DIAG_PATH, `${msg}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+      } catch {
+        /* best-effort */
+      }
+      try {
+        console.error(msg)
+      } catch {
+        /* ignore */
+      }
+    } catch {
+      /* 真·首次运行：文件不存在 */
+    }
   }
 }
 /**
