@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1061-htmlsafecut"
+const VERSION = "r1062-timerguard"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -6945,6 +6945,11 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
   const BG_AUTO_MS = 60_000
   const bgAutoTick = async (): Promise<void> => {
     try {
+      // R1826：与 askReconcile / emitCensus / runOffsetCheck 等**所有**定时器同规则 ——
+      // 陈旧热重载实例必须自停。此前**独漏**这一条：旧实例的 60s 拍仍会 fetchTail，
+      // 必要时还会 POST background promote；且每次热重载都累加一个这样的陈旧实例
+      // → 换代数轮后多个旧实例同时"自动转后台"、刷网络与日志。
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
       const cfg = readBg()
       const sid = fixedTarget ?? frontSessionID ?? persistedFront ?? ""
       if (!cfg.enabled || !sid) return
