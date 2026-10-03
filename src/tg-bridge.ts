@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1083-peer-self"
+const VERSION = "r1084-addbot-env"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -4729,12 +4729,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
 
     // env 文件先写：注册表是"索引"，env 才是"内容"；反过来会出现索引指向空文件。
     const envPath = `${BOT_ENV_DIR}/tg-${id}.env`
+    const envBody = `TG_BOT_TOKEN=${newBotToken}\nTG_ALLOWED_CHAT=${targetChat}\nTG_PUSH_CHAT=${targetChat}\n`
     try {
-      writeFileSync(
-        envPath,
-        `TG_BOT_TOKEN=${newBotToken}\nTG_ALLOWED_CHAT=${targetChat}\nTG_PUSH_CHAT=${targetChat}\n`,
-        { encoding: "utf8", mode: 0o600 },
-      )
+      // R1852：凭据文件也要**原子写**（tmp+rename）。旧实现裸 writeFileSync：中途崩溃会留下
+      // **半截 token** 的 env → 新 Bot 加载失败，且残片本身是敏感文件。原子写保证加载器
+      // 见到的要么是完整旧内容、要么是完整新内容，绝不半截。
+      atomicWrite(envPath, envBody, 0o600)
     } catch (err) {
       return { ok: false, desc: `写 env 失败：${sanitizeLog(err).slice(0, 80)}` }
     }
@@ -4753,6 +4753,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     } catch (err) {
       try {
         unlinkSync(tmp)
+      } catch {
+        /* best-effort */
+      }
+      // R1852：注册表写失败 → 回滚刚写的 env，别在磁盘上留一个"登记失败却含真 token"的
+      // 孤儿凭据文件（用户以为没登记成功，token 却已落盘）。
+      try {
+        unlinkSync(envPath)
       } catch {
         /* best-effort */
       }
