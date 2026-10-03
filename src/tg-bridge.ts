@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1056-bgauto-http"
+const VERSION = "r1057-useindex"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5474,14 +5474,20 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const aliasHit = aliasMap.get(want.toLowerCase())
       if (aliasHit) return aliasHit
       let id = want
+      // R1821：纯数字只按**序号**解析，越界即返回原值（交由调用方判 `ses_` 前缀并报"未找到"）。
+      // 此前越界序号会继续走下面的"前缀/标题包含"匹配 —— 于是 `/use 99`（仅 2 个会话）会静默钉到
+      // **标题里恰好含 "99" 的任意会话**；`/watch`、`/alias`、`/sendto` 复用同一解析器，同样会选错/存错。
+      // 这是用户反馈"不能正确选择会话"的又一分支（R1819 只挡了未命中的原样返回，挡不住这种"命中错目标"）。
+      const numeric = /^\d+$/.test(want)
       try {
         const res = await (client as any).session.list?.({})
         const arr = res?.data ?? []
         if (Array.isArray(arr)) {
-          if (/^\d+$/.test(want)) {
+          if (numeric) {
             await refreshSessionTitles()
             const hitS = cachedSessionList[Number(want) - 1]
             if (hitS) id = hitS.id
+            return id
           }
           if (id === want) {
             const hit = arr.find((s: any) => String(s?.id ?? "").startsWith(want))
@@ -5646,6 +5652,10 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return
       }
       const id = await resolveSessionID(want)
+      if (!id.startsWith("ses_")) {
+        await reply(chatID, `❌ 未找到匹配的会话：${clean(want, 40)}（用 /sessions 查看列表）`)
+        return
+      }
       if (watchedSessions.has(id)) {
         await reply(chatID, `📎 已在附加镜像：${sessionTag(id)} (${id.slice(0, 12)})`)
         return
@@ -5770,6 +5780,10 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return
       }
       const id = await resolveSessionID(arg)
+      if (!id.startsWith("ses_")) {
+        await reply(chatID, `❌ 未找到匹配的会话：${clean(arg, 40)}（用 /sessions 查看列表）`)
+        return
+      }
       aliasMap.set(name, id)
       if (aliasMap.size > 50) {
         const k = aliasMap.keys().next().value
@@ -6401,6 +6415,10 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const body = rest.slice(sp + 1).trim()
       if (!body) {
         await reply(chatID, "📌 用法：/sendto [会话] [文本]（文本不可为空）")
+        return
+      }
+      if (!id.startsWith("ses_")) {
+        await reply(chatID, `❌ 未找到匹配的会话：${clean(rest.slice(0, sp), 40)}（用 /sessions 查看列表）`)
         return
       }
       await queueAndPump(chatID, id, body, replyCtxOf(msg))
