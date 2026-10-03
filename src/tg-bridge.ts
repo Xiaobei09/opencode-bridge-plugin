@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1062-timerguard"
+const VERSION = "r1063-catchup"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -7541,6 +7541,59 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
     runOffsetCheck("periodic")
   }, 10 * 60_000)
+
+  // R1827: assistant 推送的事件驱动路径存在结构性盲区——宿主不保证为每条 assistant
+  // 消息都发 message.updated，事件 info 也可能没有 role/parts（实测非主实例会话多条
+  // 带正文的 assistant 消息完全未推送，而同期 tool 消息正常 → 用户看到「信息从不发送」）。
+  // 修法与 turn-end note 同源：轮询抓 front 会话尾部消息，凡 proto 无记录的 assistant
+  // 正文/思考补推。幂等：已推送的键存在于 protoMap → 直接跳过；与事件路径并发时由
+  // protoSend 内的 shouldSend/sentHash 二次去重。只补正文/思考，tool 由事件路径负责。
+  const catchupBootAt = Date.now()
+  setInterval(() => {
+    void (async () => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      if (pausedMode) return
+      const sid = fixedTarget ?? frontSessionID ?? persistedFront
+      if (!sid || !isPrimaryPush(sid)) return
+      const chat = pushChatResolve()
+      if (!chat) return
+      let arr: any[] = []
+      try {
+        const pe = await client.session.messages({ path: { id: sid } })
+        if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+        arr = Array.isArray(pe?.data) ? pe.data : []
+      } catch {
+        return
+      }
+      if (!arr.length) return
+      for (let i = Math.max(0, arr.length - 4); i < arr.length; i++) {
+        const m = arr[i] as any
+        const role = String(m?.role ?? m?.info?.role ?? "")
+        const typ = String(m?.type ?? m?.info?.type ?? "")
+        if (role !== "assistant" && typ !== "assistant") continue
+        const content = partsOf(m)
+        const hasText = content.some(
+          (p: any) => (p?.type === "text" || p?.type === "reasoning") && String(p?.text ?? "").trim()
+        )
+        if (!hasText) continue
+        const mid = String(m?.id ?? m?.info?.id ?? "")
+        if (!mid) continue
+        // 只补本实例启动之后创建的消息，避免每次热重载把旧历史重新推一遍。
+        const createdAt = Number(m?.time?.created ?? m?.info?.time?.created ?? 0)
+        if (!(createdAt > catchupBootAt)) continue
+        const msgKey = mid.slice(0, 20)
+        const seen = [...protoMap.keys()].some(
+          (k) => k.startsWith(`${sid}:message:${msgKey}:`) || k.startsWith(`${sid}:thinking:${msgKey}:`)
+        )
+        if (seen) continue
+        await protoPushAssistantMessage(sid, String(chat), m, false, "full")
+        await log(
+          "info",
+          `proto catchup pushed (${sanitizeLog(sid).slice(0, 12)} msg=${sanitizeLog(mid).slice(0, 20)} parts=${content.length})`
+        )
+      }
+    })()
+  }, 25_000)
 
   const onIdle = async (sessionID: string): Promise<void> => {
     activeSessionID = sessionID
