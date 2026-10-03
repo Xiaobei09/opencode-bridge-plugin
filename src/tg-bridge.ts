@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1093-answer-transient"
+const VERSION = "r1094-catchup-tail"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1078,6 +1078,29 @@ const lastHostCompact = new Map<string, number>()
 // 附加镜像会话：非当前目标也把「最终回复正文」推到同一个 chat（静默档）。
 // 默认空 = 旧行为（只镜像 front/pinned），避免多会话同时刷屏触发 TG 429。
 const WATCH_MAX = 8
+// R1867：assistant 轮询补扫的窗口**按尾部 N 条 assistant 消息**计（不是 N 行）；
+// 固定行窗口在夹入宿主 synthetic 循环提示 / tool 卡 / 用户消息时，会把被事件路径漏推的
+// 正文挤出窗口 → 永久丢失（见补扫处注释）。
+const CATCHUP_ASSISTANT_TAIL = 6
+/**
+ * R1867：返回补扫窗口起始下标 = 尾部 `tail` 条 **assistant** 消息中最早那条的下标。
+ * 纯函数（导出以便单测）：非 assistant 行不计入 tail，所以中间夹多少 synthetic 循环提示 /
+ * tool 卡 / 用户消息，都不会把被事件路径漏推的 assistant 正文挤出窗口。
+ * 无可计入的 assistant 时返回 arr.length（空窗口，不扫）。
+ */
+export const catchupAssistantsStart = (arr: any[], tail: number): number => {
+  let start = arr.length
+  let n = 0
+  for (let i = arr.length - 1; i >= 0 && n < tail; i--) {
+    const m = arr[i]
+    const role = String(m?.role ?? m?.info?.role ?? "")
+    const typ = String(m?.type ?? m?.info?.type ?? "")
+    if (role !== "assistant" && typ !== "assistant") continue
+    n++
+    start = i
+  }
+  return start
+}
 const watchedSessions = new Set<string>()
 // 最近一次与状态文件对齐的 watch 值；用于判断内存是否被本进程改过
 let watchSnapshot: string[] = []
@@ -7830,7 +7853,13 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         return
       }
       if (!arr.length) return
-      for (let i = Math.max(0, arr.length - 4); i < arr.length; i++) {
+      // R1867：窗口从"尾部 4 行"改为"尾部 CATCHUP_ASSISTANT_TAIL 条 assistant 消息"。
+      // 旧写法在循环里极易漏：一条被事件路径漏推的 assistant 正文，只要其后再落 ≥4 行
+      //（宿主 synthetic 循环提示、tool 卡、用户消息都是"行"），就滑出窗口**永久丢失** ——
+      // 正是用户诉求「bot3 的信息和思考从不发送」的残余形态。按 assistant 计数，无论中间夹
+      // 多少非 assistant 行都能覆盖；仍是有界扫描（避免大 session 每 25s 全量 O(n·protoMap)）。
+      const tailStart = catchupAssistantsStart(arr as any[], CATCHUP_ASSISTANT_TAIL)
+      for (let i = tailStart; i < arr.length; i++) {
         const m = arr[i] as any
         const role = String(m?.role ?? m?.info?.role ?? "")
         const typ = String(m?.type ?? m?.info?.type ?? "")
