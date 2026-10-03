@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1081-atomic-shared"
+const VERSION = "r1082-poll-transient"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1983,6 +1983,22 @@ export type FloodBackoffInput = {
   jitter?: number
   /** 注入 [0,1) 随机数，供测试确定化；缺省取 0.5。 */
   rand?: number
+}
+
+// R1850：poll 循环 catch 的**错误分类**（纯函数，可单测）。
+// 返回 true = routine/可自愈（按 info 节流记录），false = 真错误（error 上报）。
+//
+// 长轮询里"超时"与"对端/链路瞬断"是同一族：本轮一定结束、下一轮立刻重发，几秒内自愈。
+// 旧实现只把 timeout 降级为 info，其余一律 `poll error:` 打 error —— 于是
+// `GnuTLS recv error (-110)`（TLS 非正常终止）/`ECONNRESET`/`socket hang up` 这类
+// **已知可恢复**的网络抖动每次都在污染"近 N 分钟 0 error"这个健康信号
+//（R1779/7784 已为超时修过同一问题，这里补全同族）。判据用**错误串证据**，
+// 不靠"记得忽略"的纪律；`aborted`/`abort` 归 routine（takeover 分支在前已单独处理）。
+export const isRoutinePollError = (why: string): boolean => {
+  const s = String(why ?? "")
+  if (!s) return false
+  if (/timeout|timed out|timeouterror|aborted|abort/i.test(s)) return true
+  return /econnreset|econnrefused|epipe|enetunreach|enetdown|ehostunreach|eai_again|socket hang up|fetch failed|premature|gnutls|ssl|tls/i.test(s)
 }
 
 // R1823：群聊命令的 @botname 后缀剥离（纯函数）。Telegram 在群聊会把命令改写成 `/cmd@BotName`；
@@ -6866,6 +6882,14 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         if (Date.now() - pollTimeoutLogAt > 5 * 60_000) {
           pollTimeoutLogAt = Date.now()
           await log("info", `long poll timeout (routine, will retry: ${why.slice(0, 90)})`)
+        }
+      } else if (isRoutinePollError(why)) {
+        // R1850：链路/对端瞬断（TLS 非正常终止 GnuTLS -110、ECONNRESET、socket hang up…）
+        // 与超时同族 —— 本轮结束、下一轮立即重发即可自愈。降级 info + 节流，
+        // 不再让可恢复抖动冒充"poll error"污染健康信号。真错误仍走下面的 error 分支。
+        if (Date.now() - pollTimeoutLogAt > 5 * 60_000) {
+          pollTimeoutLogAt = Date.now()
+          await log("info", `long poll transient network (routine, will retry: ${why.slice(0, 90)})`)
         }
       } else {
         await log("error", `poll error: ${why}`)
