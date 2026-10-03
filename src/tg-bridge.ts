@@ -1734,7 +1734,7 @@ const isAllowed = (chat: any): boolean => {
   if (id && allowedNorm.has(id)) return true
   const uname = chat?.username ? String(chat.username).replace(/^@/, "") : ""
   if (uname && allowedNorm.has(uname)) return true
-  // 形态换算：白名单里配的是**用户名**（如 xb4960），而某些更新只带**数字 chat id**
+  // 形态换算：白名单里配的是**用户名**（如 myusername），而某些更新只带**数字 chat id**
   // （或反之）→ 直接比对会判成"非白名单"并**静默丢弃**这条消息。
   // 症状：备用 Bot 收得到按钮回调（回调路径不过白名单）却收不到任何文字 —— 用户报"消息丢失"。
   // 这里用 knownNumericChatIDs（本进程已确认、且随状态文件落盘的"用户名 ↔ 数字 id"映射）
@@ -4584,7 +4584,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           "· <code>chatId</code> —— 允许对话的 chat；<b>省略就用当前会话</b>",
           "· <code>标签</code> —— 可选，给人看的名字",
           "",
-          "例：<code>/addbot 123456:ABC… 8104398008 第三个</code>",
+          "例：<code>/addbot 123456:ABC… 123456789 第三个</code>",
           "",
           "⚠️ 登记完还要你**手动把新机器人拉进这个会话**（机器人无法自己加人）。",
           "⚠️ token 请先在 BotFather 用 /revoke 作废旧的再换新的 —— 贴到聊天里的等于泄露。",
