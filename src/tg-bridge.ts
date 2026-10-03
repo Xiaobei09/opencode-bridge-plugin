@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1071-use-cb-exists"
+const VERSION = "r1072-table-esc"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
