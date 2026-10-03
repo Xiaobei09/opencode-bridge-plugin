@@ -266,7 +266,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1060-stateloaddiag"
+const VERSION = "r1061-htmlsafecut"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1832,6 +1832,30 @@ export const balanceHtmlTags = (input: string): string => {
 }
 
 /**
+ * `splitHtmlChunks` 定长切片的安全切点：保证 `[i, cut)` 不落在标签 `<...>` 或实体 `&...;` 中间。
+ *
+ * 为什么必须有：R1064 的定长切片按 `i += max` 硬切，切点可能落在标签/实体内部：
+ *  · 片尾 `<b`（无 `>`）：`validateHtmlText` **不报**（它的标签正则要 `>`），若 Telegram 报 400，
+ *    因该片含 `<` 会走"剥标签重发纯文本"降级 → 丢格式（不丢消息）。
+ *  · 片尾 `&am`/`&`（无 `;`）：`validateHtmlText` 报"实体不完整"，而若该片**不含 `<`**，
+ *    发送层的 400 降级分支（`status===400 && chunks[i].includes("<")`）**不触发** →
+ *    `noteDrop` 并**整片丢弃** → 用户看到"消息发送不完整"（正是 R1064 要修的病症）。
+ * 与 `truncateAt` 同策略：回退到最近的 `<`/`&` 之前，余下字符留给下一片，不丢内容。
+ */
+export const safeHtmlCut = (line: string, i: number, max: number): number => {
+  let end = Math.min(i + max, line.length)
+  if (end >= line.length) return end
+  const lt = line.lastIndexOf("<", end - 1)
+  const gt = line.lastIndexOf(">", end - 1)
+  if (lt > gt) end = lt
+  const amp = line.lastIndexOf("&", end - 1)
+  const semi = line.lastIndexOf(";", end - 1)
+  if (amp > semi) end = amp
+  if (end <= i) end = Math.min(i + max, line.length) // 兜底：保证切片循环前进
+  return end
+}
+
+/**
  * 从 staleToolBorn / protoMap 的工具 key 里取出 callID。
  *
  * 为什么不能写死下标：这类 key 有**两种**形态 ——
@@ -2845,7 +2869,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     for (const ln of text.split("\n")) {
       if (ln.length > max) {
         push()
-        for (let i = 0; i < ln.length; i += max) chunks.push(ln.slice(i, i + max))
+        for (let i = 0; i < ln.length; ) {
+          const end = safeHtmlCut(ln, i, max)
+          chunks.push(ln.slice(i, end))
+          i = end
+        }
         continue
       }
       if (cur && cur.length + 1 + ln.length > max) push()
