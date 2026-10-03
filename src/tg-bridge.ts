@@ -81,6 +81,24 @@ export const mergeRename429Until = (
   return out
 }
 
+// R1856：纯函数 —— 有界 LRU 的 `touch`（用于 ownSessions）。
+// 缺口：旧实现只有 `set.add(sid)` + 超限删首个。Set 对**已存在**元素 add **不改变顺序**，
+// 所以"仍在活跃投递、但插入最早"的会话会被当成最旧淘汰，而刚重复投递的会话得不到保护。
+// 淘汰后隔离门 `ownOk` 可能不再认它（`ownSessions.has` 为 false）→ 非主实例偶发
+// "不再跟这个会话"（用户体感：bot3 有时不发）。改为先 delete 再 add 置尾，实现真 LRU。
+// 越界时从**表头**（最久未 touch）开始删，直到回到 cap；非 ses_ 前缀直接忽略。
+export const touchOwnSession = (set: Set<string>, sid: string, cap: number): void => {
+  if (!sid || !sid.startsWith("ses_")) return
+  set.delete(sid)
+  set.add(sid)
+  const limit = Number.isFinite(cap) && cap >= 0 ? Math.floor(cap) : 0
+  while (set.size > limit) {
+    const oldest = set.values().next()
+    if (oldest.done) break
+    set.delete(oldest.value)
+  }
+}
+
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
 // 分母 = 模型 limit.context（provider.list 实取，取不到回落 1M）。
@@ -300,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1086-cmd-sentinel"
+const VERSION = "r1087-own-lru"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3759,12 +3777,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
    */
   const ownSessions = new Set<string>()
   const noteOwnSession = (sid: string): void => {
-    if (!sid || !sid.startsWith("ses_")) return
-    ownSessions.add(sid)
-    if (ownSessions.size > 24) {
-      const oldest = ownSessions.values().next()
-      if (!oldest.done) ownSessions.delete(oldest.value)
-    }
+    // R1856：真 LRU（重复投递会刷新位置），见 touchOwnSession。
+    touchOwnSession(ownSessions, sid, 24)
   }
 
   const protoPushAssistantMessage = async (sessionID: string, chatID: string, m: any, force = false, mode: 'full' | 'text' = 'full'): Promise<void> => {
