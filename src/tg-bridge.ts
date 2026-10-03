@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1069-addbot-tokdel"
+const VERSION = "r1070-dedupe-ack"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5462,6 +5462,12 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     if (!opts?.synthetic) {
       if (seenUpdates.has(uid)) {
         inboundCounters.droppedDupe++
+        // R1836：已见过的重投也要把 offset 推过去。否则若上个实例恰在「写 seen 之后、
+        // 提交 offset 之前」崩溃/被杀（两处 savePersistedState 之间的窗口），重启后 TG 会
+        // 反复重投同一条：被去重环拦下却**从不提交 offset**，直到下一条真实 update 才前进。
+        // 无新消息时形成静默空转（同一条 update 被无限拉取）。推进 offset 让重投确定性终止。
+        // 语义安全：uid 既已在 seenUpdates，说明此前已处理/按 R1817 约定作废，不会造成重复副作用。
+        commitOffset(uid)
         return
       }
       seenUpdates.add(uid)
