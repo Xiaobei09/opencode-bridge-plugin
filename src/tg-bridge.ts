@@ -283,7 +283,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1070-dedupe-ack"
+const VERSION = "r1071-use-cb-exists"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -5267,6 +5267,16 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     }
     if (parts[0] === "use" && parts[1] && parts[1].startsWith("ses_")) {
       const id = parts[1]
+      // R1837：与文本 /use 同一不变量（R1829）—— 只接受列表里**真实存在**的会话。
+      // 此前回调只校验 `ses_` 前缀：会话被删除后，早年渲染的旧按钮仍可把前台钉到死会话，
+      // 表现为"切过去后消息发不出去"（正是 R1819「不能正确选择会话」的回调侧残留）。
+      // 保守放行：refreshSessionTitles 失败/列表为空时 sessionIdAcceptable 返回 true，不误伤。
+      await refreshSessionTitles()
+      if (!sessionIdAcceptable(id, cachedSessionList.map((s) => s.id), true)) {
+        await answer("会话不存在")
+        await reply(cchat, `❌ 会话不存在：${id.slice(0, 12)}（可能已删除；用 /sessions 查看列表）`)
+        return
+      }
       const prev = fixedTarget ?? frontSessionID ?? persistedFront
       fixedTarget = id
       persistedFront = id
