@@ -300,7 +300,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1080-full-honest"
+const VERSION = "r1081-atomic-shared"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -617,7 +617,10 @@ const claimPollOwner = (id: string, kind: string): void => {
       /* first run */
     }
     current[kind] = { id, ts: Date.now() }
-    writeFileSync(OWNER_PATH, JSON.stringify(current), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+    // R1849：OWNER_PATH 被 tg-bridge 多实例与 auto-continue 跨进程读写（`amPollOwner`/
+    // `readPollOwner` 都 `JSON.parse`）；裸写有 O_TRUNC 窗口，读侧 parse 失败会误判
+    // "无主" → 重复抢主。改用 atomicWrite（tmp+rename）。
+    atomicWrite(OWNER_PATH, JSON.stringify(current), PRIVATE_FILE_MODE)
   } catch {
     /* best-effort */
   }

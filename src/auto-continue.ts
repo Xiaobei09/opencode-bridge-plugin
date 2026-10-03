@@ -50,7 +50,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1052-loop-atomic"
+const VERSION = "r1053-atomic-shared"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
@@ -104,10 +104,9 @@ const readMarkedSids = (): string[] => {
 const writeMarkedSids = (sids: string[]): void => {
   try {
     const clean = sids.filter(isSessionID).slice(0, MARKER_SET_MAX)
-    writeFileSync(MARKER_STATE_PATH, JSON.stringify({ sids: clean, ts: Date.now() }), {
-      encoding: "utf8",
-      mode: PRIVATE_FILE_MODE,
-    })
+    // R1849：loop-marker.json 跨 Bot 的 AC 进程共享；裸写有 O_TRUNC 窗口，
+    // `readMarkedSids` parse 失败 → 返回 [] → 该清掉的 [LOOP] 标记清不掉/反之。
+    atomicWriteJson(MARKER_STATE_PATH, { sids: clean, ts: Date.now() })
   } catch {
     /* best-effort */
   }
@@ -167,7 +166,10 @@ const ownsCtlWriter = (): boolean => {
 const writeCtlStopped = (stopped: boolean, by: string, reason = ""): void => {
   if (!ownsCtlWriter()) return
   try {
-    writeFileSync(LOOP_CTL_PATH, JSON.stringify({ stopped, by, reason, ts: Date.now() }), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+    // R1849：总闸跨进程共享，与 tg-bridge 的 `mutateLoopCtlFile` 同一文件。裸写有
+    // O_TRUNC 窗口，读侧（本侧 `readCtl`、桥侧 `loopStopped`）会 parse 失败 → 误判
+    // 为「没停」。改用 atomicWriteJson（tmp+rename）。
+    atomicWriteJson(LOOP_CTL_PATH, { stopped, by, reason, ts: Date.now() })
   } catch {
     /* best-effort */
   }
@@ -850,7 +852,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       if (keys.length > 300) {
         for (const k of keys.slice(0, keys.length - 300)) delete j[k]
       }
-      writeFileSync(CLAIM_PATH, JSON.stringify(j), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+      // R1849：round-claims.json 跨代/跨进程共享；裸写 O_TRUNC 窗口里的半截会被
+      // 并发读当作"无认领" → 同一轮可能被重复注入。atomicWriteJson 保证读者见完整版。
+      atomicWriteJson(CLAIM_PATH, j)
       return true
     } catch {
       return true // 文件不可用时不挡路（内存 decided 仍在）
@@ -861,7 +865,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       const j = JSON.parse(readFileSync(CLAIM_PATH, "utf8")) as any
       if (j && typeof j === "object") {
         delete j[`${sessionID}:${msgID}`]
-        writeFileSync(CLAIM_PATH, JSON.stringify(j), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+        atomicWriteJson(CLAIM_PATH, j)
       }
     } catch {
       /* best-effort */
