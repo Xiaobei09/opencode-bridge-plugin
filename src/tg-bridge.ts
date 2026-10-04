@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1117-proto-retry-evicted-dropcensus"
+const VERSION = "r1119-callback-allowlist-droppedbot"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1530,6 +1530,8 @@ const inboundCounters = {
   droppedDupe: 0,
   droppedNotAllowed: 0,
   droppedNoMessage: 0,
+  droppedBot: 0,
+  droppedCallback: 0,
   outbound: 0,
   outboundFail: 0,
 }
@@ -5934,6 +5936,20 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     inboundCounters.total++
     if (u?.callback_query) {
       inboundCounters.callback++
+      // R1892：与文本/编辑消息共用同一条白名单闸。旧缺口：非白名单 chat 的按钮点击
+      // （callback_query）照常进 handleCallback —— 等于「按钮」通道比「文字」更宽松，
+      // 而 ma:* 菜单动作还能合成文本消息喂入既有命令链（L6328 合成处）→ 白名单形同虚设。
+      // 现回调先过 isAllowed；非白名单 → 计数 + info 留痕 + 丢弃（不再进处理链）。
+      const qchat = u.callback_query.message?.chat
+      if (qchat && !isAllowed(qchat)) {
+        inboundCounters.droppedCallback++
+        await log(
+          "info",
+          `update from non-whitelisted chat=${sanitizeLog(chatTarget(qchat))} ` +
+            `(id=${sanitizeLog(String(qchat?.id ?? "")).slice(0, 16)}, callback, data=${sanitizeLog(String(u.callback_query?.data ?? "")).slice(0, 24)}) ignored`,
+        )
+        return
+      }
       currentInbound = null
       await handleCallback(u.callback_query)
       return
