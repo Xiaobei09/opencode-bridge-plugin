@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1106-updates-okfalse"
+const VERSION = "r1107-chunk-fallback-kb"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3133,8 +3133,25 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         }
         if (status === 400 && chunks[i].includes("<")) {
           const plain = chunks[i].replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
-          const r2 = await tgFetch("sendMessage", { chat_id: Number(chatID) || chatID, text: plain.slice(0, PUSH_MAX) })
-          if (r2.ok) continue
+          // R1880：与非分段路径（下方那条 400 降级）对齐。旧实现在这里只发 `{chat_id, text}`：
+          //   • **丢 reply_markup** —— 按钮消失、用户点不到（本轮 dim 5 的正题）；
+          //   • **丢 disable_notification** —— 本该静默的思考/状态卡变响铃；
+          //   • **丢 reply_to_message_id**；
+          //   • 成功时**零日志** —— 非分段路径会记一条，所以日志里看不出"按钮被剥掉了"；
+          //   • r2 若再失败会掉进下面的 drop 日志、报的是**原始 400** 而非 r2 的真实状态，
+          //     两次失败被压成一次，定位时看到的是一个不存在的错误码。
+          const fb: Record<string, unknown> = { chat_id: Number(chatID) || chatID, text: plain.slice(0, PUSH_MAX) }
+          if (i === 0 && kb) fb.reply_markup = { inline_keyboard: kb }
+          if (silent) fb.disable_notification = true
+          if (i === 0 && replyTo) fb.reply_to_message_id = replyTo
+          const r2 = await tgFetch("sendMessage", fb)
+          if (r2.ok) {
+            // 同 R1806：r2.id 可能是 undefined，容错在调用点（protoDeliveryVerdict 判 degraded）。
+            if (i === 0) firstId = r2.id as number
+            await log("info", `sendMessage plain-fallback ok (chat=${sanitizeLog(chatID)}) chunk=${i + 1}/${chunks.length}${i === 0 && kb ? " (kb kept)" : ""}`)
+            continue
+          }
+          await log("error", `sendMessage plain-fallback failed (chat=${sanitizeLog(chatID)}) chunk=${i + 1}/${chunks.length}: ${r2.status ?? 0} desc=${sanitizeLog(r2.desc ?? "").slice(0, 160)}`)
         }
         await log("error", `sendMessage chunk ${i + 1}/${chunks.length} dropped (chat=${sanitizeLog(chatID)}): ${status} desc=${sanitizeLog(r.desc ?? "").slice(0, 160)}`)
         noteDrop("send-chunk", `chat=${sanitizeLog(chatID)} status=${status} chunk=${i + 1}/${chunks.length}`)
