@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1104-edit-degrade-drop"
+const VERSION = "r1105-list-keep"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2712,14 +2712,21 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     try {
       const res = await (client as any).session.list?.({})
       const ok = Array.isArray(res?.data)
-      const arr = ok ? res.data : []
-      cachedSessionList.length = 0
-      for (const s of arr) {
-        const id = String(s?.id ?? "")
-        if (!id) continue
-        const title = String(s?.title ?? s?.info?.title ?? "").slice(0, 60)
-        cachedSessionList.push({ id, title: title || undefined })
-        if (title) sessionTitleCache.set(id, title)
+      // R1878：**只在拿到合法数组时才重建缓存**。旧代码的清空动作是**无条件执行**的
+      // → `session.list` 返回**非数组**（降级/畸形响应）时，最后一份好数据被抹掉，
+      // `/sessions` 会短暂全空（用户看到"会话列表没了"），偏偏发生在最不该丢数据的时刻。
+      // 选择面不受影响（R1829/R1874 保守放行：读失败返回 false，不因一次畸形读收紧可选项），
+      // 但**展示面**不该被一次坏读摧毁 —— 保留上一份好列表，读成功时再整体替换。
+      if (ok) {
+        const arr = res.data as any[]
+        cachedSessionList.length = 0
+        for (const s of arr) {
+          const id = String(s?.id ?? "")
+          if (!id) continue
+          const title = String(s?.title ?? s?.info?.title ?? "").slice(0, 60)
+          cachedSessionList.push({ id, title: title || undefined })
+          if (title) sessionTitleCache.set(id, title)
+        }
       }
       for (const [sid, ts] of lastActivity) {
         if (Date.now() - ts > ACTIVE_WINDOW_MS) lastActivity.delete(sid)
