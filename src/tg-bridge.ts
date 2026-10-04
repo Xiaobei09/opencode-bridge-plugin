@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1115-fallback-decode-then-strip"
+const VERSION = "r1116-proto-retry-budget"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -431,6 +431,7 @@ let QUEUE_CARD_OWNER = true
 // 独立开关而非复用 QUEUE_CARD_OWNER —— QUEUE_CARD_OWNER 还承载 ownsAsk/scopeOwn 语义
 //（主实例=跟随前台 + 兜底询问），放开它会让非主实例抢答。env TG_SELF_QUEUE_PIN=0 可关。
 const ALLOW_SELF_QUEUE_PIN = process.env.TG_SELF_QUEUE_PIN !== "0"
+const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 12 // R1889 重试总额度（12 次 ≈ 退避累计 5 分钟）；理由见 run() 内 retry 分支的注释
 
 const loadFileEnv = (path?: string | null): Record<string, string> => {
   const out: Record<string, string> = {}
@@ -3284,7 +3285,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const status = r.status ?? 0
         if (status === 429 || status >= 500 || status === 0) {
           await log("info", `sendMessage chunk ${i + 1}/${chunks.length} failed (chat=${sanitizeLog(chatID)}): ${status || "network-exception"} (will retry whole)`)
-          return { r: "retry" }
+          return { r: "retry", status, desc: status || "network-exception" }
         }
         if (status === 400 && chunks[i].includes("<")) {
           // R1888：**先解码、后剥标签**。text 是已 htmlEsc 的 HTML（随后按 parse_mode=HTML
@@ -3348,11 +3349,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     const status = r.status ?? 0
     if (status === 429 && r.desc === "local flood gate active") {
-      return { r: "retry" }
+      return { r: "retry", status, desc: "local flood gate active" }
     }
     if (status === 429 || status >= 500 || status === 0) {
       await log("info", `sendMessage failed (chat=${sanitizeLog(chatID)}): ${status || "network-exception"} (will retry)`)
-      return { r: "retry" }
+      return { r: "retry", status, desc: status || "network-exception" }
     }
     if (status === 400) {
       // R1888：同分段路径 —— **先解码、后剥标签**，否则剥标签打在转义文本上是空操作，
@@ -3412,7 +3413,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // status 0 = fetch 抛异常（网络不可达/DNS/超时），**必须可重试**。
     // 此前只判 429/5xx，把网络异常当永久失败 → 00:54 那次网络抖动直接把菜单点击
     // 变成"点了没反应"（用户报告 /menu 打不开的一类成因）。
-    if (status === 0 || status === 429 || status >= 500) return { r: "retry" }
+    if (status === 0 || status === 429 || status >= 500) return { r: "retry", status, desc: status || "network-exception" }
     await log("error", `editMessageText failed (chat=${sanitizeLog(chatID)}, msg=${messageID}): ${status} (no retry) desc=${sanitizeLog(r.desc ?? "").slice(0, 160)}`)
     noteDrop("edit", `chat=${sanitizeLog(chatID)} msg=${messageID} status=${status} len=${text.length}`)
     return { r: "drop" }
@@ -3670,6 +3671,30 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       if (r.r === "retry") {
         item.attempt++
+        // R1889：重试**总额度**。旧实现 attempt 只增不设上限，只要判定还是 retry 就无限续，
+        // 退避实际封顶 **30s** → 一个永久失败的 key 会**每 30 秒**打一次 Telegram 直到天荒地老。
+        // （实测更正：外层 `Math.min(60_000, …)` 那层钳位**不可达** —— 内层 `Math.min(attempt,6)`
+        //   已把上限锁在 6×5s=30s。此前注释与状态记录都写成"封顶 60s / 每分钟"，是错的。）
+        // 收敛出口本来只有四条：成功、非 retry 的永久失败、换代/停循环放弃、队首淘汰
+        // （cap 200，淘汰会 warn 但那条内容就此不再送达）。没有额度上限意味着"瞬时抖动"
+        // 与"永久故障"在行为上**无法区分**：后者会一直占着一个队列位并持续刷网。
+        // 定性诚实：**无线上实际复发证据**（可见日志只覆盖约 7.5 分钟、436 行，不足以判断），
+        // 故这是潜在面硬化。默认 12 次 ≈ 退避累计 5 分钟，足以扛过瞬时抖动；
+        // 耗尽后走**与永久失败同一条** verdict（error 级 + noteDrop 语义的日志），
+        // 于是"没送出去"在日志里始终有交代，不靠沉默。env TG_PROTO_RETRY_MAX_ATTEMPTS 可调。
+        if (item.attempt >= PROTO_RETRY_MAX_ATTEMPTS) {
+          clearTimeout(item.timer)
+          protoRetry.delete(key)
+          // 必须同时进 drop census：这与 send/edit/queue-full/flood-shed/edit-degrade 是
+          // **同一族**「内容确实没送出去」的事件。此前只记 log → 用户在 TG 里看到的
+          // 丢件清单里**看不到这条**，等于损失只存在于日志、不可见。
+          noteDrop("proto-retry-exhausted", `chat=${sanitizeLog(item.chatID)} attempts=${item.attempt} budget=${PROTO_RETRY_MAX_ATTEMPTS} len=${item.text.length}`)
+          await log(
+            "error",
+            `proto retry dropped permanently (${sanitizeLog(key)}): attempts=${item.attempt} reason=retry-budget-exhausted budget=${PROTO_RETRY_MAX_ATTEMPTS} last=${sanitizeLog((r as any).desc ?? "").slice(0, 120)}`,
+          )
+          return
+        }
         const delay = Math.min(60_000, 5_000 * Math.min(item.attempt, 6))
         item.timer = setTimeout(() => void run(), delay)
         return
@@ -5519,12 +5544,12 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       if (view === "root") {
         // 根菜单就地编辑成子菜单，避免每点一次多出一条消息
         const mid = Number(cq?.message?.message_id ?? 0)
-        const r = mid ? await editTextRaw(target, mid, text, kb, false) : { r: "retry" as const }
+        const r = mid ? await editTextRaw(target, mid, text, kb, false) : { r: "retry" as const, desc: "no message id to edit" }
         if (r.r !== "sent") await sendTextRaw(target, text, kb, false)
         else if (mid) protoMap.set(`menu:${target}`, { id: mid, text, fallback: false })
       } else {
         const mid = Number(cq?.message?.message_id ?? 0)
-        const r = mid ? await editTextRaw(target, mid, text, kb, false) : { r: "retry" as const }
+        const r = mid ? await editTextRaw(target, mid, text, kb, false) : { r: "retry" as const, desc: "no message id to edit" }
         if (r.r !== "sent") await sendTextRaw(target, text, kb, false)
       }
       await answer("菜单")
