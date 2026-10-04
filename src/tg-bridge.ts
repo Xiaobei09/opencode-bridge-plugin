@@ -318,7 +318,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1105-list-keep"
+const VERSION = "r1106-updates-okfalse"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -7046,6 +7046,29 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return
       }
       const j = (await res.json()) as any
+      // R1879：HTTP 200 也可能带 `ok:false`（error_code/description），或干脆不是对象。
+      // 旧实现只测 `Array.isArray(j?.result)` → 一律当"本轮无消息"：**零日志**（连 error_code
+      // 都不留痕；本文件其他 Telegram 调用都查了 `j.ok`，唯独 getUpdates 这处不查），
+      // 且把**失败的轮次记成健康的空轮** —— 上游在拒绝我们，日志里却看不出任何异常。
+      // 规则：**失败轮不记账**（不刷新同伴账本、不推进 offset、不记入站），一律早退。
+      if (!j || typeof j !== "object" || j.ok === false) {
+        const code = Number(j?.error_code ?? 0)
+        const desc = String(j?.description ?? (j ? "(no description)" : "(non-object body)")).slice(0, 120)
+        const shown = Number.isFinite(code) && code > 0 ? String(code) : "?"
+        const detail =
+          `getUpdates not ok: status=200 error_code=${shown} ${desc} ` +
+          `(me=${shortId}, gen=${myGen}, pid=${process.pid})`
+        // 429（限流）与 5xx 属瞬时：降级 info + 节流，不让上游抖动冒充 poll error。
+        if (code === 429 || isRoutinePollStatus(code)) {
+          if (Date.now() - pollTimeoutLogAt > 5 * 60_000) {
+            pollTimeoutLogAt = Date.now()
+            await log("info", `getUpdates transient (routine, will retry): ${detail}`)
+          }
+        } else {
+          await log("error", detail)
+        }
+        return // 关键：不走 touchPeer、不推进 offset、不 noteInbound
+      }
       const result = Array.isArray(j?.result) ? j.result : []
       for (const u of result) {
         await handleUpdate(u)
