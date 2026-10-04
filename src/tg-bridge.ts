@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1116-proto-retry-budget"
+const VERSION = "r1117-proto-retry-evicted-dropcensus"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3615,6 +3615,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       void log(
         "warn",
         `proto retry evicted (cap 200, oldest): ${sanitizeLog(oldKey)} attempts=${oldItem?.attempt ?? 0} len=${(oldItem?.text ?? "").length}`,
+      )
+      // R1890：但 warn 日志**对用户不可见** —— 必须同时进 drop census，与 send/edit/
+      // queue-full/flood-shed/edit-degrade/proto-retry-exhausted 同属「内容确实没送出去」。
+      // dropRing 消费方是 /drop 诊断卡（L7773-7778），只列最后 10 条；不进它，用户在 TG
+      // 里就看不到这次淘汰造成的内容损失。实测 dropRing 无"容量类"单独子类、淘汰条目
+      // 与其它 kind 平等，故本条必须显式 noteDrop。
+      noteDrop(
+        "proto-retry-evicted",
+        `chat=${sanitizeLog(oldItem?.chatID ?? "")} attempts=${oldItem?.attempt ?? 0} len=${(oldItem?.text ?? "").length}`,
       )
     }
     const run = async (): Promise<void> => {
