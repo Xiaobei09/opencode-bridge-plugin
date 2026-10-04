@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1114-ctx-diag-honest"
+const VERSION = "r1115-fallback-decode-then-strip"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3287,7 +3287,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           return { r: "retry" }
         }
         if (status === 400 && chunks[i].includes("<")) {
-          const plain = chunks[i].replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+          // R1888：**先解码、后剥标签**。text 是已 htmlEsc 的 HTML（随后按 parse_mode=HTML
+          // 发出），所以旧顺序 `.replace(/<[^>]*>/g,"")` 打在转义文本上**是空操作** ——
+          // 紧接着的解码又把 &lt;b&gt; 还原成真标签，于是「剥标签纯文本降级」反而把标签
+          // 当**字面文本**原样送到用户面前（实测 `<b>粗体</b> 正文` 原样送达，用户看到标签）。
+          // 调换顺序后剥的才是真标签 → `粗体 正文`；其余用例（`ctx <1%`、`a & b`、
+          // 讲解用的字面实体）两种顺序结果完全一致，不受影响。
+          const plain = chunks[i].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/<[^>]*>/g, "")
           // R1880：与非分段路径（下方那条 400 降级）对齐。旧实现在这里只发 `{chat_id, text}`：
           //   • **丢 reply_markup** —— 按钮消失、用户点不到（本轮 dim 5 的正题）；
           //   • **丢 disable_notification** —— 本该静默的思考/状态卡变响铃；
@@ -3349,8 +3355,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return { r: "retry" }
     }
     if (status === 400) {
-      // HTML 非法（如标签错位）：剥标签纯文本降级重发一次，保证送达；键保留（400 错在正文不在 markup）。
-      const plain = text.replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+      // R1888：同分段路径 —— **先解码、后剥标签**，否则剥标签打在转义文本上是空操作，
+      // 解码又把标签还原成字面文本，降级反而把 `<b>`/`<pre>` 送到用户面前。
+      const plain = text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/<[^>]*>/g, "")
       const fb: Record<string, unknown> = { chat_id: Number(chatID) || chatID, text: plain.slice(0, PUSH_MAX) }
       if (kb) fb.reply_markup = { inline_keyboard: kb }
       const r2 = await tgFetch("sendMessage", fb)
