@@ -50,7 +50,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1053-atomic-shared"
+const VERSION = "r1054-loop-ctl-merge"
 const LOOP_TITLE_MARK = "[LOOP]"
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
@@ -169,7 +169,14 @@ const writeCtlStopped = (stopped: boolean, by: string, reason = ""): void => {
     // R1849：总闸跨进程共享，与 tg-bridge 的 `mutateLoopCtlFile` 同一文件。裸写有
     // O_TRUNC 窗口，读侧（本侧 `readCtl`、桥侧 `loopStopped`）会 parse 失败 → 误判
     // 为「没停」。改用 atomicWriteJson（tmp+rename）。
-    atomicWriteJson(LOOP_CTL_PATH, { stopped, by, reason, ts: Date.now() })
+    // R1891：必须**合并**而非覆盖。本文件按 loopGateStopped 的 schema 同时收两套账本：
+    // 顶层 `stopped`（全局闸）+ `bots[<id>].{stopped,sids}`（单 Bot 闸，由 tg 侧
+    // writeLoopCtl / syncLoopCtlSids 维护）。旧写法每拍写一个裸 {stopped,by,reason,ts}，
+    // 把 `bots` 账本整体抹掉 →「停一次全局闸」连坐把各 Bot 的单 Bot 暂停（含 sids 绑定）
+    // 清零，此后单 Bot 闸匹配不到 sid → 永不停该 bot。读旧值合并，保留 bots。
+    const prev = readCtl()
+    const out = { ...prev, stopped, by, reason, ts: Date.now() }
+    atomicWriteJson(LOOP_CTL_PATH, out)
   } catch {
     /* best-effort */
   }
