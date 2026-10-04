@@ -107,8 +107,26 @@ const ctxUsage = new Map<string, CtxUsage>()
 const modelWindows = new Map<string, number>()
 let modelWinTs = 0
 const ctxTotal = (u: CtxUsage): number => u.input + u.output + u.reasoning + u.cacheRead + u.cacheWrite
-const windowFor = (modelID: string, providerID: string): number =>
+export const windowFor = (modelID: string, providerID: string): number =>
   modelWindows.get(`${providerID}/${modelID}`) ?? 1048576
+export const windowKnown = (modelID: string, providerID: string): boolean =>
+  modelWindows.has(`${providerID}/${modelID}`)
+// R1881：宿主 `GET /api/model` 响应 → 「模型键 → 真实窗口」。**纯函数**（提到模块作用域），
+// 这样"默认模型到底是 200k 还是 1M"能用行为测试钉死，而不是只能靠源码断言。
+// 实测真实形状：{ data: [ { providerID, id, limit: { context, output } } ] }（67 个模型）。
+export const modelWindowEntries = (j: unknown): Array<{ key: string; context: number }> => {
+  const out: Array<{ key: string; context: number }> = []
+  const root = j as any
+  const list = Array.isArray(root?.data) ? root.data : Array.isArray(root) ? root : []
+  for (const m of list) {
+    const pid = String(m?.providerID ?? "")
+    const mid = String(m?.id ?? m?.modelID ?? "")
+    const lim = Number(m?.limit?.context)
+    if (pid && mid && Number.isFinite(lim) && lim > 0) out.push({ key: `${pid}/${mid}`, context: lim })
+  }
+  return out
+}
+
 
 // ctx 骤降是否算"宿主自动压缩" —— 纯函数，好处是四条否决线都能用行为测试钉死
 // （写成 if 链就只能靠静态断言，那玩意儿今天已经假阳性 4 次）。
@@ -248,6 +266,9 @@ const ctxSuffix = (sessionID: string): string => {
     const total = ctxTotal(u)
     if (total <= 0) return ""
     const win = windowFor(u.modelID, u.providerID)
+    // R1881：窗口**未知**时不得拿兜底常量当真实窗口算百分比 —— 那正是「显示 1m」的成因：
+    // 用量除以 1048576 会把 200k 的模型显示成"1m 才用了 9%"。宁可显示"未知"。
+    if (!windowKnown(u.modelID, u.providerID)) return " · ctx ?（模型窗口未知）"
     // 兜底：超窗值一律不显示成 100%（100% 会被当成"上下文满了"，是误导）
     if (total > win) return " · ctx ?（用量口径异常，已隐藏）"
     const pct = (total / win) * 100
@@ -318,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1107-chunk-fallback-kb"
+const VERSION = "r1109-ctx-window-seq"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2610,38 +2631,89 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   ctxBackfillRequest = (sid) => {
     void backfillCtxUsage(sid)
   }
-  // 模型窗口：provider.list 实取 limit.context（10 分钟 TTL），取不到回落 1M
+  // 模型窗口（10 分钟 TTL）。R1881：**两个数据源**，且失败必须留痕。
+  //
+  // 背景（用户实报「默认模型的上下文是1m」）：本宿主版本的插件 client **没有**
+  // `provider.list`，旧实现直接 `return` → modelWindows 永远是空表 → 所有模型一律
+  // 回落 1048576 → 卡片显示 "1m"。实测默认模型 `opencode/big-pickle` 的真实窗口是
+  // **200000**：显示值错 5 倍，且 windowFor 的另一处消费（自动压缩阈值）也被算松 5 倍。
+  //
+  // 数据源 2 = 宿主 HttpApi `GET /api/model`（实测 HTTP 200，`{data:[{providerID,id,limit:{context}}]}`）。
+  // 凭证与 bgHttpPromote 同源：~/.local/state/opencode/service.json，Basic base64("opencode:"+pw)。
+  const fetchModelWindowsHttp = async (): Promise<number> => {
+    const home = process.env.HOME ?? "/root"
+    const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
+      url?: string
+      password?: string
+    }
+    const url = String(reg?.url ?? "").replace(/\/+$/, "")
+    const pw = String(reg?.password ?? "")
+    if (!url || !pw) return 0
+    const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
+    const r = await fetch(`${url}/api/model`, {
+      headers: { Authorization: `Basic ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!r.ok) return 0
+    const entries = modelWindowEntries(await r.json())
+    for (const e of entries) modelWindows.set(e.key, e.context)
+    return entries.length
+  }
   const refreshModelWindows = async (): Promise<void> => {
-    try {
-      if (Date.now() - modelWinTs < 10 * 60_000) return
-      modelWinTs = Date.now()
-      const fn = (client as any)?.provider?.list
-      if (typeof fn !== "function") {
-        await log("info", "[tg-bridge] ctx model windows: provider.list unavailable (1M default)")
-        return
-      }
-      const r = await fn.call((client as any).provider, {})
-      const list = Array.isArray((r as any)?.data) ? (r as any).data : Array.isArray(r) ? (r as any) : []
-      let n = 0
-      for (const p of list) {
-        const pid = String((p as any)?.id ?? "")
-        const models = Array.isArray((p as any)?.models) ? (p as any).models : []
-        for (const mm of models) {
-          const mid = String((mm as any)?.id ?? "")
-          const lim = Number((mm as any)?.limit?.context)
-          if (pid && mid && Number.isFinite(lim) && lim > 0) {
-            modelWindows.set(`${pid}/${mid}`, lim)
-            n++
+    if (Date.now() - modelWinTs < 10 * 60_000) return
+    modelWinTs = Date.now()
+    let n = 0
+    const fn = (client as any)?.provider?.list
+    if (typeof fn === "function") {
+      try {
+        const r = await fn.call((client as any).provider, {})
+        const list = Array.isArray((r as any)?.data) ? (r as any).data : Array.isArray(r) ? (r as any) : []
+        for (const p of list) {
+          const pid = String((p as any)?.id ?? "")
+          const mo = (p as any)?.models
+          // models 既可能是数组，也可能是 `Record<modelID, model>` 映射 —— 两种都吃。
+          const models: any[] = Array.isArray(mo) ? mo : mo && typeof mo === "object" ? Object.values(mo) : []
+          for (const mm of models) {
+            const mid = String((mm as any)?.id ?? "")
+            const lim = Number((mm as any)?.limit?.context)
+            if (pid && mid && Number.isFinite(lim) && lim > 0) {
+              modelWindows.set(`${pid}/${mid}`, lim)
+              n++
+            }
           }
         }
+      } catch (err) {
+        // 旧实现整段 `/* ignore */`：抛错也一声不吭，于是窗口表悄悄空着。
+        await log("error", `[tg-bridge] ctx model windows: provider.list failed (${sanitizeLog(err).slice(0, 140)}), trying HttpApi`)
       }
-      await log("info", `[tg-bridge] ctx model windows: ${n} models`)
-    } catch {
-      /* ignore */
+    } else {
+      await log("info", "[tg-bridge] ctx model windows: provider.list unavailable, using HttpApi /api/model")
     }
+    if (n === 0) {
+      try {
+        n = await fetchModelWindowsHttp()
+      } catch (err) {
+        await log("error", `[tg-bridge] ctx model windows: HttpApi /api/model failed: ${sanitizeLog(err).slice(0, 140)}`)
+      }
+      await log(
+        n > 0 ? "info" : "error",
+        n > 0
+          ? `[tg-bridge] ctx model windows: ${n} models (HttpApi /api/model)`
+          : "[tg-bridge] ctx model windows: 0 models — 窗口将回落 1M 兜底，ctx 百分比与压缩阈值均不可信",
+      )
+      return
+    }
+    await log("info", `[tg-bridge] ctx model windows: ${n} models`)
   }
-  void refreshModelWindows()
-  void backfillCtxUsage(fixedTarget ?? persistedFront ?? "")
+  // R1882：这两步有**先后依赖** —— 窗口表必须先填好，回填算出的百分比才有正确分母。
+  // 原来是两个并列的 `void`，实测每次热重载后首个回填都抢在取窗口之前跑完
+  // （三个 bot 的 backfill 时间戳全部早于 `ctx model windows: 57 models`）
+  // → 用户看到的仍是 `/1m`，会以为 R1881 没生效。
+  // 串进同一个协程：既保证顺序，又保持 setup 不被网络往返阻塞。
+  void (async () => {
+    await refreshModelWindows()
+    await backfillCtxUsage(fixedTarget ?? persistedFront ?? "")
+  })()
   // offset 只在 poll 成功处理 update 后提交
   const commitOffset = (uid: number): void => {
     if (!Number.isFinite(uid) || uid <= 0) return
