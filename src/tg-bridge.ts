@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1119-callback-allowlist-droppedbot"
+const VERSION = "r1120-watch-prune-dead"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2882,6 +2882,20 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (lastLoggedSessionCount !== cachedSessionList.length) {
           lastLoggedSessionCount = cachedSessionList.length
           void log("info", `session list ok (${cachedSessionList.length} 个，作为存在性判据)`)
+        }
+        // R1893：dead watch entries persist —— 会话被删后 watch 条目只是滞留占格
+        // （/watch 列表还会展示它、WATCH_MAX 被它占用），持久化也累加。refreshSessionTitles
+        // 只有在 **listOk && 缓存非空** 时才许修剪 —— 绝不能因一次坏读/降级把真在用的
+        // watch 条目一并删掉。判据与 /watch 入口（L7055）同款：列表可用时必须在列。
+        if (ok && cachedSessionList.length > 0) {
+          const live = new Set(cachedSessionList.map((s) => s.id))
+          const dead: string[] = []
+          for (const w of watchedSessions) if (!live.has(w)) dead.push(w)
+          if (dead.length > 0) {
+            for (const w of dead) watchedSessions.delete(w)
+            void log("info", `watch pruned dead entries (missing from session list): ${dead.map((d) => d.slice(0, 12)).join(",")}`)
+            savePersistedState()
+          }
         }
       } else {
         void log("warn", `session list 非数组（保留上一份好列表 ${cachedSessionList.length} 个）`)
