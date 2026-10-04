@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1109-ctx-window-seq"
+const VERSION = "r1112-session-list-full"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1640,6 +1640,12 @@ if (!BOOTSTRAP_BOT) loadPersistedState()
 const clean = (s: unknown, n: number): string =>
   String(s ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n)
 const POLL_MS = Number(process.env.TG_POLL_MS ?? "2000") || 2000
+// R1885：`/api/session` 的取回条数。实测服务端默认只给最近 50 个，而项目内实有 125 个 ——
+// 不显式要数量，会话选择闸口会把「排在 50 名之外但真实存在」的会话误判为不存在。
+// 注意：这**只能**走裸 HTTP；宿主内置 client 不转发 limit 参数（见 refreshSessionTitles 注释）。
+// 取一个远大于本地各上限的数：本地最多也就 WATCH_MAX=8 条镜像 + LOOP_SESSIONS_CAP=16，
+// 而这份列表的用途是**存在性判据**，宁全勿缺（多取的成本只是几十个标题字符串）。
+const SESSION_LIST_LIMIT = 1000
 const PUSH_MAX = 3800
 const ACTIVE_WINDOW_MS = 10 * 60_000
 const STOP_NOTIFY_MS = 60_000
@@ -2776,29 +2782,94 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
   const sessionTitleCache = new Map<string, string>()
   const cachedSessionList: Array<{ id: string; title?: string }> = []
+  // R1884：上次记进日志的条数（-1 = 还没记过）。仅用于"变化才记"，避免刷屏。
+  let lastLoggedSessionCount = -1
+  // R1885：裸 HTTP 取**全量**会话列表。凭证与 `/api/model`（R1881）同源。
+  // 返回 null 表示"取不到"（service.json 不可读 / 网络失败 / 非数组），调用方据此回落。
+  const fetchSessionListHttp = async (): Promise<any[] | null> => {
+    try {
+      const home = process.env.HOME ?? "/root"
+      const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
+        url?: string
+        password?: string
+      }
+      const url = String(reg?.url ?? "").replace(/\/+$/, "")
+      const pw = String(reg?.password ?? "")
+      if (!url || !pw) return null
+      const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
+      const r = await fetch(`${url}/api/session?limit=${SESSION_LIST_LIMIT}`, {
+        headers: { Authorization: `Basic ${token}` },
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!r.ok) return null
+      const body = await r.json()
+      const arr = Array.isArray(body) ? body : Array.isArray((body as any)?.data) ? (body as any).data : null
+      return arr
+    } catch {
+      return null
+    }
+  }
   // R1874：返回**本轮刷新是否成功**。此前返回 void，而 5 个存在性闸都把 `sessionIdAcceptable`
   // 的第三参 `listOk` 硬编码为 `true` —— 参数形同虚设：`session.list` 失败时缓存里可能仍是
   // **旧的非空列表**，于是把"新建/未在旧缓存里的有效会话"误判成"不存在"并拒绝，恰好违背
   // R1829 写明的"拉不到列表时保守放行、不误伤"策略。改为返回 boolean，闸口按真实结果传参。
   const refreshSessionTitles = async (): Promise<boolean> => {
     try {
-      const res = await (client as any).session.list?.({})
-      const ok = Array.isArray(res?.data)
+      // R1885：**存在性判据必须完整**，而宿主 client 给不完整。
+// 实测（本项目 service.json + Basic 票）：
+      //   `GET /api/session`                →  50 个（服务端默认上限）
+      //   `GET /api/session?limit=1000`     → 125 个（项目内实有）
+      //   `?directory=/root&limit=1000`     → 119 个（与目录无关，50 上限照样生效）
+      //   插件 client 实测只拿到 **50** 个（R1884 的诊断日志读出的真值）。
+      // 两种"给 client 传 limit"的写法都**试过并被实测否掉**：顶层 `{limit}` 与
+      // `{query:{limit}}` 之后日志仍是 50 —— 宿主内置 client 与已安装 SDK 版本不同，
+      // 不转发该参数。**唯一可行路径是裸 HTTP**（`/api/model` 已是同一套路，可用）。
+      //
+      // 危害链条（判据，不是展示列表）：
+      //   列表 → cachedSessionList → sessionIdAcceptable(id, ids, listOk)
+      //   → 5 个闸口（回调 use: /use /watch /alias /sendto）统一 `if (!ok) → "会话不存在"`
+      // 于是排在 50 名之外、**真实存在**的会话被**误判为不存在**，用户被挡在门外，
+      // 且提示语与真实原因（列表被截断）完全对不上，无从自查。注意方向性：
+      // 这与 R1829 的"保守放行"是**反方向**的错 —— 那个是该放行却收紧，这个是该承认却拒绝。
+      let arr: any[] | null = await fetchSessionListHttp()
+      if (!arr && cachedSessionList.length > 0) {
+        // 手上有上一份**好**列表时，绝不用 client 那份**截断**列表覆盖它：
+// 否则 HTTP 抖一次，误判就又回来了（这正是本修复要消灭的症状）。
+        for (const [sid, ts] of lastActivity) {
+          if (Date.now() - ts > ACTIVE_WINDOW_MS) lastActivity.delete(sid)
+        }
+        return true
+      }
+      if (!arr) {
+        const res = await (client as any).session.list?.({})
+        arr = Array.isArray(res?.data) ? (res.data as any[]) : null
+      }
+      const ok = Array.isArray(arr)
       // R1878：**只在拿到合法数组时才重建缓存**。旧代码的清空动作是**无条件执行**的
       // → `session.list` 返回**非数组**（降级/畸形响应）时，最后一份好数据被抹掉，
       // `/sessions` 会短暂全空（用户看到"会话列表没了"），偏偏发生在最不该丢数据的时刻。
       // 选择面不受影响（R1829/R1874 保守放行：读失败返回 false，不因一次畸形读收紧可选项），
       // 但**展示面**不该被一次坏读摧毁 —— 保留上一份好列表，读成功时再整体替换。
       if (ok) {
-        const arr = res.data as any[]
         cachedSessionList.length = 0
-        for (const s of arr) {
+        for (const s of arr as any[]) {
           const id = String(s?.id ?? "")
           if (!id) continue
           const title = String(s?.title ?? s?.info?.title ?? "").slice(0, 60)
           cachedSessionList.push({ id, title: title || undefined })
           if (title) sessionTitleCache.set(id, title)
         }
+        // R1884：把"存在性判据"的**规模**变成可观测量。这份列表是
+        // `sessionIdAcceptable` 判定"会话是否存在"的唯一依据，此前它的条数在日志里
+        // 完全不可见 —— 于是"列表被截断 → 真实会话被误判为不存在"这类问题只能靠猜。
+        // 只在条数**变化**时记一条（refreshSessionTitles 每个闸口命令都会调，静默记会刷屏），
+        // 并且把 listOk=false 的坏读也报出来（那才是"缓存被保留"的时刻）。
+        if (lastLoggedSessionCount !== cachedSessionList.length) {
+          lastLoggedSessionCount = cachedSessionList.length
+          void log("info", `session list ok (${cachedSessionList.length} 个，作为存在性判据)`)
+        }
+      } else {
+        void log("warn", `session list 非数组（保留上一份好列表 ${cachedSessionList.length} 个）`)
       }
       for (const [sid, ts] of lastActivity) {
         if (Date.now() - ts > ACTIVE_WINDOW_MS) lastActivity.delete(sid)
