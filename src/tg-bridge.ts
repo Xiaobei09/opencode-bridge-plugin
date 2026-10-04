@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1113-redact-provider-keys"
+const VERSION = "r1114-ctx-diag-honest"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -2615,8 +2615,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             if (uu) {
               const total = ctxTotal(uu)
               const win = windowFor(uu.modelID, uu.providerID)
-              const pct = (total / win) * 100
-              await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}=${fmtK(total)}/${fmtK(win)} (${pct < 1 ? "<1" : Math.min(100, Math.round(pct))}%) in=${fmtK(uu.input)} out=${fmtK(uu.output)} rea=${fmtK(uu.reasoning)} cr=${fmtK(uu.cacheRead)} cw=${fmtK(uu.cacheWrite)} [msg]`)
+              // R1887：诊断行必须与 ctxSuffix **同一诚实口径**。此前这里无条件打印
+              // fmtK(win) 与百分比，而窗口未知时 win 是兜底常量 → 日志里出现
+              // 「=54k/1m (5%)」，正是 R1881 从界面上拿掉的那种「显示 1m」的假象；
+              // 超窗值还会被 Math.min(100,…) 静默夹成 100%，被读成「上下文满了」。
+              // 诊断是排障入口，撒谎比缺字段更有害：窗口未知打 win=?，超窗打 over。
+              const known = windowKnown(uu.modelID, uu.providerID)
+              const pct = known ? (total / win) * 100 : 0
+              const winTxt = known ? fmtK(win) : "?"
+              const pctTxt = !known ? "?" : total > win ? "over" : pct < 1 ? "<1%" : `${Math.round(pct)}%`
+              await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}=${fmtK(total)}/${winTxt} (${pctTxt}) in=${fmtK(uu.input)} out=${fmtK(uu.output)} rea=${fmtK(uu.reasoning)} cr=${fmtK(uu.cacheRead)} cw=${fmtK(uu.cacheWrite)} [msg]`)
             }
             return
           }
