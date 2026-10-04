@@ -339,7 +339,7 @@ const loopStopTimestamp = (): number => {
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1112-session-list-full"
+const VERSION = "r1113-redact-provider-keys"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -1842,13 +1842,17 @@ const SOURCE = (() => {
 
 // 凭据脱敏：Telegram 的调用形如 https://api.telegram.org/bot<TOKEN>/sendMessage，
 // 只要任何一条日志带上 URL（fetch 异常、错误对象、调试打印），token 就落盘了。
-// 某些运行时（Node/undici）会把 URL 塞进 error.cause；用户也可能自己粘贴 token。
-// 因此脱敏放在**日志出口**而不是各个调用点 —— 新增日志语句不可能忘记。
+// R1886：形态扩到 provider 侧 —— 宿主/provider 的原样错误文本经 sanitizeLog(err) 进日志，
+// 而 /errors 与 /logs 会把日志回显到会话窗口；误伤控制：sk- 需 >=12 位且 \b 夹住、
+// query 密钥参数须带 ?/& 前缀、只抹值保留参数名。当前无线上泄漏证据（命中 0）。
 export const redactSecrets = (s: string): string =>
   s
     .replace(/\/bot\d{5,}:[A-Za-z0-9_-]{8,}/g, "/bot<redacted>")
     .replace(/\bbot\d{5,}:[A-Za-z0-9_-]{8,}\b/g, "bot<redacted>")
     .replace(/\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g, "<redacted>")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}/g, "<redacted>")
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/-]{12,}=*/g, "$1 <redacted>")
+    .replace(/([?&](?:api_key|apikey|access_token|token|key)=)[^&\s"'<>]{6,}/gi, "$1<redacted>")
 // R1873：日志"去控制字符"的**单一来源**（`sanitizeLog` 与 `log()` 出口共用）。目的：
 // 任何进日志的文本都必须是单行（`\n`/控制字符 → 空格），否则外部文本可撕裂/伪造日志行。
 export const stripLogControls = (s: string): string => s.replace(/[\u0000-\u001f\u007f]/g, " ")
