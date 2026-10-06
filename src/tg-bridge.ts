@@ -3673,6 +3673,19 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   let lastRenameSkipSid = ""
   let lastRenameCheck = 0
   const RENAME_CHECK_MS = 60_000
+  // R1897：429 告警节流戳必须在**闭包层**（跨调用持久）。旧代码把它放在
+  // renameBotToSession 函数体内，每次调用重置为 0 → 节流形同虚设 → 每 60s
+  // poll 一条 warn，实测 1.5h 刷 159 条。
+  let rename429LogAt = 0
+  // R1897：改名签名落盘。lastRenameSig 原是纯内存态，服务每次重启清零 →
+  // 名字没变也会在启动后立刻重打一次 setMyName（实测 15:26:28 刚成功、15:26:58
+  // 重启后 15:27:05 再打即撞 429，retry_after≈21.5h）。持久化后重启/热重载
+  // 不再发无谓请求。
+  const RENAME_SIG_PATH = "REDACTED_ROOT/.config/opencode/botname-sig.json"
+  try {
+    const sj = JSON.parse(readFileSync(RENAME_SIG_PATH, "utf8")) as Record<string, string>
+    if (typeof sj?.[BOT_ID] === "string") lastRenameSig = sj[BOT_ID]
+  } catch { /* 首次运行：无签名 */ }
   let renameInFlight: Promise<boolean> | null = null
   const renameBotToSession = async (sid: string): Promise<boolean> => {
     const title = sessionNameOf(sid) || ""
@@ -3698,11 +3711,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     //   * lastRenameSig 仅在**两请求都成功**后推进，失败留空 → 下轮 poll 自动重试。
     const RENAME_429_PATH = "REDACTED_ROOT/.config/opencode/botname-429.json"
     let rename429Until = 0
-    let rename429LogAt = 0
     {
       try {
         const j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until?: number }>
         rename429Until = Number(j?.[BOT_ID]?.until ?? 0) || 0
+        // R1897：限流实测是**共享出口 IP 级**——三个 Bot 的 429 截止时间精确汇聚到
+        // 同一窗口（bot3 14:14 的 81968s 与 primary/bot2 15:27 的 77632s，同一秒级终点）。
+        // 只读自己的键 → 任一 Bot 撞 429 后，其它 Bot 仍会"各自再打一次"再撞一次。
+        // 读取取 max(自己, __shared)；写入时也同时写 __shared（见 noteRename429）。
+        rename429Until = Math.max(rename429Until, Number(j?.["__shared"]?.until ?? 0) || 0)
       } catch { rename429Until = 0 }
     }
     const noteRename429 = (retryAfterSec: number): void => {
@@ -3716,8 +3733,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         let j: Record<string, { until?: number }> = {}
         try { j = JSON.parse(readFileSync(RENAME_429_PATH, "utf8")) as Record<string, { until?: number }> } catch { j = {} }
         const merged = mergeRename429Until(j, BOT_ID, until)
-        atomicWrite(RENAME_429_PATH, JSON.stringify(merged), 0o600)
-        rename429Until = Math.max(rename429Until, merged[BOT_ID]?.until ?? 0)
+        // R1897：同时写 __shared —— 限流是 IP 级共享窗口（证据见启动读取处），
+        // 任一 Bot 撞 429 即为全通道装冷却，省掉其它 Bot 的"陪打"请求。
+        const mergedAll = mergeRename429Until(merged, "__shared", until)
+        atomicWrite(RENAME_429_PATH, JSON.stringify(mergedAll), 0o600)
+        rename429Until = Math.max(rename429Until, mergedAll[BOT_ID]?.until ?? 0, mergedAll["__shared"]?.until ?? 0)
       } catch { /* 非致命：冷却仍在本进程内存生效 */ }
     }
     const postJson = async (path: string, body: object): Promise<void> => {
@@ -3739,9 +3759,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     const run = async (): Promise<boolean> => {
       if (renameCooling(rename429Until, Date.now())) {
-        if (Date.now() - rename429LogAt > 60_000) {
+        // R1897：① 节流 60s→30min（节流戳已上移到闭包层，见 RENAME_CHECK_MS 旁）；
+        // ② until 带完整日期 + 剩余分钟 —— 旧格式只打 HH:MM:SS，跨天截止（次日 13:00）
+        // 看起来像"已过期还在限流"，实测误导排查方向。
+        if (Date.now() - rename429LogAt > 30 * 60_000) {
           rename429LogAt = Date.now()
-          await log("warn", `bot rename rate-limited (bot=${BOT_ID}, until ${new Date(rename429Until).toISOString().slice(11, 19)}, sid=${sid.slice(0, 12)})`)
+          const leftMin = Math.max(1, Math.round((rename429Until - Date.now()) / 60_000))
+          await log("warn", `bot rename rate-limited (bot=${BOT_ID}, until=${new Date(rename429Until).toISOString()}, remaining≈${leftMin}min, sid=${sid.slice(0, 12)})`)
         }
         return false
       }
@@ -3753,6 +3777,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return false
       }
       lastRenameSig = sig
+      try {
+        // R1897：签名落盘（atomicWrite tmp+rename，多 Bot 各写各的键不互踩）。
+        let sj: Record<string, string> = {}
+        try { sj = JSON.parse(readFileSync(RENAME_SIG_PATH, "utf8")) as Record<string, string> } catch { sj = {} }
+        sj[BOT_ID] = sig
+        atomicWrite(RENAME_SIG_PATH, JSON.stringify(sj), 0o600)
+      } catch { /* 非致命：本内存态仍生效 */ }
       await log("info", `bot renamed to "${sanitizeLog(title).slice(0, 30)}" (sid=${sid.slice(0, 12)})`)
       return true
     }
