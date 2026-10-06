@@ -377,6 +377,94 @@ export const mutateLoopCtlFile = (mutate: (j: any) => void): "wrote" | "same" | 
   }
 }
 
+// ---------------------------------------------------------------------------
+// R1895：跨 Bot 429 限流标记（用户指令：「可以使用其他的机器人各发一条提示这个机器人
+// 429 的消息」「如果被限流的话，应该回复一条被限流的提示吧」）。
+//
+// 为什么必须由**别的** Bot 来说：硬限流期间本 Bot 一条消息都发不出去（Telegram 限的是
+// 整个 Bot，不只是某个方法），本地闸门 429 一到就把全部出站请求挡下 —— 让被限流者自己
+// 提示用户是结构性做不到的，硬发也只是进队列一起等。可行形态只有：谁被限流 → 写共享
+// 标记；**其他实例**读到后各自替它发一条（一条/Bot/每次限流，去重）。
+//
+// 为什么单独一个文件而不是塞进 loop-ctl.json：那是**自动循环总闸**（auto-continue 也在
+// 读写，R1891 起按读旧值合并），把 15s 一拍的瞬时限流状态混进去等于让热路径污染总闸；
+// 且标记写失败只应损失"提醒"这个增值功能，绝不能连累总闸。独立文件 + atomicWrite，
+// 失败即忽略（best-effort）。
+export const FLOOD_FLAG_PATH = "REDACTED_ROOT/.config/opencode/bot-flood.json"
+
+export type FloodFlagEntry = { since: number; until: number }
+export type FloodFlagDisk = Record<string, FloodFlagEntry | undefined>
+
+// 纯函数：把「本 Bot 进入/续期限流」合并进磁盘快照。
+//   · until 取 max —— 与 mergeRename429Until 同一并发口径：read-modify-write 的两个进程
+//     不会互相把冷却改短；
+//   · 已过期条目（until <= now）就地丢弃 —— 否则"上次限流的残留"会让 since 永远续不上
+//     新一轮的起点，提醒文案里的"已持续多久"就错了；
+//   · 同一次限流续期**保留原 since** —— 用户要看到的是"从几点起被限流"，续期不能重置起点。
+export const mergeFloodFlag = (disk: FloodFlagDisk, bot: string, now: number, until: number): FloodFlagDisk => {
+  const out: FloodFlagDisk = {}
+  for (const [k, v] of Object.entries(disk)) {
+    const u = Number(v?.until) || 0
+    const s = Number(v?.since) || 0
+    if (u > now && s > 0) out[k] = { since: s, until: u }
+  }
+  const prev = out[bot]
+  out[bot] = { since: prev ? prev.since : now, until: Math.max(prev?.until ?? 0, until) }
+  return out
+}
+
+// 纯函数：此刻**仍处于限流中**的条目（按 bot 名排序，调用方遍历顺序稳定、便于测试断言）。
+export const activeFloods = (disk: FloodFlagDisk, now: number): Array<{ bot: string } & FloodFlagEntry> => {
+  const out: Array<{ bot: string } & FloodFlagEntry> = []
+  for (const [bot, v] of Object.entries(disk)) {
+    const u = Number(v?.until) || 0
+    if (!(u > now)) continue
+    out.push({ bot, since: Number(v?.since) || u, until: u })
+  }
+  return out.sort((a, b) => (a.bot < b.bot ? -1 : a.bot > b.bot ? 1 : 0))
+}
+
+const readFloodFlagDisk = (): FloodFlagDisk => {
+  try {
+    const j = JSON.parse(readFileSync(FLOOD_FLAG_PATH, "utf8")) as { floods?: unknown }
+    if (j && typeof j === "object" && j.floods && typeof j.floods === "object") return j.floods as FloodFlagDisk
+  } catch {
+    /* 不存在 / 损坏：按空快照处理（下次写盘即重建） */
+  }
+  return {}
+}
+const writeFloodFlagDisk = (floods: FloodFlagDisk): void => {
+  atomicWrite(FLOOD_FLAG_PATH, JSON.stringify({ floods }), 0o600)
+}
+
+// 进入（或续期）限流时调用。任何异常都吞掉：提醒功能绝不能影响发送路径。
+export const markSelfFlooded = (bot: string, until: number, now = Date.now()): void => {
+  try {
+    writeFloodFlagDisk(mergeFloodFlag(readFloodFlagDisk(), bot, now, until))
+  } catch {
+    /* best-effort */
+  }
+}
+
+// 恢复后调用：清掉自己的条目（其他实例不再把它算作"限流中"）。
+// 条目本就不存在/已过期则**不写盘** —— 否则 15s 一拍的心跳会变成持续空写。
+export const clearSelfFlooded = (bot: string, now = Date.now()): void => {
+  try {
+    const disk = readFloodFlagDisk()
+    if (!(bot in disk)) return
+    if ((Number(disk[bot]?.until) || 0) <= now) return
+    const next: FloodFlagDisk = {}
+    for (const [k, v] of Object.entries(disk)) {
+      if (k === bot) continue
+      const u = Number(v?.until) || 0
+      if (u > now) next[k] = { since: Number(v?.since) || u, until: u }
+    }
+    writeFloodFlagDisk(next)
+  } catch {
+    /* best-effort */
+  }
+}
+
 // R1724 缺口补丁：front 切换后必须把 bots[BOT_ID].sids 跟着换成新 front。
 // 漏了会怎样：用户停了某 Bot 的循环，随后该 Bot 切到另一个会话 → sids 仍指旧会话 →
 // auto-continue 侧按 sid 判定**漏停**，那个 Bot 自己又跑起来了（正是"单独停"要保证的事）。
@@ -492,7 +580,7 @@ export function protoDeliveryVerdict(r: { r: "sent" | "retry" | "drop"; id?: num
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1120-watch-prune-dead"
+const VERSION = "r1121-flood-cross-notice"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -3868,6 +3956,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (primary.status === 429) {
         const waitSeconds = floodWaitSeconds(primary.retryAfter, ++primary429Streak)
         floodUntil = Math.max(floodUntil, Date.now() + (waitSeconds + 1) * 1000)
+        // R1895：进闸即写共享标记 —— 自己此刻起发不出任何消息，只有别的 Bot 能替我说。
+        // 每次 429 都写（合并语义：until 取 max、since 保留同次起点），不额外去抖：
+        // 这是一次文件写 + rename，且只在 429 分支（受本地闸门保护，不会每拍都走）。
+        markSelfFlooded(BOT_ID, floodUntil)
         if (Date.now() - lastFloodLogAt > 10_000) {
           lastFloodLogAt = Date.now()
           const rawRa = Number(primary.retryAfter ?? 0)
@@ -8480,6 +8572,66 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
     })()
   }, 3000)
+  // ── R1895：跨 Bot 429 提醒（每 15 秒一拍）───────────────────────────────────
+  // 用户指令：某个 Bot 被 Telegram 429 限流时，**其他**机器人各发一条提示给他。
+  // 自己是发不出去的（硬限流挡的是整个 Bot），所以本拍只做两件事：
+  //   ① 自己已恢复 → 清掉共享标记（别的实例不再把它算作"限流中"）；
+  //   ② 别人限流中 → 替它说一句，按「Bot + 本次限流起点」去重，一个实例对一个 Bot 只喊一次。
+  // 全程 best-effort：任何读盘/发送失败都只记日志，绝不影响主发送路径。
+  const FLOOD_WATCH_MS = 15_000
+  // 通知间隔：无论几个 Bot 同时限流，本实例两次提醒至少隔 60s（避免刷屏）。
+  const FLOOD_NOTICE_MIN_GAP_MS = 60_000
+  // key = `${bot}:${since}` → 发出时刻。since 变了即新的一次限流，重新允许提醒一次。
+  const floodNoticeSent = new Map<string, number>()
+  const floodLabel = (bot: string): string => {
+    if (bot === BOT_ID) return bot
+    try {
+      const j = JSON.parse(readFileSync(BOT_REGISTRY_PATH, "utf8")) as { bots?: Array<{ id?: string; label?: string }> }
+      const label = String((j?.bots ?? []).find((b) => String(b?.id ?? "") === bot)?.label ?? "").trim()
+      if (label) return `${label}（${bot}）`
+    } catch {
+      /* 标签只是装饰，取不到就退回 id */
+    }
+    return bot
+  }
+  const floodWatchTick = async (): Promise<void> => {
+    try {
+      // 陈旧热重载实例不参与：由新实例接管提醒（与其它心跳同一口径）。
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      const now = Date.now()
+      // ① 自己恢复 → 清标记。clearSelfFlooded 自己会跳过"本就不存在/已过期"的情况，
+      //    所以这行不会变成持续空写（文件 mtime 不变即可验证）。
+      if (now >= floodUntil) clearSelfFlooded(BOT_ID, now)
+      // 自己正在限流：此时替别人喊也发不出去（sendTextRaw 直接 retry 进队列），跳过。
+      if (now < floodUntil) return
+      const active = activeFloods(readFloodFlagDisk(), now).filter((f) => f.bot !== BOT_ID)
+      if (!active.length) return
+      const chat = pushChatResolve()
+      if (!chat) return
+      // 顺手清掉早已过期的去重条目（限流结束超过 6 小时就不必再记住）。
+      for (const [k, t] of floodNoticeSent) if (now - t > 6 * 3600_000) floodNoticeSent.delete(k)
+      for (const f of active) {
+        const key = `${f.bot}:${f.since}`
+        if (floodNoticeSent.has(key)) continue
+        const lastAt = [...floodNoticeSent.values()].reduce((a, b) => Math.max(a, b), 0)
+        // 本轮先不发（还没到间隔）：**不**记 key —— 下一拍重新判断，否则永远等不到。
+        if (lastAt > 0 && now - lastAt < FLOOD_NOTICE_MIN_GAP_MS) continue
+        floodNoticeSent.set(key, now)
+        const left = Math.max(1, Math.ceil((f.until - now) / 1000))
+        const secs = Math.max(1, Math.round((now - f.since) / 1000))
+        await reply(
+          chat,
+          `⚠️ ${floodLabel(f.bot)} 正被 Telegram 限流（429），已持续约 ${secs} 秒，预计还需约 ${left} 秒恢复；期间它发不出任何消息，恢复后会自动补发。`,
+        )
+        await log("info", `cross-bot 429 notice (bot=${f.bot} since=${f.since} left=${left}s)`)
+      }
+    } catch (err) {
+      await log("error", `flood watch failed: ${sanitizeLog(err)}`)
+    }
+  }
+  setInterval(() => {
+    void floodWatchTick()
+  }, FLOOD_WATCH_MS)
   // 状态落盘心跳：用来一眼看出"状态文件是不是冻住了"（曾冻 15 分钟无人察觉）。
   setInterval(() => {
     void (async () => {
