@@ -4065,6 +4065,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     push()
     return chunks
   }
+  // R1898：桥侧最后一次成功投递（R1728 静默 watchdog 基线）在 sendTextRaw /
+  // editTextRaw 的每个 `sent` 返回点**源头刷新**。此前只在 protoSend 的 3 个分支刷新，
+  // 而循环期卡片以**编辑重渲染**为主（proto edit ok）、另有队列/命令回执/菜单等 7 类
+  // 成功送达路径各自不刷新 → 基线长期停滞 → `proto silent 15/30/45min` 误报
+  //（2026-10-06 实测，同时段日志里 send/edit 全部 ok）。源头一处修，未来新路径不再漏。
   const sendTextRaw = async (chatID: string, text: string, kb?: unknown, silent?: boolean, replyTo?: number): Promise<SendResult> => {
     // R1064：超长消息分段发送，不再 truncateAt 截断丢弃（用户报"消息发送不完整"）。
     if (text.length > PUSH_MAX) {
@@ -4137,6 +4142,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       inboundCounters.outbound += chunks.length
       await log("info", `sendMessage chunked ok (chat=${sanitizeLog(chatID)}) parts=${chunks.length} len=${text.length}`)
+      // R1898：投递基线在**源头**刷新（见 sendTextRaw 头部注释）
+      lastProtoSendAt = Date.now()
       return { r: "sent", id: firstId, len: text.length }
     }
     const [cut, truncated] = truncateAt(text, PUSH_MAX)
@@ -4161,6 +4168,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const r = await tgFetch("sendMessage", body)
     if (r.ok) {
       inboundCounters.outbound++
+      lastProtoSendAt = Date.now() // R1898 源头刷新基线
       return { r: "sent", id: r.id, fallback: r.viaFallback, len: String(body.text ?? "").length }
     }
     const status = r.status ?? 0
@@ -4181,6 +4189,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const r2 = await tgFetch("sendMessage", fb)
       if (r2.ok) {
         await log("info", `sendMessage plain-fallback ok (chat=${sanitizeLog(chatID)})`)
+        lastProtoSendAt = Date.now() // R1898 源头刷新基线
         return { r: "sent", id: r2.id, fallback: r2.viaFallback }
       }
     }
@@ -4220,10 +4229,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const kbErrE = validateInlineKeyboard(body.reply_markup ? (kb as unknown) : undefined)
     if (kbErrE) await log("error", `editMessageText precheck keyboard invalid: ${kbErrE}`)
     const r = await tgFetch("editMessageText", body, preferFallback)
-    if (r.ok) return { r: "sent", id: r.id ?? messageID, fallback: r.viaFallback, len: String(body.text ?? "").length }
+    // R1898：编辑是循环期卡片的**主要**送达方式（整张重渲染）——源头刷新基线，
+    // 否则只编辑不发送的窗口里 watchdog 会误报 `proto silent`（2026-10-06 实测）。
+    if (r.ok) {
+      lastProtoSendAt = Date.now()
+      return { r: "sent", id: r.id ?? messageID, fallback: r.viaFallback, len: String(body.text ?? "").length }
+    }
     // 内容一字不差时 TG 回 400 message is not modified：屏上本就是对的，按成功处理，不降级重发
     if (r.status === 400 && /not modified/i.test(r.desc ?? "")) {
       await log("info", `editMessageText same (chat=${sanitizeLog(chatID)}, msg=${messageID}): already up to date`)
+      lastProtoSendAt = Date.now() // R1898 同文也是"链路活着"的证据
       return { r: "sent", id: messageID }
     }
     const status = r.status ?? 0
