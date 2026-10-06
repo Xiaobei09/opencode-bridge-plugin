@@ -1,12 +1,18 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
+import { inboundSilenceVerdict } from "./inbound-silence"
 // 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
-import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG } from "./bg-mode"
+import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG, BG_TH_STEPS } from "./bg-mode"
+// TG 等宽表格绘制（纯函数 + 单测）：状态/诊断类消息用表格对齐（代码块强制等宽）。
+import { renderTgTable, renderKvList } from "./tabular"
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
 import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
+// R1565：「AI 主动结束输出」短提示文案（纯函数 + 单测），见 turn-end-note.ts 头注。
+import { turnEndLine, extractRound, noteSkipped, SYNTHETIC_LOOP_MARKERS, noteOwnerOnlySkipped } from "./turn-end-note"
+import { appendShellBgHint, hasShellBgHint, isFreshRunningCard, HINT_FRESH_MS_DEFAULT } from "./bg-hint"
 
 // ── R1399：插件 client 白名单无 background 端点时的直连宿主 HttpApi 兜底 ────────
 // 背景：R1398 实证 v2.0.10 的插件 client 只含白名单子集（session 键无 background/），
@@ -24,7 +30,11 @@ const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }
     const pw = String(reg?.password ?? "")
     if (!url || !pw) return { ok: false, text: "✗ 服务注册不可读（service.json 缺 url/password）" }
     const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
-    // R1833：必须显式超时（理由见 live v2lib/tg-bridge.ts 同名注释）。本文件其余网络调用均有 15s 超时。
+    // R1833：必须显式超时。宿主 HttpApi 若"接受连接但不响应"（半边僵死），
+    // 无 signal 的 fetch 会挂到 undici 默认头超时（约 5 分钟）才失败：手动
+    // /background 会卡住命令响应，自动路径滞留一个 pending 连接。本文件其它
+    // 全部网络调用均有 15s 超时（setMyName / tgFetch / getUpdates 窥视…），
+    // 这里是唯一例外，补齐以保持一致。
     const r = await fetch(`${url}/api/session/${encodeURIComponent(sid)}/background`, {
       method: "POST",
       headers: { Authorization: `Basic ${token}` },
@@ -49,56 +59,6 @@ const bgHttpAvail = (): boolean => {
   }
 }
 
-// R1635/R1834：Telegram 429 响应解析与冷却（纯函数，供 bot 改名使用）。
-export const parseTgRetryAfter = (text: string): number => {
-  try {
-    const j = JSON.parse(text) as { parameters?: { retry_after?: number } }
-    if (j && typeof j === "object") return Number(j?.parameters?.retry_after) || 0
-  } catch { /* 非 JSON 响应 */ }
-  return 0
-}
-export const renameCooling = (until: number, now: number): boolean => until > now
-export const rename429Seconds = (status: number, retryAfterSec: number, fallbackS = 300): number => {
-  const ra = Number(retryAfterSec)
-  if (Number.isFinite(ra) && ra > 0) return Math.max(1, Math.floor(ra))
-  return status === 429 ? Math.max(1, Math.floor(fallbackS)) : 0
-}
-
-// R1844：纯函数 —— botname-429.json 的写入合并。冷却截止是**单调**时间戳，逐 bot 取 max。
-// 账本跨 bot/跨实例（重载）共享且是 read-modify-write：取 max 保证并发写不会把某 bot 的冷却改小，
-// 顺带规范化掉非正/非法条目。返回值可直接 atomicWrite 落盘。
-export const mergeRename429Until = (
-  disk: Record<string, { until?: number } | undefined>,
-  bot: string,
-  until: number,
-): Record<string, { until: number }> => {
-  const out: Record<string, { until: number }> = {}
-  for (const [k, v] of Object.entries(disk)) {
-    const u = Number(v?.until) || 0
-    if (u > 0) out[k] = { until: u }
-  }
-  out[bot] = { until: Math.max(out[bot]?.until ?? 0, Number(until) || 0) }
-  return out
-}
-
-// R1856：纯函数 —— 有界 LRU 的 `touch`（用于 ownSessions）。
-// 缺口：旧实现只有 `set.add(sid)` + 超限删首个。Set 对**已存在**元素 add **不改变顺序**，
-// 所以"仍在活跃投递、但插入最早"的会话会被当成最旧淘汰，而刚重复投递的会话得不到保护。
-// 淘汰后隔离门 `ownOk` 可能不再认它（`ownSessions.has` 为 false）→ 非主实例偶发
-// "不再跟这个会话"（用户体感：bot3 有时不发）。改为先 delete 再 add 置尾，实现真 LRU。
-// 越界时从**表头**（最久未 touch）开始删，直到回到 cap；非 ses_ 前缀直接忽略。
-export const touchOwnSession = (set: Set<string>, sid: string, cap: number): void => {
-  if (!sid || !sid.startsWith("ses_")) return
-  set.delete(sid)
-  set.add(sid)
-  const limit = Number.isFinite(cap) && cap >= 0 ? Math.floor(cap) : 0
-  while (set.size > limit) {
-    const oldest = set.values().next()
-    if (oldest.done) break
-    set.delete(oldest.value)
-  }
-}
-
 // 真实水位（参照 how-much / context-sidebar 口径）：
 // 分子 = 最近一次 assistant 全量 tokens（input+output+reasoning+cache.read+cache.write，压缩后重算）；
 // 分母 = 模型 limit.context（provider.list 实取，取不到回落 1M）。
@@ -109,6 +69,9 @@ let modelWinTs = 0
 const ctxTotal = (u: CtxUsage): number => u.input + u.output + u.reasoning + u.cacheRead + u.cacheWrite
 export const windowFor = (modelID: string, providerID: string): number =>
   modelWindows.get(`${providerID}/${modelID}`) ?? 1048576
+// R1881：窗口是**实取**还是**兜底猜的** —— 必须能区分。兜底常量 1048576 曾被当真实
+// 窗口显示（用户实报「默认模型的上下文是1m」），而实测默认模型 `opencode/big-pickle`
+// 的真实窗口是 **200000** → 显示值错 5 倍，连带自动压缩阈值也算松 5 倍。
 export const windowKnown = (modelID: string, providerID: string): boolean =>
   modelWindows.has(`${providerID}/${modelID}`)
 // R1881：宿主 `GET /api/model` 响应 → 「模型键 → 真实窗口」。**纯函数**（提到模块作用域），
@@ -126,7 +89,6 @@ export const modelWindowEntries = (j: unknown): Array<{ key: string; context: nu
   }
   return out
 }
-
 
 // ctx 骤降是否算"宿主自动压缩" —— 纯函数，好处是四条否决线都能用行为测试钉死
 // （写成 if 链就只能靠静态断言，那玩意儿今天已经假阳性 4 次）。
@@ -272,7 +234,11 @@ const ctxSuffix = (sessionID: string): string => {
     // 兜底：超窗值一律不显示成 100%（100% 会被当成"上下文满了"，是误导）
     if (total > win) return " · ctx ?（用量口径异常，已隐藏）"
     const pct = (total / win) * 100
-    if (pct < 1) return " · ctx &lt;1%"
+    // R1511：返回**原始文本**（绝不预转义）。消费点有两种约定：
+    // ① 卡片头 `htmlEsc(ctxSuffix(...))`（renderToolTerminalCard/事件路径卡片）；
+    // ② `ptitle → protoBlock`，后者会对标题整体 htmlEsc 一次。
+    // 曾返回已转义的 `" · ctx &lt;1%"` → protoBlock 二次转义 → 用户看到字面 `&lt;1%`（2026-09-29 实测）。
+    if (pct < 1) return " · ctx <1%"
     // 本宿主没有压缩入口时必须**说清楚**，否则用户会以为"该压缩却没压"（实测被问到）。
     // ⚠️ 这句话以前写的是「本宿主不可压缩」—— **已被今天证伪**：2026-09-26T15:36 实测
     // 宿主自己把 48% 压到了 4%。不可压缩的是**本桥调不动 compact 接口**，不是宿主不会压。
@@ -319,23 +285,210 @@ const ctxSuffix = (sessionID: string): string => {
 
 // 关键约束：LOOP_CTL_PATH 必须**保持共享**（自动循环总闸是全局的，两个 Bot 共用）。
 const LOOP_CTL_PATH = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
+// R1724（用户指令「不同机器人的循环设置要求单独」）：本 Bot 是否处于循环停止态。
+// 纯函数 —— 桥侧 20 处 loopStopped() 判定全走它，单测可直接钉行为（不必起桥）。
+//   * 顶层 stopped=true = 全局闸（守卫 PROBLEM/WEBSEARCH、/loop stop all）→ 一律停；
+//   * bots[botId].stopped=true = 单 Bot 闸；sids 为空视为「本 Bot 全停」，
+//     非空则要求包含当前 front（front 切换后旧会话自动恢复，与 auto-continue 同判据）。
+export const botLoopStopped = (j: any, botId: string, curSid: string): boolean => {
+  if (!j || typeof j !== "object") return false
+  if (j.stopped === true) return true
+  const bots = j.bots
+  if (!bots || typeof bots !== "object") return false
+  const e = (bots as Record<string, any>)[botId]
+  if (!e || typeof e !== "object" || e.stopped !== true) return false
+  const sids = Array.isArray(e.sids) ? e.sids.filter((x: unknown): x is string => typeof x === "string") : []
+  if (sids.length === 0) return true
+  return typeof curSid === "string" && curSid !== "" && sids.includes(curSid)
+}
 const loopStopped = (): boolean => {
   try {
     const j = JSON.parse(readFileSync(LOOP_CTL_PATH, "utf8")) as any
-    return j?.stopped === true
+    // ⚠️ 这里只能用 persistedFront（模块级 let）：frontSessionID 声明在 TgBridgePlugin
+    // 闭包内（2910 行），模块级函数引用它不在作用域 → 运行时 ReferenceError 会被
+    // 本函数的 catch 吞掉并返回 false → 「单 Bot 闸」静默失效（功能死掉且无任何报错）。
+    // 两者始终成对赋值（2896 / 8069），语义等价。
+    return botLoopStopped(j, BOT_ID, persistedFront)
   } catch {
     return false
   }
 }
 const loopStopTimestamp = (): number => {
+  // R1724：per-bot 闸的时间戳要取**该 Bot 条目**的 ts；混用顶层 ts 会让
+  // 「停止前后的注入分界」判错（停的明明是本 bot，拿到的却是别处的写入时间）。
   try {
     const j = JSON.parse(readFileSync(LOOP_CTL_PATH, "utf8")) as any
+    const bots = j?.bots
+    if (bots && typeof bots === "object") {
+      const e = (bots as any)[BOT_ID]
+      if (e && typeof e === "object" && e.stopped === true) {
+        const t = Number(e.ts ?? 0)
+        if (Number.isFinite(t) && t > 0) return t
+      }
+    }
     const n = Number(j?.ts ?? 0)
     return Number.isFinite(n) && n > 0 ? n : Date.now()
   } catch {
     return 0
   }
 }
+
+// ---------------------------------------------------------------------------
+// R1724：loop-ctl.json 的**唯一写入内核**（模块级）。
+// 为什么必须在模块级：写闸的两处调用点跨作用域 —— `/loop stop|start` 在实例闭包内，
+// 而「front 切换时同步 sids」在模块级的 savePersistedState 里。若各写一份，两边迟早漂移。
+// 三态返回值：wrote（真的改了盘）/ same（已是目标态，不写）/ err（写失败，调用方保留重试）。
+export const mutateLoopCtlFile = (mutate: (j: any) => void): "wrote" | "same" | "err" => {
+  let raw = ""
+  try {
+    raw = readFileSync(LOOP_CTL_PATH, "utf8")
+  } catch {
+    /* 文件不存在：按新建处理 */
+  }
+  let j: any = {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === "object") j = parsed
+  } catch {
+    /* 损坏：按空对象重建（顶层字段由本次 mutate 补齐） */
+  }
+  if (!j.bots || typeof j.bots !== "object") j.bots = {}
+  const before = JSON.stringify(j)
+  try {
+    mutate(j)
+  } catch {
+    return "err"
+  }
+  // 先比内容再补 ts：否则「本次什么都没改」也会因 ts 变化被写成"有变更"，
+  // savePersistedState 高频调用会变成持续无谓写盘（并污染顶层 ts 这个回落时间戳）。
+  if (JSON.stringify(j) !== before) j.ts = Date.now()
+  const out = JSON.stringify(j)
+  if (out === raw) return "same"
+  try {
+    // R1849：loop-ctl.json 是**跨进程共享**的总闸（tg-bridge 三个 Bot 各自的实例 +
+    // auto-continue 多条服务同时读写）。裸 writeFileSync 先 O_TRUNC 再写，读侧
+    // `loopStopped()`/`readCtl()` 恰好落在窗口内会 parse 失败 → catch 返回 false/{}
+    // → 把「已停」误判成「没停」（fail-open：循环该停没停）。这正是 R1841/R1847 已为
+    // state/loop-sessions 修掉的同一族缺陷，唯独总闸漏了。rename 原子，读者只见旧版或新版。
+    atomicWrite(LOOP_CTL_PATH, out, 0o600)
+    return "wrote"
+  } catch {
+    return "err"
+  }
+}
+
+// R1724 缺口补丁：front 切换后必须把 bots[BOT_ID].sids 跟着换成新 front。
+// 漏了会怎样：用户停了某 Bot 的循环，随后该 Bot 切到另一个会话 → sids 仍指旧会话 →
+// auto-continue 侧按 sid 判定**漏停**，那个 Bot 自己又跑起来了（正是"单独停"要保证的事）。
+// 节流：只在 front 变化时动；且被 isLiveWriter 挡住（陈旧热重载实例不得写）。
+let ctlSidsSynced = ""
+export const syncLoopCtlSids = (): void => {
+  if (!isLiveWriter()) return
+  // 同上：模块级函数只能用 persistedFront（frontSessionID 在闭包内，见 loopStopped 注释）。
+  const cur = persistedFront
+  if (!cur.startsWith("ses_") || cur === ctlSidsSynced) return
+  const r = mutateLoopCtlFile((j) => {
+    const e = j.bots[BOT_ID] && typeof j.bots[BOT_ID] === "object" ? j.bots[BOT_ID] : {}
+    const sids = Array.isArray(e.sids) ? e.sids : []
+    if (sids.length === 1 && sids[0] === cur) return
+    e.sids = [cur]
+    j.bots[BOT_ID] = e
+  })
+  // wrote 与 same 都表示磁盘已是目标态；err 则不记快照，下次 state save 再试。
+  if (r !== "err") ctlSidsSynced = cur
+}
+
+// R1728：本桥实例最后一次**成功投递**的时刻。
+// 为什么需要：2026-10-01 02:37 那次热重载**半完成**（模块图重求值、快照已换，但插件没重新
+// 初始化）→ 事件 handler 指向已废弃的旧闭包 → 轮询/心跳/自动注入全部照常，唯独
+// 「消息事件 → 卡片」这条链路全哑，**且零日志**。结果 30 分钟无推送，只有用户能发现。
+// 这里记录时间戳供 watchdog 判据使用（见下面 setInterval）。
+let lastProtoSendAt = 0
+let lastProtoSilentWarnAt = 0
+
+/**
+ * R1733：投递静默判据（**纯函数**，不碰任何闭包/模块状态）。
+ *
+ * 为什么要抽出来：R1728 加的 watchdog 只被"没误报"验证过 —— 但**没报警**和**不能报警**
+ * 在日志上长得一模一样（都是 0 条 `proto silent`）。若定时器没注册、或文案/条件写错，
+ * 我会得出"判据从严、0 误报"的**假绿**结论。这已是本项目第 4 次同类教训
+ * （scope-guard 假绿 3 次 + reload.sh 假红 1 次），共同规律是：
+ * **判据必须被单独验证"能抓到目标形态"，且好输入/坏输入双向都要测。**
+ *
+ * 所有输入显式传入（含 loopStopped / isCurrentGen 这两个环境态），
+ * 这样测试可以在不启动插件、不碰真实系统的前提下驱动全部分支。
+ */
+export type ProtoSilentVerdict = { warn: boolean; minutes: number; why: string }
+
+export function protoSilentVerdict(
+  now: number,
+  lastSendAt: number,
+  lastWarnAt: number,
+  opts: { thresholdMs: number; throttleMs: number; loopStopped: boolean; isCurrentGen: boolean }
+): ProtoSilentVerdict {
+  const silentMs = now - (lastSendAt || 0)
+  const minutes = Math.round(silentMs / 60000)
+  if (!opts.isCurrentGen) return { warn: false, minutes, why: "陈旧热重载实例" }
+  if (!lastSendAt) return { warn: false, minutes, why: "尚无投递基线" }
+  if (silentMs < opts.thresholdMs) return { warn: false, minutes, why: "静默未超阈值" }
+  // 循环闸已停时静默是**预期行为**（用户主动停的），不是故障
+  if (opts.loopStopped) return { warn: false, minutes, why: "循环已停，静默属预期" }
+  if (lastWarnAt && now - lastWarnAt < opts.throttleMs) return { warn: false, minutes, why: "告警节流中" }
+  return { warn: true, minutes, why: "静默超阈值且循环未停" }
+}
+
+/**
+ * R1802：一次投递的**送达判定**（**纯函数**，只吃 `SendResult`，不碰模块状态）。
+ *
+ * ## 要解决的缺陷（真阳性，非误报）
+ * 调用点原判据是 `r.r === "sent" && r.id`。但 `id` 在 `SendResult` 里是**可选**的
+ * （`{ r:"sent"|"retry"|"drop"; id?: number }`），而上游 `callTelegram` 有**两条**
+ * 产出 `ok:true` 却可能没有 `id` 的路径：
+ *   ① HTTP 2xx 但 `result.message_id` 缺失/非数字 → `id: Number.isFinite(id) ? id : undefined`
+ *   ② HTTP 2xx 但 `res.json()` 抛异常 → `return { ok: true }`（连字段都没有）
+ * 于是 `{ r:"sent", id:undefined }` 会让原判据为**假**，落入 else 分支，后果有两处：
+ *   - 日志记成 `proto send ${r.r}` 即 **`proto send sent`**，而且级别是 **error**
+ *     —— **措辞说成功、级别说失败**，任何按级别或按关键字的判据都会读错一边；
+ *   - **`lastProtoSendAt` 不刷新** → R1728 的投递静默 watchdog 基线被污染 → 可能误报。
+ *
+ * 决定性证据：`editTextRaw` 的两个 sent 返回点都写了 `id: r.id ?? messageID` **兜底**
+ * （L3455/L3459），唯独 `sendTextRaw` 是裸的 `id: r.id` —— 作者在编辑路径防过这个坑，
+ * 发送路径没防。
+ *
+ * ## 为什么判据里 `id` 只影响"要不要退回"，不影响"算不算送达"
+ * `id` 缺失意味着**我们不知道 TG 给这条消息分配了什么编号**，于是：
+ *   - 无法 `protoMap.set(key,{id})` —— 后续改写这张卡会失去锚点；
+ *   - 无法 `trackReplyButtons` —— 按钮挂不上去。
+ * 这是**真实的、可观测的副作用**，不能因为"消息到了"就当没事发生。
+ * 但它**不改变"用户收到了"这个事实**，所以不能因此把它记成失败/漏发。
+ * → 故拆成两个正交维度：`delivered`（用户是否收到）与 `degraded`（我方状态是否完整）。
+ *
+ * 契约：
+ *   - `r !== "sent"` → delivered=false（retry/drop 由调用方各自处理）
+ *   - `r === "sent" && id 是有限正整数` → delivered=true, degraded=false（正常路径）
+ *   - `r === "sent"` 但 id 缺失/非有限/非正 → delivered=true, **degraded=true**
+ *     （必须仍刷新 lastProtoSendAt，否则 watchdog 基线被污染）
+ */
+export type ProtoDeliveryVerdict = {
+  /** 用户是否**确实收到**了这条消息（TG 返回 2xx 即收到，与我方是否拿到 id 无关）。 */
+  delivered: boolean
+  /** 我方状态是否完整：false = 可 protoMap.set + trackReplyButtons；true = 发送成功但**不能**。 */
+  degraded: boolean
+  /** 为什么 degraded，供日志与排障用。 */
+  why: string
+}
+export function protoDeliveryVerdict(r: { r: "sent" | "retry" | "drop"; id?: number }): ProtoDeliveryVerdict {
+  if (r.r !== "sent") return { delivered: false, degraded: false, why: `非成功路径(r=${r.r})` }
+  const id = r.id
+  if (typeof id !== "number" || !Number.isFinite(id) || id <= 0)
+    return {
+      delivered: true,
+      degraded: true,
+      why: `TG 已接受但未回 message_id(id=${String(id)})：不记 protoMap/按钮，但**必须**刷新 lastProtoSendAt`,
+    }
+  return { delivered: true, degraded: false, why: "正常：有 message_id，可锚定与挂按钮" }
+}
+
 const PRIVATE_FILE_MODE = 0o600
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
@@ -374,6 +527,12 @@ export type BotConfig = {
   /** 启动时的附加镜像列表。给非主实例传 [] 可避免继承到别人的 watch
    *  （否则备用 Bot 会镜像主会话，两个 Bot 交叉发言）。 */
   initialWatch?: string[]
+  /** R1565 每轮「AI 主动结束输出」短提示开关。默认开；false 关。env TG_TURN_END_NOTIFY=0 等效。 */
+  turnEndNotify?: boolean
+  /** R1593 循环轮不发 note 开关。默认开；false 关（回退循环也发）。env TG_TURN_NOTE_LOOP_SKIP=0 等效。 */
+  turnNoteLoopSkip?: boolean
+  /** R1596 主实例独占 note 开关。默认开（只有主实例发）；false 关（每实例都发）。env TG_TURN_NOTE_OWNER_ONLY=0 等效。 */
+  turnNoteOwnerOnly?: boolean
 }
 
 let CONFIG_PATH = "REDACTED_ROOT/.config/opencode/tg.env"
@@ -431,6 +590,24 @@ let QUEUE_CARD_OWNER = true
 // 独立开关而非复用 QUEUE_CARD_OWNER —— QUEUE_CARD_OWNER 还承载 ownsAsk/scopeOwn 语义
 //（主实例=跟随前台 + 兜底询问），放开它会让非主实例抢答。env TG_SELF_QUEUE_PIN=0 可关。
 const ALLOW_SELF_QUEUE_PIN = process.env.TG_SELF_QUEUE_PIN !== "0"
+// R1565 每轮「AI 主动结束输出」短提示开关：默认开，env TG_TURN_END_NOTIFY=0 或
+// configureBot 传 turnEndNotify:false 可关（与 turn-end-note.ts 文案配套）。
+let TURN_END_NOTIFY = process.env.TG_TURN_END_NOTIFY !== "0"
+// R1593：循环轮（已完成消息文本含 [ROUND n]）**不发** note——用户真实反馈
+//「本轮完成刷屏」（实测近 5min 三 bot 合并 39 条 note ≈4 条/分钟）。默认开（跳过
+// 循环轮，仅非循环手动轮发「✅ 输出结束」）；env TG_TURN_NOTE_LOOP_SKIP=0 或
+// configureBot 传 turnNoteLoopSkip:false 可回退旧行为（循环也发）。
+let TURN_NOTE_LOOP_SKIP = process.env.TG_TURN_NOTE_LOOP_SKIP !== "0"
+// R1596：turn-end note 只由主实例（QUEUE_CARD_OWNER，index 0）发。alt/bot3 实例的 front
+// 是各自项目的真实会话（proxyip / robin 等），不喝本循环注入 → R1595 续跑检测对它们
+// 恒 false → 各自项目回合一结束就发，跨 bot 刷屏。默认开；env TG_TURN_NOTE_OWNER_ONLY=0
+// 或 configureBot 传 turnNoteOwnerOnly:false 可回到每实例都发。
+let TURN_NOTE_OWNER_ONLY = process.env.TG_TURN_NOTE_OWNER_ONLY !== "0"
+// R1597：note 的"安静窗"——完成不足该毫秒数的消息不评估（宿主注入下一条循环提示
+// 通常秒级到达，20s 轮询可能撞在注入前把续跑中的回合误判成停摆 → 主实例偶发
+// 「输出结束」）。40s 后仍无续跑提示才算真正停摆。env TG_TURN_NOTE_QUIET_MS 可调。
+const AC_MIN_ROUND_MS = Number(process.env.AC_MIN_ROUND_MS ?? 90_000) || 90_000
+const TURN_NOTE_QUIET_MS = Number(process.env.TG_TURN_NOTE_QUIET_MS ?? "") || AC_MIN_ROUND_MS + 30_000
 const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 12 // R1889 重试总额度（12 次 ≈ 退避累计 5 分钟）；理由见 run() 内 retry 分支的注释
 
 const loadFileEnv = (path?: string | null): Record<string, string> => {
@@ -495,6 +672,9 @@ export const unownedFrontOwner = (queueCardOwner: boolean): boolean => queueCard
 export const configureBot = (cfg: BotConfig, opts: { deferLoad?: boolean } = {}): void => {
   if (cfg.id) BOT_ID = cfg.id
   if (typeof cfg.queueCardOwner === "boolean") QUEUE_CARD_OWNER = cfg.queueCardOwner
+  if (typeof cfg.turnEndNotify === "boolean") TURN_END_NOTIFY = cfg.turnEndNotify
+  if (typeof cfg.turnNoteLoopSkip === "boolean") TURN_NOTE_LOOP_SKIP = cfg.turnNoteLoopSkip
+  if (typeof cfg.turnNoteOwnerOnly === "boolean") TURN_NOTE_OWNER_ONLY = cfg.turnNoteOwnerOnly
   if (cfg.genKey) GEN_KEY = cfg.genKey
   if (cfg.configPath) CONFIG_PATH = cfg.configPath
   if (cfg.fallbackEnvPath !== undefined) FALLBACK_ENV_PATH = cfg.fallbackEnvPath
@@ -770,7 +950,7 @@ const shouldSend = (key: string, text: string): boolean => {
   sentParts.set(key, text)
   return true
 }
-  const outQueue: Array<{ chat: string; text: string; ts: number; kb?: unknown; replyTo?: number }> = []
+const outQueue: Array<{ chat: string; text: string; ts: number; kb?: unknown; replyTo?: number }> = []
 // 置顶注入队列（用户→会话方向）：串行注入 + 注入提示；持久化，重启可恢复（/queue 置顶查看）
 type PinItem = { id: string; sid: string; text: string; ctx: string; chat: string; ts: number; tgMid?: number }
 const pinQueue: PinItem[] = []
@@ -853,7 +1033,7 @@ export const renderToolTerminalCard = (sessionID: string, part: any, status: str
   const IN_TAIL = 600
   const outTail = outText.length > OUT_TAIL ? outText.slice(0, 120) + "\n…（略）…\n" + outText.slice(-OUT_TAIL) : outText
   const inTail = inText.length > IN_TAIL ? inText.slice(0, IN_TAIL) + "\n…（略）…" : inText
-  const lines: string[] = [`<b>🔧 ${htmlEsc(disp)} 执行 · 开始 ${clock}${ctxSuffix(sessionID)}</b>`]
+  const lines: string[] = [`<b>🔧 ${htmlEsc(disp)} 执行 · 开始 ${clock}${htmlEsc(ctxSuffix(sessionID))}</b>`]
   // ① edit 类工具补 diff 区（与事件路径 inputZone 的形状对齐：📥 变更 + language-diff）
   const rawInObj = (rawIn && typeof rawIn === "object" ? rawIn : {}) as Record<string, unknown>
   const oldStr = (rawInObj.oldString ?? (st.metadata as any)?.oldString) as string | undefined
@@ -894,6 +1074,160 @@ let lastQPinCount = -1
 let lastQPinEdit = 0
 // 长轮询超时的日志节流（超时常态，不该每秒刷一条）
 let pollTimeoutLogAt = 0
+// R1740：入站静默判据的状态。放模块级（不是 pollOnce 闭包内）—— 闭包内的变量
+// 每次插件换代都会被重置，而静默判据恰恰需要跨"没有 update"的那些轮次累积。
+let lastInboundAt = 0
+let lastInboundSilentWarnAt = 0
+// R1741：bootAt —— 判据的**第三基线**。没有它，"重启后一直无人发言"这个最常见的
+// 静默形态会让判据返回 basis:none 并永久放弃监控（详见 inbound-silence.ts 注释）。
+let botBootAt = 0
+// R1743：同伴入站时间（跨 bot 共享）。判别「用户安静」与「我这路坏了」的**唯一**信号
+// —— 别的 bot 收到了而我没收到。纯时长做不到（同形，见 inbound-silence.ts 注释）。
+const PEER_INBOUND_PATH = "/tmp/opencode/tg-peer-inbound.json"
+// R1759：账本升级为两字段。**混用一个字段会同时产生假阴和假阳**：
+//   in  = 我真收到 update 的时刻（poll 活着不代表收到了！长轮询 30s 空返回是常态）
+//   seen= 同伴最后一次【刷新账本】的时刻（= 它 poll 还活着）
+// 若只留一个字段并用 touchPeer 刷新它：
+//   - 假阴：收不到消息的 bot 读不到同伴领先 → 永远不报（R1757 死结）
+//   - 假阳：同伴"poll 活着"被当成"同伴收到了" → 掩盖真实故障（R1759 反向问题）
+// 所以判据只认 `in`，`seen` 仅用于诊断"该 bot 进程是否还活着"。
+export type PeerLedger = Record<string, { in: number; seen: number }>
+/**
+ * R1843：把「待写入的账本」与「磁盘现状」**逐 bot 逐字段取 max** 合并。
+ * in/seen 都是单调时间戳，取 max 是正确合并。为什么必须：
+ * 账本是 **read-modify-write 且跨实例共享**（/tmp/opencode/tg-peer-inbound.json）。
+ * A 读到旧账 → B 写入新账 → A 回写自己那份旧账，会把 B 刚写进去的 in 抹回去（丢更新）。
+ * 取 max 合并后，丢更新**不可能**把时间戳改小。
+ */
+export const mergePeerLedgers = (base: PeerLedger, add: PeerLedger): PeerLedger => {
+  const out: PeerLedger = { ...base }
+  for (const [bot, v] of Object.entries(add)) {
+    const cur = out[bot] ?? { in: 0, seen: 0 }
+    out[bot] = { in: Math.max(cur.in, v.in), seen: Math.max(cur.seen, v.seen) }
+  }
+  return out
+}
+let peerLastInboundAt = 0
+let peerWriteFailures = 0
+
+/**
+ * R1758：**每次 poll 返回都要调**（含空数组），把自己那一项刷新到"最近一次
+ * 自称有入站"的时刻，并重算同伴最新值。
+ *
+ * 为什么必须独立于 noteInbound —— R1757 查到的**自我抑制死结**：
+ *   原设计只在 `result.length > 0`（真收到消息）时调 noteInbound，于是
+ *     primary/bot3 没收到消息 → 不调 → 从不读同伴账本 → peerLastInboundAt 恒 0
+ *     → 判据落 no-peer → 不报
+ *   而"没收到消息"恰恰是它最该报警的时刻。故障 bot 因此**永远沉默**。
+ *
+ * 关键设计（与"入站基线"严格区分，别混淆）：
+ *   peers[BOT_ID] 记录的是"**我最近一次确认自己还在正常 poll**"的时刻，
+ *   供**同伴**横向比较用；而 `lastInboundAt` 才是"**我真收到 update**"的时刻，
+ *   供我自己纵向判断静默用。二者绝不能共用同一个字段——
+ *   一旦共用，poll 正常就等于"有入站"，判据彻底失效（那正是 R1739 查不到的盲区）。
+ *
+ * 写入节流：poll 长轮询 30s 一次，3 bot → 每 30s 最多 3 次小 JSON 写入，
+ * best-effort，失败只记 diag、不影响 poll。
+ */
+/**
+ * R1759：账本读写统一入口。**两个函数必须走同一套格式处理** ——
+ * 若 touchPeer 和 noteInbound 各写各的，格式一旦分叉就会出现
+ * "A 写的字段 B 读不到"的静默失效（判据看着在跑，实际读到全0 = 又一次假绿）。
+ * best-effort：任何异常都不得影响 poll。
+ */
+const readLedger = (): PeerLedger => {
+  try {
+    const j = JSON.parse(readFileSync(PEER_INBOUND_PATH, "utf8"))
+    if (j && typeof j === "object" && !Array.isArray(j)) {
+      const raw = j as Record<string, unknown>
+      const out: PeerLedger = {}
+      for (const [bot, v] of Object.entries(raw)) {
+        if (v && typeof v === "object") {
+          const e = v as Record<string, unknown>
+          out[bot] = { in: Number(e.in) || 0, seen: Number(e.seen) || 0 }
+        } else if (typeof v === "number" && v > 0) {
+          // R1759 迁移：兼容 R1758 的旧格式（值是裸 number，语义就是"真实入站时刻"）。
+          // 不兼容的话，重载后 peerLastInboundAt 会瞬间归 0 → 落 no-peer → **漏报**，
+          // 而故障 bot 恰恰最需要报警。那条时间戳是真实数据，没理由丢掉。
+          out[bot] = { in: v, seen: v }
+        }
+      }
+      return out
+    }
+  } catch {
+    /* 首次或损坏，从空开始 */
+  }
+  return {}
+}
+
+/**
+ * R1851：从账本取「**同伴（不含自己）**最新的真实入站时刻」。只认 in 字段
+ * （R1759：seen 是 poll 存活，不是入站）。
+ *
+ * 旧实现把**自己**也算进去：于是"我最近收到过"被当成"同伴最近收到过"——
+ * 在**没有任何同伴数据**时，判据落 `peer-ok`（"同伴也一样安静"），而真相是 `no-peer`
+ * （**根本没有跨 bot 证据**）。两者都 silent:false，不影响告警，但诊断行在骗人 ——
+ * 与 R1779「不许把无法证伪的猜测包装成结论」同源。显式排除 self 以对齐文档语义。
+ */
+export const latestPeerInbound = (peers: PeerLedger, self: string): number => {
+  let max = 0
+  for (const [bot, v] of Object.entries(peers)) {
+    if (bot === self) continue
+    const t = v && typeof v === "object" && v.in ? Number(v.in) || 0 : 0
+    if (t > max) max = t
+  }
+  return max
+}
+/** 重算"同伴（不含自己）里最新的真实入站时刻"。 */
+const recomputePeer = (peers: PeerLedger): void => {
+  peerLastInboundAt = latestPeerInbound(peers, BOT_ID)
+}
+
+const writeLedger = (peers: PeerLedger, what: string): void => {
+  try {
+    // R1843：写入前与磁盘现状**逐字段取 max 合并**（防跨实例 read-modify-write 丢更新），
+    // 再用 atomicWrite（tmp+rename）落盘，避免读侧读到**半截 JSON** →
+    // readLedger 落 {} → recomputePeer 归 0 → 判据落 no-peer → **故障 bot 静默漏报**
+    //（正是 R1757/R1758 花大力气消除的自我抑制死结）。
+    const merged = mergePeerLedgers(readLedger(), peers)
+    atomicWrite(PEER_INBOUND_PATH, JSON.stringify(merged), 0o600)
+    recomputePeer(merged)
+  } catch {
+    peerWriteFailures++
+    if (peerWriteFailures <= 3) diag(`[peer-inbound] ${what} 写入失败 bot=${BOT_ID} x${peerWriteFailures}`)
+  }
+}
+
+const touchPeer = (): void => {
+  const peers = readLedger()
+  const now = Date.now()
+  const mine = peers[BOT_ID] ?? { in: 0, seen: 0 }
+  // seen 只前进：它表达"我 poll 还活着"，**绝不能碰 in**（in 是真实入站时刻）。
+  // R1759 血训：把 poll 存活写进 in，会让同伴把我的故障当成"我在正常收消息"。
+  // ⚠️ `Number(x) || 0` 不能省：R1760 实测 `mine.in` 为 undefined 时，
+  // JSON.stringify 会把整个字段**丢掉**（实测线上账本变成 {"alt":{"seen":...}}），
+  // alt 04:33:29 的真实入站时刻被我自己的 touchPeer 写丢 → recompute 取不到 → 漏报。
+  // 这与 R1759 的教训同源：**undefined 流进序列化 = 静默丢数据，且没有任何报错**。
+  const prevIn = Number(mine.in) || 0
+  const prevSeen = Number(mine.seen) || 0
+  peers[BOT_ID] = { in: prevIn, seen: Math.max(prevSeen, now) }
+  writeLedger(peers, "touchPeer")
+}
+
+/**
+ * 记录本 bot 的**真实入站**时刻，并重算同伴最新值。
+ * 只在 `result.length > 0` 时调用。lastInboundAt 语义 = "我真收到 update"。
+ * best-effort，失败不影响 poll。
+ */
+const noteInbound = (): void => {
+  const now = Date.now()
+  lastInboundAt = now
+  const peers = readLedger()
+  const mine = peers[BOT_ID] ?? { in: 0, seen: 0 }
+  // 真收到 update：in 前进到 now，seen 同步（既然收到，poll 必然是活的）。
+  peers[BOT_ID] = { in: Math.max(mine.in, now), seen: Math.max(mine.seen, now) }
+  writeLedger(peers, "noteInbound")
+}
 let qpinBusy = false
 // "本实例不是队列置顶拥有者"只提示一次
 let queueOwnerSkipLogged = false
@@ -1093,6 +1427,28 @@ let commandReplyMode = false
 const listPlaceholder = new Map<string, number>()
 // 已停止的会话：不再给新消息挂停止键（doStop 置位，注入泵投递成功时清除）
 const haltedSet = new Set<string>()
+/**
+ * R1796：把 state 文件里的 `halted` 数组灌进 Set，返回实际置入条数。
+ *
+ * ⚠️⚠️ **这里不得加任何条数上限**（原实现是 `hl.slice(-50)`，R1796 已移除）。
+ * `halted` 记的是**用户按过 ⏹ 的会话**，是 R1107 立的"尊重用户停止意图"这条契约的唯一载体，
+ * 不是缓存、不是诊断样本。写侧（L1734 `halted: [...haltedSet]`）本来就**全量写不截断**，
+ * 只有读侧有界 —— 两边不对称意味着：**重启时最旧的条目会被静默丢弃**，
+ * 于是用户没碰过任何按钮，那些会话的自动循环自己又跑起来了（R1794 定位的失效路径）。
+ *
+ * R1795 已从 DB 取回 R1107 原文核实：那一轮谈的全是"让 auto-continue 尊重持久化 halted"，
+ * **从未设计过任何条数上限** —— 那个 50 是后来某轮顺手加的无注释截断，与立意无关。
+ *
+ * 抽成独立函数是为了**能真测**：它原本内嵌在 state 加载里、操作模块级 `haltedSet`，
+ * 直接测会污染跨文件共享状态（`haltedSet` 是模块级，10 个测试文件都 import 本模块）。
+ * 体积不是问题：每 sid ≈ 40 B，即便 2000 条也仅 ≈ 80 KB。
+ */
+export const loadHaltedInto = (hl: unknown, into: Set<string>): number => {
+  if (!Array.isArray(hl)) return 0
+  let n = 0
+  for (const s of hl) if (typeof s === "string" && s) { into.add(s); n++ }
+  return n
+}
 const pendingSelect = new Map<string, { gen: number; ids: string[]; ts: number }>()
 let selectGen = 0
 const lastInject = new Map<string, string>()
@@ -1201,6 +1557,20 @@ const loadPersistedState = (): void => {
     const j = JSON.parse(raw) as any
     if (typeof j?.front === "string" && j.front.startsWith("ses_")) persistedFront = j.front
     if (typeof j?.pinned === "string" && j.pinned.startsWith("ses_")) fixedTarget = j.pinned
+    // R1734：接回 watchdog 基线（详见 savePersistedState 里的 lastpush 注释）
+    if (typeof j?.lastpush === "number" && j.lastpush > 0) {
+      lastProtoSendAt = j.lastpush
+      // 这一行是**故意留痕**的：基线来源若丢了，症状是"watchdog 永远不报"，
+      // 而那个症状和"一切正常"在其它日志里完全同形。没有这行就只能靠猜。
+      diag(`[watchdog] 基线来自状态文件 lastpush=${new Date(j.lastpush).toISOString()}`)
+    }
+    // R1740：入站静默基线。与 lastpush 同理但**方向相反** —— lastpush 守出站，
+    // lastinbound 守入站。少了它，重启后 lastInboundAt 归零 → 静默判据在重启后
+    // 前 10 分钟完全瞎（R1739 那个 59 秒窗口正是"无痕"，跨重启更不能只靠内存）。
+    if (typeof j?.lastinbound === "number" && j.lastinbound > 0) {
+      lastInboundAt = j.lastinbound
+      diag(`[watchdog] 入站基线来自状态文件 lastinbound=${new Date(j.lastinbound).toISOString()}`)
+    }
     const chats = j?.chats
     if (chats && typeof chats === "object") {
       for (const [k, v] of Object.entries(chats)) {
@@ -1322,10 +1692,7 @@ const loadPersistedState = (): void => {
         if (Array.isArray(it) && typeof it[0] === "string" && typeof it[1] === "string") reconcileTag.set(it[0], it[1])
       }
     }
-    const hl = j?.halted
-    if (Array.isArray(hl)) {
-      for (const s of hl.slice(-50)) if (typeof s === "string" && s) haltedSet.add(s)
-    }
+    loadHaltedInto(j?.halted, haltedSet) // R1796：全量灌入，**不截断**（理由见 loadHaltedInto 注释）
     const fj = j?.filters
     if (fj && typeof fj === "object") {
       for (const k of ["reply", "think", "tool", "status"] as const) {
@@ -1558,6 +1925,13 @@ const savePersistedState = (): void => {
     const body = JSON.stringify({
         front: persistedFront,
         pinned: fixedTarget ?? "",
+        // R1734：投递静默 watchdog 的基线。**必须落盘**，否则热重载后基线归零 →
+        // "尚无投递基线"这条抑制规则会**永久生效**：万一重载后事件流又断（02:37 的形态），
+        // watchdog 恰好在这个窗口里最该报，却因为"没基线"而一声不吭。
+        // 这是把 02:37 那次"静默 30 分钟只有用户能发现"的风险重新引入，只是概率更低。
+        lastpush: lastProtoSendAt,
+      // R1740：入站静默基线落盘（见 loadPersistedState 同名读取处注释）
+      lastinbound: lastInboundAt,
         chats: Object.fromEntries(knownNumericChatIDs),
         queue: outQueue.slice(0, 50),
         pinqueue: pinQueue.slice(0, PINQ_MAX),
@@ -1619,6 +1993,8 @@ const savePersistedState = (): void => {
     lastSavedPinIds = new Set(pinQueue.map((qq) => qq.id))
     stateSavedAt = Date.now()
     stateSavedBytes = body.length
+    // R1724：front 可能在本函数里被改过 → 顺手把 loop-ctl 的 sids 对齐（自身有节流）。
+    syncLoopCtlSids()
   } catch (err) {
     // 保存失败此前是**完全静默**的（整段一个 catch 吞掉）。这导致"状态文件冻住"
     // 十几分钟都没人发现，而它的后果是：队列条目留在文件里 → 重载后重复注入、
@@ -1707,6 +2083,63 @@ const isHarnessNoise = (s: unknown): boolean => {
 
 const htmlEsc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
+// 纯函数：HTML 消息卡片渲染（可单测，2026-09-29 抽出）。
+// 约定 = **调用方必须传未转义的原始文本**（title 与 body 都别预转义），本函数统一 htmlEsc 一次。
+// ⚠️ 踩坑实录（2026-09-29 用户实测）：曾有调用方把已转义的 "&lt;1%"（ctxSuffix 预转义产物）
+// 传进来做标题 → 本函数二次转义成 "&amp;lt;1%" → Telegram 解一层 → 用户看到字面 "&lt;1%"。
+/**
+ * R1716：只复活**配对正确**的标签（`&lt;pre&gt;`/`&lt;b&gt;` 这类转义实体 → 真标签）。
+ *
+ * 缺陷实锤（2026-10-01 00:58）：旧实现是**无条件全局替换**
+ * `.replace(/&lt;pre&gt;/g,"<pre>")…`。但正文/思考里会**字面**出现 `<pre>`、`</pre>`
+ * （讲代码片段时），htmlEsc 后同样是 `&lt;/pre&gt;`，被无差别复活成真标签 →
+ * 凭空多出未配对标签 → 发送前 `validateHtmlText` 报「标签错位: </pre> 对应的是 <b>」
+ * → 走剥标签纯文本降级重发（格式丢失、消息可能重复）。
+ *
+ * 这里改成栈式（LIFO）配对：只有能被正确闭合的标签才还原；落单的保持转义，
+ * 用户看到的是字面文本 `<pre>`，而不是结构错乱的坏 HTML。
+ */
+export const revivePairedEntities = (s: string, tags: readonly string[]): string => {
+  let out = String(s ?? "")
+  if (!out.includes("&lt;")) return out
+  for (const tag of tags) {
+    // 转义态的标签形如 &lt;b&gt; / &lt;/b&gt; / &lt;pre class="language-x"&gt;
+    const re = new RegExp(`&lt;/?${tag}(?:&gt;|\\s[^&]*?&gt;)`, "g")
+    const toks: Array<{ start: number; end: number; close: boolean }> = []
+    let m: RegExpExecArray | null
+    while ((m = re.exec(out)) !== null) toks.push({ start: m.index, end: m.index + m[0].length, close: m[0].startsWith("&lt;/") })
+    if (toks.length === 0) continue
+    const stack: number[] = []
+    const paired: boolean[] = new Array(toks.length).fill(false)
+    for (let i = 0; i < toks.length; i++) {
+      if (!toks[i].close) stack.push(i)
+      else if (stack.length > 0) {
+        const open = stack.pop() as number
+        paired[open] = true
+        paired[i] = true
+      }
+    }
+    if (!paired.some(Boolean)) continue // 全是落单标签 → 一律保持转义
+    let res = ""
+    let last = 0
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i]
+      res += out.slice(last, t.start)
+      const raw = out.slice(t.start, t.end)
+      res += paired[i] ? raw.replace(/&lt;/g, "<").replace(/&gt;/g, ">") : raw
+      last = t.end
+    }
+    out = res + out.slice(last)
+  }
+  return out
+}
+
+export const renderProtoBlock = (title: string, body: string): string => {
+  const lines = String(body ?? "").split("\n").map((l) => htmlEsc(l))
+  // 标题的 <b> 是我们自己生成的真标签（不需复活）；body 里被转义的真标签按配对情况复活。
+  return revivePairedEntities(`<b>${htmlEsc(title)}</b>\n${lines.join("\n")}`, ["b", "pre"])
+}
+
 export const mdBoldToHtml = (s: string): string => {
   const t = String(s ?? "")
   const holes: string[] = []
@@ -1716,6 +2149,111 @@ export const mdBoldToHtml = (s: string): string => {
   })
   const conv = prot.split("`").map((seg, i) => (i % 2 === 1 ? seg : seg.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>"))).join("`")
   return conv.replace(/(\d+)/g, (_, n) => holes[Number(n)] ?? "")
+}
+
+// R1605：截断可能在 <pre> 内切断（正文 1200 上限）——未闭合则补 </pre>，防 TG HTML 非法触发降级重发。
+export const closeUnclosedPre = (s: string): string => {
+  const t = String(s ?? "")
+  return (t.match(/<pre>/g) ?? []).length > (t.match(/<\/pre>/g) ?? []).length ? `${t}</pre>` : t
+}
+
+// R1602（用户真实指令「表格没有转化」）：Markdown 表格 → <pre> 等宽块。
+// R1715（用户真实指令「等宽字符更好看 + 格内自动换行匹配手机」）：不再原样塞管道符，
+// 解析表头/数据后用 renderTgTable(wrap:true) 画等宽框线表格 —— 代码块恒等宽、
+// 长格自动换行成多行、整表总宽 ≤42 不横溢，手机端可读且不丢内容。
+// 旧行为：正文只 mdBoldToHtml（**→<b>），表格管道符原样送出，TG HTML 无 <table> → 用户见原始 | a | b |。
+// 判据：连续 ≥2 行且含「仅由 -|:空格 构成、含 | 与 -」的分隔行；跳过 ``` 围栏；非表格管道行不误包。
+export const mdTableToHtml = (s: string): string => {
+  const lines = String(s ?? "").split("\n")
+  // R1721 Bug C：模型输出的表行**常常没有首/尾管道符**（`项 | 状态 | 证据`）。
+  // 原判据 `/^\s*\|.*\|\s*$/` 会把这类行判为「非行」→ flush() 提前切断 run →
+  // parseRunTables 的数据行 while 零次进入 → **渲染出只有表头的空表**，
+  // 且这些行以裸管道文本泄漏到 </pre> 之外（用户看到空框线表 + 一堆 `| … |` 原文）。
+  // 现在：只要含管道符就算候选行；真正的「是不是表」交给 run 级判据（≥2 行 + 含分隔行 +
+  // **至少 1 个数据行**，见 flush/parseRunTables）—— 无分隔行的 run 依旧原样输出，
+  // 所以放宽 isRow 不会把普通正文（含 | 的句子）吞进表格。
+  const isRow = (l: string): boolean => l.includes("|") && l.trim().length > 0
+  const isSep = (l: string): boolean => {
+    const t = l.trim()
+    // 分隔行 = 仅由 - | : 空格 组成，且至少含一个 | 与一个 -（正统表分隔行）
+    return t.includes("|") && t.includes("-") && /^[-|:\s]+$/.test(t)
+  }
+  // 单元格净化：去两边管道、去先行 mdBoldToHtml 留下的 <b> 标签（TG <pre> 内嵌套实体不稳，
+  // 且标签会破坏可视宽度计算）、去残留 **，再 trim。
+  const parseRow = (l: string): string[] =>
+    String(l)
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      // R1838：只去 mdBoldToHtml 产生的 `<b>`/`</b>`（原用 `/<[^>]*>/g` 会把单元格里任何
+      // `<...>` 内容（如 `p <b>q` 之外的 `<div>`、比较式 `x < y > z`）**整段吞掉**）。
+      // 其余尖括号内容保留，交给外层 htmlEsc 安全转义后原样显示。
+      .map((c) => c.replace(/<\/?b\s*>/g, "").replace(/\*\*/g, "").trim())
+  // 把 run（连续管道行）解析成「表头+分隔行+数据行」的表序列；无法配对成表的行归入 rest。
+  const parseRunTables = (run: string[]): { tables: Array<{ h: string[]; rows: string[][] }>; rest: string[] } => {
+    const tables: Array<{ h: string[]; rows: string[][] }> = []
+    const rest: string[] = []
+    let i = 0
+    while (i < run.length) {
+      if (i + 1 < run.length && isSep(run[i + 1])) {
+        const start = i
+        const h = parseRow(run[i])
+        i += 2
+        const rows: string[][] = []
+        while (i < run.length && isRow(run[i]) && !isSep(run[i])) {
+          rows.push(parseRow(run[i]))
+          i++
+        }
+        // R1721 Bug C：**没有任何数据行就不算表** —— 只出现「表头 + 分隔行」时，
+        // 画出来的是「空壳表」（有表头、零行数据），比不画更糟；模型输出里
+        // 「表头 + 分隔行」单独出现很常见（表格被分片截断就是这种形状）。
+        // 这种情况把整个 run 片段（表头+分隔行）原样归入 rest → 内容零丢失、
+        // 不会出现「空框线表 + 裸管道行泄漏到 </pre> 外」的破相输出。
+        if (rows.length === 0) {
+          for (let k = start; k < i; k++) rest.push(run[k])
+          continue
+        }
+        tables.push({ h, rows })
+      } else {
+        rest.push(run[i])
+        i++
+      }
+    }
+    return { tables, rest }
+  }
+  const out: string[] = []
+  let inFence = false
+  let run: string[] = []
+  let runHasSep = false
+  const flush = (): void => {
+    // 表格判据：连续行 ≥2 且含分隔行（防普通带 | 的正文误包）
+    if (run.length >= 2 && runHasSep) {
+      const { tables, rest } = parseRunTables(run)
+      if (tables.length > 0 || rest.length > 0) {
+        for (const tb of tables) {
+          const body = renderTgTable(tb.h, tb.rows, { wrap: true, fence: false })
+          // R1838：表格正文是**派生纯文本**（renderTgTable 只画框线+单元格文字），必须 htmlEsc
+          // 后才能塞进 <pre>。此前直发：单元格里的 `a < b` 会留下裸 `<`、`x & y` 留下裸 `&`，
+          // 在 HTML parse_mode 下要么被 TG 判非法整条降级为纯文本（表格破相），要么把后续
+          // 文本当标签吞掉。与 renderProtoBlock（L2035 已 htmlEsc）保持一致。
+          out.push(`<pre>${htmlEsc(body)}</pre>`)
+        }
+        if (rest.length > 0) out.push(...rest)
+      } else out.push(`<pre>${run.join("\n")}</pre>`)
+    } else out.push(...run)
+    run = []
+    runHasSep = false
+  }
+  for (const l of lines) {
+    if (/^\s*```/.test(l)) { flush(); inFence = !inFence; out.push(l); continue }
+    if (inFence) { flush(); out.push(l); continue }
+    if (isRow(l)) { run.push(l); if (isSep(l)) runHasSep = true; continue }
+    flush()
+    out.push(l)
+  }
+  flush()
+  return out.join("\n")
 }
 
 const INTERNAL_LOG_LINE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\S*\s+\[(tg-bridge|auto-continue)\]|auto-continue: eval|getUpdates failed|proto (send|edit) (ok|failed|drop)|answerCallback|cb (recv|refresh|full)|^\[(tg-bridge|auto-continue)\]/
@@ -1898,6 +2436,7 @@ const makeQ = (sid: string, answer: string): string => {
   }
   return `q:${token}`
 }
+
 // R1862：解析内联作答回调 `qa:<sid>|<答案>`（makeQ 的逆）。**答案可以是任意选项文本**
 // （用户问题的 label），里面可能含 `:`；而 callback_data 以 `:` 分隔字段，若调用方只取
 // `data.split(":")[1]`，答案会在**首个冒号处被静默截断**（例：选项 "A: B" 实际只发出 "A"）。
@@ -1908,12 +2447,13 @@ export const parseAskInline = (data: string): { sid: string; ans: string } => {
   const sep = rest.indexOf("|")
   return sep >= 0 ? { sid: rest.slice(0, sep), ans: rest.slice(sep + 1) } : { sid: rest, ans: "" }
 }
+
 const isAllowed = (chat: any): boolean => {
   const id = String(chat?.id ?? "")
   if (id && allowedNorm.has(id)) return true
   const uname = chat?.username ? String(chat.username).replace(/^@/, "") : ""
   if (uname && allowedNorm.has(uname)) return true
-  // 形态换算：白名单里配的是**用户名**（如 myusername），而某些更新只带**数字 chat id**
+  // 形态换算：白名单里配的是**用户名**（如 alice），而某些更新只带**数字 chat id**
   // （或反之）→ 直接比对会判成"非白名单"并**静默丢弃**这条消息。
   // 症状：备用 Bot 收得到按钮回调（回调路径不过白名单）却收不到任何文字 —— 用户报"消息丢失"。
   // 这里用 knownNumericChatIDs（本进程已确认、且随状态文件落盘的"用户名 ↔ 数字 id"映射）
@@ -2051,35 +2591,67 @@ export const validateHtmlText = (text: string): string | null => {
   return null
 }
 
-// R1636：纯函数 —— 速率限制（429）时"下一次循环该等多久"的**指数退避**。
-// 背景：原 floodWaitSeconds 是**平**的 —— 不管连着挨几次 429，只要 Telegram
-// 给的 retry_after 一样大，等待就一样长，于是"冷却结束→再打一次→再 429"以
-// 固定节奏无限循环，把 bot 永久锁在限流里（Telegram 反而越给越长的 retry_after）。
-// 现在：连续第 n 次 429 的等待 = max(指数项 base·2^(n-1), Telegram 的 retry_after)，
-// 封顶 cap；**成功一次即清零** attempt。抖动（jitter）让多 Bot / 多会话的重试
-// 不在同一个毫秒撞上，避免"齐步走"再次触发限流。
-// 不变量：返回值**永远 ≥ min(cap, Telegram 要求的 retry_after)**（抖动因子 ≥1）。
-// ⚠️ retry_after > cap（默认 900s）时**不**成立 —— 超大 retry_after 会被 cap 收敛
-// （有意为之，见测试"retry_after 巨大时按 cap 收敛"）。准确表述是"最慢每 cap 秒重试一次"，
-// 而非"绝不早于 Telegram 允许的时间"。
-export const FLOOD_BACKOFF_BASE_S = 60
-export const FLOOD_BACKOFF_CAP_S = 900
-export const FLOOD_BACKOFF_FLOOR_S = 5
-export const FLOOD_BACKOFF_JITTER = 0.25
+// R1635：纯函数 —— 从 Telegram 错误响应体解析 retry_after（秒）。非 JSON / 无 parameters 返回 0。
+export const parseTgRetryAfter = (text: string): number => {
+  try {
+    const j = JSON.parse(text) as { parameters?: { retry_after?: number } }
+    if (j && typeof j === "object") return Number(j?.parameters?.retry_after) || 0
+  } catch { /* 非 JSON 响应 */ }
+  return 0
+}
 
-export type FloodBackoffInput = {
-  /** Telegram 给的 retry_after（秒）；0/缺省/非法 = 未给。 */
-  retryAfter?: number
-  /** 已连续挨到的 429 次数（首次 = 1）。0/缺省按"首次"处理。 */
-  attempt?: number
-  /** 退避基数（秒），默认 60。 */
-  baseSeconds?: number
-  /** 封顶（秒），默认 900；小于 base 时按 base 处理。 */
-  capSeconds?: number
-  /** 抖动比例 0..1，默认 0.25。0 = 无抖动（完全确定）。 */
-  jitter?: number
-  /** 注入 [0,1) 随机数，供测试确定化；缺省取 0.5。 */
-  rand?: number
+// R1635：纯函数 —— 冷却判断。until=冷却截止 ms；now=当前 ms。true=仍在冷却（跳过 rename）。
+export const renameCooling = (until: number, now: number): boolean => until > now
+
+// R1834：纯函数 —— 由 setMyName/setMyShortDescription 的失败响应算出"本次冷却秒数"。
+//
+// 缺口：旧逻辑只在 `retryAfter > 0` 时才 noteRename429()。若 Telegram（或中间的
+// 网关/代理）回 429 但响应体**不可解析**（无 parameters.retry_after），就**不装冷却**，
+// 而 poll 每 60s 会再调一次 → 持续 hammer，可能把限流拖得更久。429 必须**始终**装冷却。
+// 规则：
+//   * retryAfter > 0             → 用原值（保留"尊重 TG 给的超长 retry_after"这一既有行为）；
+//   * status===429 且 retryAfter≤0 → 用保守兜底（默认 300s）；
+//   * 其它状态且无 retry_after    → 0（瞬态错误不额外冷却，允许下轮 poll 重试）。
+// 非有限/负数 retryAfter 视为"未给"。
+export const rename429Seconds = (status: number, retryAfterSec: number, fallbackS = 300): number => {
+  const ra = Number(retryAfterSec)
+  if (Number.isFinite(ra) && ra > 0) return Math.max(1, Math.floor(ra))
+  return status === 429 ? Math.max(1, Math.floor(fallbackS)) : 0
+}
+
+// R1844：纯函数 —— botname-429.json 的写入合并。冷却截止是**单调**时间戳，逐 bot 取 max。
+// 账本跨 bot/跨实例（重载）共享且是 read-modify-write：取 max 保证并发写不会把某 bot 的冷却改小，
+// 顺带规范化掉非正/非法条目。返回值可直接 atomicWrite 落盘。
+export const mergeRename429Until = (
+  disk: Record<string, { until?: number } | undefined>,
+  bot: string,
+  until: number,
+): Record<string, { until: number }> => {
+  const out: Record<string, { until: number }> = {}
+  for (const [k, v] of Object.entries(disk)) {
+    const u = Number(v?.until) || 0
+    if (u > 0) out[k] = { until: u }
+  }
+  out[bot] = { until: Math.max(out[bot]?.until ?? 0, Number(until) || 0) }
+  return out
+}
+
+// R1856：纯函数 —— 有界 LRU 的 `touch`（用于 ownSessions）。
+// 缺口：旧实现只有 `set.add(sid)` + 超限删首个。Set 对**已存在**元素 add **不改变顺序**，
+// 所以"仍在活跃投递、但插入最早"的会话会被当成最旧淘汰，而刚重复投递的会话得不到保护。
+// 淘汰后隔离门 `ownOk` 可能不再认它（`ownSessions.has` 为 false）→ 非主实例偶发
+// "不再跟这个会话"（用户体感：bot3 有时不发）。改为先 delete 再 add 置尾，实现真 LRU。
+// 越界时从**表头**（最久未 touch）开始删，直到回到 cap；非 ses_ 前缀直接忽略。
+export const touchOwnSession = (set: Set<string>, sid: string, cap: number): void => {
+  if (!sid || !sid.startsWith("ses_")) return
+  set.delete(sid)
+  set.add(sid)
+  const limit = Number.isFinite(cap) && cap >= 0 ? Math.floor(cap) : 0
+  while (set.size > limit) {
+    const oldest = set.values().next()
+    if (oldest.done) break
+    set.delete(oldest.value)
+  }
 }
 
 // R1850：poll 循环 catch 的**错误分类**（纯函数，可单测）。
@@ -2103,8 +2675,8 @@ export const isRoutinePollError = (why: string): boolean => {
 // update、offset 不变，下一次轮询立即重试即可自愈。旧实现把**任何**非 2xx 一律
 // `getUpdates failed: …` 打 error（5xx 也照打）→ 服务端抖动一次就污染"近 N 分钟 0 error"
 // 健康信号（R1850 已在 catch 路径修过同一族，这里补全响应分支）。
-// 但 409（同一 token 有第二个轮询者）、401/400/403 是**真错误/真配置问题**，必须保留 error。
-// 故判据**只认 5xx** 为 routine。
+// 但 409（同一 token 有第二个轮询者）、401/400/403 是**真错误/真配置问题**，必须保留 error：
+// 409 暴露重复轮询者，坏 token 需要人介入。故判据**只认 5xx** 为 routine。
 export const isRoutinePollStatus = (status: number): boolean => {
   const s = Number(status)
   return Number.isFinite(s) && s >= 500 && s < 600
@@ -2137,6 +2709,37 @@ export const normalizeCmd = (text: string): string => {
   const t = String(text ?? "")
   if (!t.startsWith("/")) return ""
   return t.slice(1).split(/[\s@]/)[0].toLowerCase()
+}
+
+// R1636：纯函数 —— 速率限制（429）时"下一次循环该等多久"的**指数退避**。
+// 背景：原 floodWaitSeconds 是**平**的 —— 不管连着挨几次 429，只要 Telegram
+// 给的 retry_after 一样大，等待就一样长，于是"冷却结束→再打一次→再 429"以
+// 固定节奏无限循环，把 bot 永久锁在限流里（Telegram 反而越给越长的 retry_after）。
+// 现在：连续第 n 次 429 的等待 = max(指数项 base·2^(n-1), Telegram 的 retry_after)，
+// 封顶 cap；**成功一次即清零** attempt。抖动（jitter）让多 Bot / 多会话的重试
+// 不在同一个毫秒撞上，避免"齐步走"再次触发限流。
+// 不变量：返回值**永远 ≥ min(cap, Telegram 要求的 retry_after)**（抖动因子 ≥1）。
+// ⚠️ retry_after > cap（默认 900s）时**不**成立 —— 超大 retry_after 会被 cap 收敛
+// （有意为之，见测试"retry_after 巨大时按 cap 收敛"）。准确表述是"最慢每 cap 秒重试一次"，
+// 而非"绝不早于 Telegram 允许的时间"。
+export const FLOOD_BACKOFF_BASE_S = 60
+export const FLOOD_BACKOFF_CAP_S = 900
+export const FLOOD_BACKOFF_FLOOR_S = 5
+export const FLOOD_BACKOFF_JITTER = 0.25
+
+export type FloodBackoffInput = {
+  /** Telegram 给的 retry_after（秒）；0/缺省/非法 = 未给。 */
+  retryAfter?: number
+  /** 已连续挨到的 429 次数（首次 = 1）。0/缺省按"首次"处理。 */
+  attempt?: number
+  /** 退避基数（秒），默认 60。 */
+  baseSeconds?: number
+  /** 封顶（秒），默认 900；小于 base 时按 base 处理。 */
+  capSeconds?: number
+  /** 抖动比例 0..1，默认 0.25。0 = 无抖动（完全确定）。 */
+  jitter?: number
+  /** 注入 [0,1) 随机数，供测试确定化；缺省取 0.5。 */
+  rand?: number
 }
 
 export const floodBackoffSeconds = (input: FloodBackoffInput = {}): number => {
@@ -2239,10 +2842,11 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   guardprob: "/autoguard problem toggle",
   guardweb: "/autoguard web toggle",
   guardinfo: "/autoguard",
-  // 转后台：裸命令=立刻提升当前阻塞子代理；auto=整体自动配置；shell=shell 自动后台；status=如实回显能力与原因。
+  // 转后台：裸命令=立刻提升当前阻塞子代理；auto=整体自动配置；shell=shell 自动后台；th=超时阈值；status=如实回显能力与原因。
   bg: "/background",
   bgauto: "/background auto toggle",
   bgshell: "/background shell toggle",
+  bgth: "/background th",
   bgstatus: "/background status",
   loud: "/loud",
   quiet: "/quiet",
@@ -2250,73 +2854,90 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
 
 export const buildMenuKeyboard = (
   view: string,
-  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean } = {},
+  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number } = {},
 ): unknown[][] => {
-const paused = Boolean(opts.paused)
-const stopped = Boolean(opts.stopped)
-const selfmute = Boolean(opts.selfmute)
-// 守卫开关是运行期状态（同 paused/stopped 由调用方传入）。**缺省按开**显示：
-// 装守卫的目的是停下来问人，默认显示成「关」会让人以为功能没装。
-const gProblem = opts.guard ? opts.guard.problem !== false : DEFAULT_GUARD.problem
-const gWeb = opts.guard ? opts.guard.websearch !== false : DEFAULT_GUARD.websearch
-// 整体自动转后台开关（默认关：它是行为改变，且实验开关没开时调用注定失败）。
-const bgAutoOn = Boolean(opts.bgAuto)
-// shell 自动后台开关（默认关：后台化改变响应时序，必须用户显式开）。
-const bgShellAuto = Boolean(opts.bgShellAuto)
-// 注意：inline_keyboard 的一"行"必须是**扁平的按钮数组**。
-// 之前写成 [[btn],[btn]]（行里再套数组）→ Telegram 直接 400，菜单发不出去。
-const b = (label: string, data: string): unknown => ({ text: label, callback_data: data })
-if (view === "sess") {
-  const sess = [...readSessionListSync()].slice(0, 8)
-  const rows: unknown[][] = sess.map((s: any) => [
-    { text: clean(s?.title || s?.id?.slice(0, 12) || "?", 22), callback_data: `use:${s.id}` },
-  ])
-  rows.push([b("📋 完整列表", "ma:sessions")])
-  rows.push([b("⬅️ 返回", "m:root")])
-  return rows
-}
-if (view === "push") {
+  const paused = Boolean(opts.paused)
+  const stopped = Boolean(opts.stopped)
+  const selfmute = Boolean(opts.selfmute)
+  // 守卫开关是运行期状态（同 paused/stopped 由调用方传入）。**缺省按开**显示：
+  // 装守卫的目的是停下来问人，默认显示成「关」会让人以为功能没装。
+  const gProblem = opts.guard ? opts.guard.problem !== false : DEFAULT_GUARD.problem
+  const gWeb = opts.guard ? opts.guard.websearch !== false : DEFAULT_GUARD.websearch
+  // 整体自动转后台开关（默认关：它是行为改变，且实验开关没开时调用注定失败）。
+  const bgAutoOn = Boolean(opts.bgAuto)
+  // shell 自动后台开关（默认关：后台化改变响应时序，必须用户显式开）。
+  const bgShellAuto = Boolean(opts.bgShellAuto)
+  // 插件层 shell>N 秒转后台阈值（R1505 起可调；缺省 60s）。
+  const bgMs = Number.isFinite(Number(opts.bgPromoteMs)) ? Number(opts.bgPromoteMs) : 60_000
+  // 菜单阈值按钮：轮切到下一档，按钮文案带目标档，回调把目标秒数带给命令。
+  const bgThNext = (ms: number): number => {
+    const i = BG_TH_STEPS.indexOf(ms)
+    return BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] ?? BG_TH_STEPS[0] ?? 60_000
+  }
+  // 注意：inline_keyboard 的一"行"必须是**扁平的按钮数组**。
+  // 之前写成 [[btn],[btn]]（行里再套数组）→ Telegram 直接 400，菜单发不出去。
+  const b = (label: string, data: string): unknown => ({ text: label, callback_data: data })
+  if (view === "sess") {
+    const sess = [...readSessionListSync()].slice(0, 8)
+    const rows: unknown[][] = sess.map((s: any) => [
+      { text: clean(s?.title || s?.id?.slice(0, 12) || "?", 22), callback_data: `use:${s.id}` },
+    ])
+    rows.push([b("📋 完整列表", "ma:sessions")])
+    rows.push([b("⬅️ 返回", "m:root")])
+    return rows
+  }
+  if (view === "push") {
+    return [
+      [b("🔊 全部推送", "ma:loud"), b("🔇 推送设置", "ma:quiet")],
+      [b(paused ? "▶️ 恢复推送" : "⏸ 暂停推送", paused ? "ma:resume" : "ma:pause")],
+      [b("注入:立即", "ma:inject_now"), b("注入:回合后", "ma:inject_idle")],
+      [b("附加镜像列表", "ma:watch"), b("清空镜像", "ma:unwatch")],
+      [b("⬅️ 返回", "m:root")],
+    ]
+  }
+  if (view === "loop") {
+    // 只放「循环/回合/守卫」——后台相关挪去独立的 bg 页，队列/补发挪去 sys（R1505 归组）。
+    return [
+      [b("⏹ 停止当前回合", "ma:stop"), b("🔁 重试上一条", "ma:retry")],
+      [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop")],
+      [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
+      [b("🛡 守卫详情/最近触发", "ma:guardinfo")],
+      [b("⬅️ 返回", "m:root")],
+    ]
+  }
+  if (view === "bg") {
+    // 后台专门页（R1505）：提升 + 自动转后台 + shell 自动后台 + 阈值 + 能力状态。
+    const nextSec = Math.round(bgThNext(bgMs) / 1000)
+    return [
+      [b("🧵 立即转后台", "ma:bg")],
+      [b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto")],
+      [b(bgShellAuto ? "🖥 shell 自动后台：开" : "🖥 shell 自动后台：关", "ma:bgshell")],
+      [b("⏱ 超时阈值：" + Math.round(bgMs / 1000) + "s › " + nextSec + "s", "ma:bgth")],
+      [b("ℹ️ 后台能力/直连状态", "ma:bgstatus")],
+      [b("⬅️ 返回", "m:root")],
+    ]
+  }
+  if (view === "sys") {
+    return [
+      [b("ℹ️ 目标详情", "ma:info"), b("🕒 最近动态", "ma:digest")],
+      [b("📋 查看队列", "ma:queue"), b("🚀 立即补发", "ma:flush")],
+      [b("📡 队列置顶", "qpin"), b("🧽 清理旧按钮", "ma:stripall")],
+      [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
+      [b("❌ 错误日志", "ma:errors"), b("📜 运行日志", "ma:logs")],
+      [b("🗂 会话列表", "ma:sessions"), b("🧬 迁移到新会话", "ma:migrate")],
+      [b("🤖 版本/owner", "ma:owner"), b("🪪 我是谁", "ma:whoami")],
+      [b("❓ 帮助", "ma:help"), b("🔢 版本号", "ma:version")],
+      [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute")],
+      [b("🩹 纠正卡住的工具卡", "ma:healcards")],
+      [b("⬅️ 返回", "m:root")],
+    ]
+  }
   return [
-    [b("🔊 全部推送", "ma:loud"), b("🔇 推送设置", "ma:quiet")],
-    [b(paused ? "▶️ 恢复推送" : "⏸ 暂停推送", paused ? "ma:resume" : "ma:pause")],
-    [b("注入:立即", "ma:inject_now"), b("注入:回合后", "ma:inject_idle")],
-    [b("附加镜像列表", "ma:watch"), b("清空镜像", "ma:unwatch")],
-    [b("⬅️ 返回", "m:root")],
+    [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
+    [b("🔁 循环", "m:loop"), b("🛠 后台", "m:bg")],
+    [b("🛠 系统", "m:sys")],
   ]
-}
-if (view === "loop") {
-  return [
-    [b("⏹ 停止当前回合", "ma:stop"), b("🔁 重试上一条", "ma:retry")],
-    [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop")],
-    [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
-    [b("🛡 守卫详情/最近触发", "ma:guardinfo")],
-    [b("🧵 转后台", "ma:bg"), b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto")],
-    [b(bgShellAuto ? "🖥 shell 自动后台：开" : "🖥 shell 自动后台：关", "ma:bgshell")],
-    [b("ℹ️ 后台能力状态", "ma:bgstatus")],
-    [b("📋 查看队列", "ma:queue"), b("🚀 立即补发（外发积压+继续注入）", "ma:flush")],
-    [b("⬅️ 返回", "m:root")],
-  ]
-}
-if (view === "sys") {
-  return [
-    [b("ℹ️ 目标详情", "ma:info"), b("🕒 最近动态", "ma:digest")],
-    [b("📡 队列置顶", "qpin"), b("🧽 清理旧按钮", "ma:stripall")],
-    [b("🚀 立即补发并继续注入", "ma:flush"), b("🗑 丢弃外发队列", "ma:drop")],
-    [b("🗑 丢弃注入队列", "ma:dropq")],
-    [b("❌ 错误日志", "ma:errors"), b("📜 运行日志", "ma:logs")],
-    [b("🗂 会话列表", "ma:sessions"), b("🧬 迁移到新会话", "ma:migrate")],
-    [b("🤖 版本/owner", "ma:owner"), b("🪪 我是谁", "ma:whoami")],
-    [b("❓ 帮助", "ma:help"), b("🔢 版本号", "ma:version")],
-    [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute")],
-    [b("🩹 纠正卡住的工具卡", "ma:healcards")],
-    [b("⬅️ 返回", "m:root")],
-  ]
-}
-return [
-  [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
-  [b("🔁 循环", "m:loop"), b("🛠 系统", "m:sys")],
-]
-}
+  }
 
 export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 横幅里的 fallback 必须与运行时一致：运行时用的是 fallbackApiBase（由
@@ -2464,16 +3085,53 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
 
   // 手动停止必须写入循环总闸；否则只中断当前 turn，下一次 idle/定时评估会复活。
-  const persistLoopStop = (reason: string): void => {
-    try {
-      writeFileSync(
-        "REDACTED_ROOT/.config/opencode/loop-ctl.json",
-        JSON.stringify({ stopped: true, by: "user", reason: reason.slice(0, 160), ts: Date.now() }),
-        { encoding: "utf8", mode: PRIVATE_FILE_MODE }
-      )
-    } catch {
-      /* best-effort */
+  //
+  // R1724（用户指令「不同机器人的循环设置要求单独」）：原先 /loop stop 写的是**全局**闸
+  // → 任一 Bot 停循环，另外两个 Bot 也一起停。现在写**单 Bot 条目**（bots[BOT_ID]），
+  // sids 绑定本 Bot 当前 front 会话 → auto-continue 的 loopGateStopped 按 sid 判定，
+  // 其它 Bot 不受影响。顶层 stopped 保留给守卫（PROBLEM/WEBSEARCH 仍停全部）与
+  // `/loop stop all`；sids 每次 state save 刷新，front 切换后自动跟随。
+  const cur_front_sid = (): string => {
+    const cur = frontSessionID || persistedFront || ""
+    return cur.startsWith("ses_") ? cur : ""
+  }
+  const writeLoopCtl = (mutate: (j: any) => void): void => {
+    const cur = cur_front_sid()
+    const r = mutateLoopCtlFile((j) => {
+      if (cur) {
+        const e = (j.bots[BOT_ID] && typeof j.bots[BOT_ID] === "object" ? j.bots[BOT_ID] : {}) as any
+        e.sids = [cur]
+        j.bots[BOT_ID] = e
+      }
+      mutate(j)
+    })
+    // 写失败要留痕：静默失败会让「我点了停止但 Bot 还在跑」完全无法排查（R1724 同类症状）。
+    if (r === "err") {
+      try {
+        void log("warn", `loop-ctl write FAILED (bot=${BOT_ID}): user action may not take effect`)
+      } catch {
+        /* best-effort */
+      }
+    } else if (cur) {
+      ctlSidsSynced = cur
     }
+  }
+  const persistLoopStop = (reason: string, scopeAll = false): void => {
+    writeLoopCtl((j) => {
+      if (scopeAll) {
+        j.stopped = true
+        j.by = "user"
+        j.reason = reason.slice(0, 160)
+      } else {
+        j.stopped = false // 全局闸不动：只停本 Bot
+        const e = (j.bots[BOT_ID] ?? {}) as any
+        e.stopped = true
+        e.by = "user"
+        e.reason = reason.slice(0, 160)
+        e.ts = Date.now()
+        j.bots[BOT_ID] = e
+      }
+    })
     try {
       queuePinRequest?.()
     } catch {
@@ -2481,18 +3139,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
   }
   const clearLoopStop = (): void => {
-    try {
-      writeFileSync(
-        "REDACTED_ROOT/.config/opencode/loop-ctl.json",
-        JSON.stringify({ stopped: false, by: "user", ts: Date.now() }),
-        { encoding: "utf8", mode: PRIVATE_FILE_MODE }
-      )
-    } catch {
-      /* best-effort */
-    }
+    writeLoopCtl((j) => {
+      const e = (j.bots[BOT_ID] ?? {}) as any
+      e.stopped = false
+      e.ts = Date.now()
+      j.bots[BOT_ID] = e
+    })
   }
 
-  const SYNTHETIC_MARKERS = ["继续自动筛查循环", "上一轮自动筛查应答因可恢复错误中断"]
+  // 收敛自 turn-end-note.ts 的 SYNTHETIC_LOOP_MARKERS（防两处前缀漂移）
+  const SYNTHETIC_MARKERS = SYNTHETIC_LOOP_MARKERS
   const isSyntheticUserMsg = async (sessionID: string, msgID: string): Promise<boolean> => {
     try {
       const res = await client.session.messages({ path: { id: sessionID } })
@@ -2765,6 +3421,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // savePersistedState()，会把新实例的内存态（watch/front/队列）整体覆盖回旧值。
   G[writerGenKey()] = myGen
   instanceGen = myGen
+  // R1569：turn-end note 轮询的"实例启动时间"基准。热重载后新实例的 turnEndNotified
+  // Set 是空的——若没有这个守卫，会把**已通知过**的最近 completed 消息再补发一条重复
+  // note（每次热重载每会话可能 1 条）。只认 boot 之后完成的消息即可避免补发。
+  const turnNoteBootAt = Date.now()
+  // R1741/R1743：入站静默判据的 boot 基线。与 turnNoteBootAt 同一位置、同一语义
+  // （本代实例的启动时刻）。放模块级是因为判据要跨"没有 update"的那些轮次累积。
+  botBootAt = Date.now()
   // 429 时不让关键 proto 消息消失：按 key 保留内存重试，定时退避。
   const protoRetry = new Map<string, {
     chatID: string
@@ -2940,8 +3603,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const name = title.slice(0, 64)
     const short = `TG \\u2192 ${sid.slice(0, 12)}`
     // R1635：setMyName 响应校验 + 429 冷却跨重载持久化。
+    // 之前 fetch 200 即记成功、且提前推进 lastRenameSig —— 429 静默失败时
+    // 名称永远不更新（alt @opencodev2_bot 实测冻结 14.6h）。现改为：
     //   * 检查 HTTP status 与响应体 {ok:false, error_code, parameters.retry_after}；
-    //   * 429 时把冷却截止时间按 BOT_ID 写入 botname-429.json（reload 后仍记得）；
+    //   * 429 时把冷却截止时间按 BOT_ID 写入 botname-429.json（reload 后仍记得，防再打 429）；
     //   * lastRenameSig 仅在**两请求都成功**后推进，失败留空 → 下轮 poll 自动重试。
     const RENAME_429_PATH = "REDACTED_ROOT/.config/opencode/botname-429.json"
     let rename429Until = 0
@@ -2977,7 +3642,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (!res.ok) {
         const text = await res.text().catch(() => "")
         const retryAfter = parseTgRetryAfter(text)
-        // R1834：429 必须始终装冷却（响应体读不到 retry_after 时用兜底 300s）。
+        // R1834：429 必须始终装冷却（响应体读不到 retry_after 时用兜底 300s），
+        // 否则 poll 每 60s 重试一次会持续 hammer；非 429 且无 retry_after 不冷却。
         const coolSec = rename429Seconds(res.status, retryAfter)
         if (coolSec > 0) noteRename429(coolSec)
         throw new Error(`TG ${path} HTTP ${res.status}${retryAfter > 0 ? ` retry_after=${retryAfter}s` : ""}: ${text.slice(0, 80)}`)
@@ -3040,6 +3706,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     void resumeFallback()
   }, 2500)
   let frontSessionID: string | undefined
+  // followPrimaryFront 骨架已撤回（曾因模块级引用闭包内变量触发 TS2304 + scope-guard 失败；dim1 B 接线留待后续聚焦轮一次做完整）。
   let activeFrontOverride = ""
   const activeFront = async (): Promise<string> => {
     if (fixedTarget) return fixedTarget
@@ -3295,7 +3962,17 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (hErr) await log("error", `sendMessage chunk precheck html invalid: ${hErr}`)
         const r = await tgFetch("sendMessage", body)
         if (r.ok) {
-          if (i === 0) firstId = r.id
+          // ⚠️ R1806：`r.id` 的类型是 `number | undefined`（`callTelegram` 在 HTTP 2xx 时
+          // 有两条产路不给 id：① `result.message_id` 缺失/非数字 ② `res.json()` 抛异常）。
+          // 而 `firstId` 由上面的 `= 0` 推断成 `number`，**bun build 不报错**
+          // （strictNullChecks 关闭）→ 运行时 `undefined` 会被无声灌进来。
+          // 生产实证：R1805 在归档里查到 3 次该形态（`proto send sent` 且消息其实已送达）。
+          //
+          // 所以**不要**在这里写 `firstId = r.id ?? 0` 之类"修补"：0 与 undefined 语义不同，
+          // 而真正的容错在调用点 —— `protoDeliveryVerdict` 把两者都判成
+          // `delivered:true, degraded:true`（已送达但无法锚定卡片）。
+          // 本行保持原样，是为了让"送达但无 id"这个事实能原样传上去。
+          if (i === 0) firstId = r.id as number
           continue
         }
         const status = r.status ?? 0
@@ -3372,6 +4049,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return { r: "retry", status, desc: status || "network-exception" }
     }
     if (status === 400) {
+      // HTML 非法（如标签错位）：剥标签纯文本降级重发一次，保证送达；键保留（400 错在正文不在 markup）。
       // R1888：同分段路径 —— **先解码、后剥标签**，否则剥标签打在转义文本上是空操作，
       // 解码又把标签还原成字面文本，降级反而把 `<b>`/`<pre>` 送到用户面前。
       const plain = text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/<[^>]*>/g, "")
@@ -4020,7 +4698,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return
     }
     const r = await sendTextRaw(chatID, text, kb, silent)
-    if (r.r === "sent" && r.id) {
+    // R1802：送达判定交给纯函数（原型是 `r.r==="sent" && r.id`，会把"已送达但无 id"读成失败）
+    const dv = protoDeliveryVerdict(r)
+    if (dv.delivered && !dv.degraded && r.id) {
       protoMap.set(key, { id: r.id, text, fallback: r.fallback === true })
       noteHash()
       savePersistedState()
@@ -4031,13 +4711,97 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       // 只有最新回复保留按钮：新回复落地即扒掉上一条同会话回复的键
       if (kb && r.fallback !== true) await trackReplyButtons(sess, chatID, r.id, kb, key)
+      // R1728：投递成功 → 刷新桥侧最后投递时间戳（静默断流 watchdog 用）
+      lastProtoSendAt = Date.now()
       await log("info", `proto send ok (${sanitizeLog(key)}) msg=${r.id} len=${text.length} h=${h ? h.slice(0, 8) : "-"}`)
+    } else if (dv.delivered) {
+      // R1802：**TG 已接受、用户已收到**，只是没回 message_id → 我方无法锚定这张卡（不能
+      // protoMap.set、不能挂按钮）。绝不能 rollback（会把已送达当未投递再走重试/降级），
+      // 也不能不刷新 lastProtoSendAt（否则 R1728 watchdog 基线被污染成误报）。
+      // 注意文案：**不用 error 级**——原实现在这里记 `proto send sent` 且级别为 error，
+      // 造成"措辞说成功、级别说失败"，任何按级别或按关键字的判据都会读错一边。
+      noteHash()
+      savePersistedState()
+      lastPushAt = new Date().toISOString()
+      if (sess) touchActivity(sess)
+      lastProtoSendAt = Date.now()
+      await log("warn", `proto send degraded (${sanitizeLog(key)}) no message_id, 无法锚定卡片: ${dv.why}`)
     } else {
       rollback()
       if (r.r === "retry") scheduleProtoRetry(key, chatID, text, kb, silent)
       await log("error", `proto send ${r.r} (${sanitizeLog(key)}) len=${text.length}`)
     }
   }
+
+  // R1607：shell 提升到后台 → 在「原来消息」（执行中卡片）末尾追加一行提示。
+  // 用户指令：「在shell提升到后台时，在原来消息末尾增加一行提示」。
+  // _v2compat 的 bg-watch promote 成功后调全局钩子 __oc_bg_promoted_hooks__（fn(sid, evId)）。
+  // R1609：只编辑"新鲜"卡（runningAt 距今 ≤ 阈值）；R1610：改精确 key 定位（evId），不再扫描。
+  const PROMOTED_HINT_FRESH_MS =
+    Number(process.env.TG_PROMOTED_HINT_FRESH_MS ?? "") || HINT_FRESH_MS_DEFAULT
+  const noteShellPromoted = async (sid: string, callID?: string): Promise<void> => {
+    try {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      const chat = pushChatResolve()
+      if (!chat) return
+      // R1610：只编辑**被 promote 的那个调用**的卡（精确 key），不再扫描 protoMap。
+      // 实证背景：①扫描+「第一个新鲜 running 卡」启发式会把提示追加到错误的历史卡
+      // （12:57:44 事件：被 promote 的是 call_df3a407…，提示却落到 12:56:38 的 call_39205af 卡 msg=14220）；
+      // ②protoMap 累积了数百条 runningAt>0 的历史卡，一次扫卡打出 470 行 warn 日志洪泛。
+      // 钩子现在由 bg-watch 携带 evId（watch key 第三段，v2 为 call_XXX、TUI 为 call_function_XXX），
+      // 与桥推卡用的 :input 键同名 → 精确命中；找不到就干净跳过，绝不猜测改别的卡。
+      if (!callID) {
+        await log("info", `shell promoted hint: no callID provided (sid=${String(sid).slice(0, 12)}) skip`)
+        return
+      }
+      const exactKey = `${sid}:tool:${callID}:input`
+      const rec = protoMap.get(exactKey)
+      if (!rec || Number(rec?.runningAt ?? 0) <= 0) {
+        await log("info", `shell promoted hint: promoted tool card not found (sid=${String(sid).slice(0, 12)}, key=${sanitizeLog(exactKey).slice(0, 70)}) skip`)
+        return
+      }
+      // 兜底新鲜度（正常情况被 promote 的卡必为本进程数秒内所推；防御跨代残留同名卡）
+      if (!isFreshRunningCard(rec, Date.now(), PROMOTED_HINT_FRESH_MS)) {
+        await log("warn", `shell promoted hint: promoted card stale (key=${sanitizeLog(exactKey).slice(0, 70)}) skip`)
+        return
+      }
+      const msgId = rec.id
+      if (!(msgId > 0)) {
+        await log("warn", `shell promoted hint: card has no msg id (key=${sanitizeLog(exactKey).slice(0, 60)})`)
+        return
+      }
+      const base = rec.text ?? ""
+      // 去重：已带 ⏫ / 「已转入后台」就不再追加（promote 可能多次触发），
+      // 文案与追加逻辑在纯函数模块（bg-hint.ts，可单测）
+      if (hasShellBgHint(base)) {
+        await log("info", `shell promoted hint: already hinted (key=${sanitizeLog(exactKey).slice(0, 60)}) skip`)
+        return
+      }
+      const newText = appendShellBgHint(base)
+      if (newText === base) return
+      const r = await editTextRaw(chat, msgId, newText, undefined, rec.fallback === true)
+      if (r.r === "sent") {
+        protoMap.set(exactKey, { ...rec, text: newText })
+        savePersistedState()
+        await log("info", `shell promoted hint appended (key=${sanitizeLog(exactKey).slice(0, 60)}) msg=${msgId}`)
+      } else if (r.r === "retry") {
+        await log("warn", `shell promoted hint retry needed (key=${sanitizeLog(exactKey).slice(0, 60)})`)
+      }
+    } catch (err) {
+      await log("warn", `shell promoted hint failed: ${sanitizeLog(String(err)).slice(0, 120)}`)
+    }
+  }
+
+  // 注册到全局钩子：同进程多 bot 实例各自注册（每个实例只改自己 protoMap 里的卡）。
+  // 旧 generation 的闭包经 GEN_KEY 检查不再触网；上限防热重载无限累积。
+  {
+    const G = globalThis as any
+    const key = "__oc_bg_promoted_hooks__"
+    const arr = Array.isArray(G[key]) ? G[key] : (G[key] = [])
+    arr.push({ fn: noteShellPromoted })
+    if (arr.length > 16) arr.splice(0, arr.length - 16)
+  }
+
   const fenceSafe = (s: string): string => String(s ?? "").replace(/```/g, "'''")
   const partTime = (p: any): number => {
     const t = Number(p?.time?.created ?? p?.info?.time?.created ?? 0)
@@ -4048,10 +4812,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const s = ts ? fmtClock(ts) : ""
     return `${base}${s ? ` · ${s}` : ""}${ctxSuffix(sid)}`
   }
-  const protoBlock = (title: string, body: string): string => {
-    const lines = body.split("\n").map((l) => htmlEsc(l))
-    return `<b>${htmlEsc(title)}</b>\n${lines.join("\n")}`.replace(/&lt;b&gt;/g, "<b>").replace(/&lt;\/b&gt;/g, "</b>")
-  }
+  const protoBlock = (title: string, body: string): string => renderProtoBlock(title, body)
 
   const pushQuestionCard = async (sessionID: string, chatID: string, callID: string, st: any): Promise<void> => {
     const qs = (st?.input as any)?.questions
@@ -4141,12 +4902,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const txt = String(p.text ?? "").trim()
         const rm0 = filt("reply")
         if (txt && !isInternalLog(txt) && rm0 > 0) {
-          const rm = txt.match(/\[ROUND\s*(\d+)\]/)
-          if (rm) {
-            lastRound.set(sessionID, rm[1])
+          const rnd = extractRound(txt)
+          if (rnd) {
+            lastRound.set(sessionID, rnd)
             savePersistedState()
           }
-          const rbody = rm0 === 1 ? "" : fenceSafe(mdBoldToHtml(txt))
+          const rbody = rm0 === 1 ? "" : fenceSafe(mdTableToHtml(mdBoldToHtml(txt)))
           const base = tag ? `${tag} · 💬 回复` : "💬 回复"
           await protoSend(`${sessionID}:message:${msgKey}:${pIdx}`, chatID, protoBlock(ptitle(base, p, m, sessionID), rbody), true, undefined, undefined, undefined, force)
         }
@@ -4171,7 +4932,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const toolClock = fmtClock(partTime(p) || partTime(m)) || fmtClock(Date.now())
         // 标注为「开始」：这个时刻是工具 part 的创建时刻，长命令下与 Telegram 显示的
         // 发送时刻会差几分钟（用户报"标记时间与实际发送时间相差3分钟"）。不标注就像错位。
-        const header = `<b>🔧 ${htmlEsc(dispName)} 执行 · 开始 ${toolClock}${ctxSuffix(sessionID)}</b>`
+        const header = `<b>🔧 ${htmlEsc(dispName)} 执行 · 开始 ${toolClock}${htmlEsc(ctxSuffix(sessionID))}</b>`
         const codeBlock = (lang: string, code: string): string =>
           `<blockquote><pre><code${lang ? ` class="language-${lang}"` : ""}>${htmlEsc(code)}</code></pre></blockquote>`
         const foldPreview = (text: string): { preview: string; folded: boolean; more: string } => {
@@ -4367,6 +5128,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const lastRealPush = new Map<string, number>()
   let lastPushAt = ""
   let eventCount = 0
+  // R1565：已发过「本轮完成/输出结束」短提示的 (session:msgId)，同一条消息只发一次。
+  const turnEndNotified = new Set<string>()
   const fetchTail = async (sessionID: string, n: number): Promise<any[] | null> => {
     try {
       const res = await client.session.messages({ path: { id: sessionID } })
@@ -4523,7 +5286,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // "AI 没结束就注入"重新引回来。要"立刻注入"的语义请走队列并把 injectMode 设为相应值，
   // 不要新写直注函数。
   const doPrompt = async (target: string, text: string, ctx: string, allowStopped = false): Promise<string> => {
-    if (loopStopped() && !allowStopped) return "loop stopped（已暂停注入；/loop start 恢复）"
+    if (loopStopped() && !allowStopped) return `loop stopped（本 Bot=${BOT_ID} 已暂停注入；/loop start 恢复本 Bot，其它 Bot 不受影响）`
     const startedAt = Date.now()
     const wasAlreadyStopped = loopStopped()
     try {
@@ -5140,13 +5903,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(
         chatID,
         [
-          "用法：<b>/addbot &lt;token&gt; [chatId] [标签]</b>",
+          "用法：/addbot <token> [chatId] [标签]",
           "",
-          "· <code>token</code> —— BotFather 给的 token（形如 <code>123456:ABC…</code>）",
-          "· <code>chatId</code> —— 允许对话的 chat；<b>省略就用当前会话</b>",
-          "· <code>标签</code> —— 可选，给人看的名字",
+          "· token —— BotFather 给的 token（形如 123456:ABC…）",
+          "· chatId —— 允许对话的 chat；省略就用当前会话",
+          "· 标签 —— 可选，给人看的名字",
           "",
-          "例：<code>/addbot 123456:ABC… 123456789 第三个</code>",
+          "例：/addbot 123456:ABC… 123456789 第三个",
           "",
           "⚠️ 登记完还要你**手动把新机器人拉进这个会话**（机器人无法自己加人）。",
           "⚠️ token 请先在 BotFather 用 /revoke 作废旧的再换新的 —— 贴到聊天里的等于泄露。",
@@ -5157,7 +5920,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     if (!TG_TOKEN_RE.test(tokenForNewBot)) {
       await reply(
         chatID,
-        "❌ token 格式不对。应是 BotFather 给的 <code>数字:字母数字</code>（冒号前 6–12 位数字，冒号后 ≥30 位）。",
+        "❌ token 格式不对。应是 BotFather 给的 数字:字母数字（冒号前 6–12 位数字，冒号后 ≥30 位）。",
       )
       return
     }
@@ -5167,7 +5930,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // 验真：失败就不碰注册表（不留僵尸条目）
     const v = await verifyBotToken(tokenForNewBot)
     if (!v.ok) {
-      await reply(chatID, `❌ token 无效，Telegram 拒绝：<code>${htmlEsc(v.desc ?? "未知错误")}</code>\n（注册表未改动）`)
+      await reply(chatID, `❌ token 无效，Telegram 拒绝：${v.desc ?? "未知错误"}\n（注册表未改动）`)
       return
     }
 
@@ -5192,7 +5955,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
 
     const reg = registerBot(id, label.slice(0, 40), tokenForNewBot, targetChat)
     if (!reg.ok) {
-      await reply(chatID, `❌ 登记失败：<code>${htmlEsc(reg.desc ?? "")}</code>`)
+      await reply(chatID, `❌ 登记失败：${reg.desc ?? ""}`)
       return
     }
     const entry = triggerBridgeReload()
@@ -5200,13 +5963,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     await reply(
       chatID,
       [
-        `✅ 已登记 <b>${htmlEsc(id)}</b>${v.username ? `（@${htmlEsc(v.username)}）` : ""}`,
-        `· 标签：${htmlEsc(label)}`,
-        `· 允许会话：<code>${htmlEsc(targetChat)}</code>`,
-        `· 已触发桥侧重载：<code>${htmlEsc(entry.split("/").pop() ?? entry)}</code>`,
+        `✅ 已登记 ${id}${v.username ? `（@${v.username}）` : ""}`,
+        `· 标签：${label}`,
+        `· 允许会话：${targetChat}`,
+        `· 已触发桥侧重载：${entry.split("/").pop() ?? entry}`,
         "",
-        "还差一步（我做不了）：<b>请把这个新机器人拉进目标会话</b>，它才能收到消息。",
-        "若 1–2 分钟内没看到它的 <code>plugin loaded (bot=${htmlEsc(id)}…</code>，说明没起来，把 /info 发我看。",
+        "还差一步（我做不了）：请把这个新机器人拉进目标会话，它才能收到消息。",
+        `若 1–2 分钟内没看到它的 plugin loaded (bot=${id}…，说明没起来，把 /info 发我看。`,
       ].join("\n"),
     )
     await log("info", `addbot registered id=${id} username=${v.username ? "@" + v.username : "?"} chat=${sanitizeLog(targetChat).slice(0, 16)} (token 未记录)`)
@@ -5268,12 +6031,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const e1 = writeIdList(LOOP_OFF_FILE, off.filter((x) => x !== target))
       const e2 = writeIdList(LOOP_SESSIONS_FILE, [...list.filter((x) => x !== target), target])
       if (e1 || e2) {
-        await reply(chatID, `❌ 写入失败：<code>${htmlEsc(e1 || e2)}</code>`)
+        await reply(chatID, `❌ 写入失败：${e1 || e2}`)
         return
       }
       await reply(
         chatID,
-        `✅ 本会话循环<b>已开</b>：${htmlEsc(tag)}
+        `✅ 本会话循环已开：${tag}
 （只影响这一个会话；全局闸用 /loop stop）`,
       )
       await log("info", `loop scope on sid=${sanitizeLog(target).slice(0, 14)} (per-session)`)
@@ -5281,12 +6044,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const e1 = writeIdList(LOOP_OFF_FILE, [...off.filter((x) => x !== target), target])
       const e2 = writeIdList(LOOP_SESSIONS_FILE, list.filter((x) => x !== target))
       if (e1 || e2) {
-        await reply(chatID, `❌ 写入失败：<code>${htmlEsc(e1 || e2)}</code>`)
+        await reply(chatID, `❌ 写入失败：${e1 || e2}`)
         return
       }
       await reply(
         chatID,
-        `⏸ 本会话循环<b>已关</b>：${htmlEsc(tag)}
+        `⏸ 本会话循环已关：${tag}
 （其它会话不受影响；全局闸用 /loop stop）`,
       )
       await log("info", `loop scope off sid=${sanitizeLog(target).slice(0, 14)} (per-session)`)
@@ -5432,10 +6195,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const FILT_NAME: Record<string, string> = { reply: "💬 回复", think: "🧠 思考", tool: "🔧 工具", status: "✅ 完成" }
   const FILT_STATE = ["隐去", "仅标题", "全部"] as const
   const filtLine = (): string => {
-  const short: Record<"reply" | "think" | "tool" | "status", string> = { reply: "回", think: "思", tool: "具", status: "态" }
-  return "flt=" + (Object.keys(short) as Array<"reply" | "think" | "tool" | "status">).map((k) => `${short[k]}${filt(k)}`).join("") + (compactPrefs.auto ? ` 压开${Math.round(compactPrefs.threshold * 100)}` : " 压关") + (injectMode === "idle" ? " 注等" : " 注直")
-}
-const filterMenu = (): { text: string; kb: unknown[][] } => {
+    const short: Record<"reply" | "think" | "tool" | "status", string> = { reply: "回", think: "思", tool: "具", status: "态" }
+    return "flt=" + (Object.keys(short) as Array<"reply" | "think" | "tool" | "status">).map((k) => `${short[k]}${filt(k)}`).join("") + (compactPrefs.auto ? ` 压开${Math.round(compactPrefs.threshold * 100)}` : " 压关") + (injectMode === "idle" ? " 注等" : " 注直")
+  }
+  const filterMenu = (): { text: string; kb: unknown[][] } => {
     const lines = ["🔇 推送过滤（点按钮切换：隐去→仅标题→全部）", "🗜 压缩设置（自动压缩开关 · 阈值轮切）"]
     const kb: unknown[][] = []
     for (const k of ["reply", "think", "tool", "status"] as const) {
@@ -5459,7 +6222,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
   // ── 单一按钮菜单 ──────────────────────────────────────────────
   // 目标：命令数量收敛到手机上一屏可点。命令本身全部保留（文本备用），
   // 但日常操作只需要点菜单；菜单消息**就地编辑**，任何时候只有一条。
-  const MENU_VIEWS = ["root", "sess", "push", "loop", "sys"] as const
+  const MENU_VIEWS = ["root", "sess", "push", "loop", "bg", "sys"] as const
   const menuText = (view: string): string => {
     const t = fixedTarget ?? frontSessionID ?? persistedFront
     const nm = t ? sessionTag(t) : "(未确定)"
@@ -5486,10 +6249,22 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     if (view === "loop") {
       return [
         head,
-        loopStopped() ? "⏹ 自动循环：已停止（点“继续循环”恢复）" : "🔁 自动循环：运行中（ESC 或点“停止循环”可停）",
+        loopStopped() ? "⏹ 自动循环：本 Bot 已停止（点“继续循环”恢复；其它 Bot 不受影响）" : "🔁 自动循环：本 Bot 运行中（ESC 或点“停止循环”仅停本 Bot）",
         `注入队列：${pinQueue.length} · 外发队列：${outQueue.length}`,
         "",
-        "点下面控制。",
+        "只放循环/回合/守卫。后台相关在「后台」页。",
+      ].join("\n")
+    }
+    if (view === "bg") {
+      const bg = readBg()
+      return [
+        head,
+        `进程内后台 RPC：${bgApiLabel(bgApiShape(client))}`,
+        `实验开关 ${BG_ENV_VAR}：${bgEnvOn() ? "开" : "未开"}`,
+        `自动转后台：${bg.enabled ? "开" : "关"} · shell 自动后台：${bg.shellPromo !== false ? "开" : "关"}`,
+        `插件层超时阈值：${Math.round(bg.promoteMs / 1000)}s（跑超自动转后台） · 冷却 ${Math.round(bg.cooldownMs / 1000)}s`,
+        "",
+        "点下面调整后台行为；阈值按钮点一下轮换档位。",
       ].join("\n")
     }
     if (view === "sys") {
@@ -5507,7 +6282,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       head,
       `目标会话：<b>${htmlEsc(nm)}</b>`,
       "",
-      "全部功能都在这里：会话 / 推送 / 循环 / 系统。",
+      "按主题分页：会话 / 推送 / 循环 / 后台 / 系统。",
     ].join("\n")
   }
   // 薄包装：把运行期状态喂给模块级的真定义（测试直接调 buildMenuKeyboard）
@@ -5524,7 +6299,11 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       guard: readGuard(),
       bgAuto: readBg().enabled,
       bgShellAuto: readBg().shellPromo !== false,
+      bgPromoteMs: readBg().promoteMs,
     })
+  // R1646：每个 chat 当前打开的菜单视图（root/子页）。ma 动作执行后「原地刷新」当前视图，
+  // 而不是拽回根页 —— 用户明确要"点按钮不回到主菜单"。sync 时保持与 card 一致。
+  const menuViewNow = new Map<string, string>()
   const handleCallback = async (cq: any): Promise<void> => {
     try {
     const data = String(cq?.data ?? "")
@@ -5566,6 +6345,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const kb = menuKeyboard(view)
       const target = cchat
       const text = menuText(view)
+      menuViewNow.set(target, view)
       if (view === "root") {
         // 根菜单就地编辑成子菜单，避免每点一次多出一条消息
         const mid = Number(cq?.message?.message_id ?? 0)
@@ -5617,10 +6397,14 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       // 「完成/关闭」按钮收尾。
       const SUBMENU_ACTIONS = new Set(["quiet"])
       if (mid && !SUBMENU_ACTIONS.has(act)) {
-        // 执行完把菜单收回根页，保持"只有一条菜单消息"
-        const kb = menuKeyboard("root")
-        const r = await editTextRaw(cchat, mid, menuText("root"), kb, false)
-        if (r.r === "sent") protoMap.set(`menu:${cchat}`, { id: mid, text: menuText("root"), fallback: false })
+        // R1646：执行完**原地刷新当前视图**（用户所在子页），不再拽回根页。
+        // 保持"只有一条菜单消息"不变（仍是 edit 而非 send），并让按钮顺带刷新运行期状态
+        // （暂停/停止/守卫/后台开光等）。从未记录过视图时缺省 root，行为与旧版一致。
+        const curView = menuViewNow.get(cchat) ?? "root"
+        const kb = menuKeyboard(curView)
+        const body = menuText(curView)
+        const r = await editTextRaw(cchat, mid, body, kb, false)
+        if (r.r === "sent") protoMap.set(`menu:${cchat}`, { id: mid, text: body, fallback: false })
       } else if (mid) {
         await log("info", `menu action opened submenu, card kept (act=${act})`)
       }
@@ -6151,7 +6935,7 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       }
       const prevUse = fixedTarget ?? frontSessionID ?? persistedFront
       const id = await resolveSessionID(want)
-      // R1819：文本 /use 必须与回调 /use 同一不变量 —— 只接受真实 ses_ 目标。
+      // R1819：文本 /use 必须与回调 /use（L5882）同一不变量 —— 只接受真实 ses_ 目标。
       // 此前 resolveSessionID 未命中时原样返回 want（拼错的名称 / 越界序号 / 命中不到的片段），
       // 这里却无条件 fixedTarget=id → 钉到一个不存在的会话，之后消息"发不出去 / 发错会话"
       // （用户反馈"不能正确选择会话"）。未命中必须明确报错且**不改动**当前目标。
@@ -6340,7 +7124,13 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const c = pushChatResolve() || chatID
       const body = menuText("root")
       const r = await sendTextRaw(c, body, menuKeyboard("root"), false)
-      if (r.r === "sent" && r.id) protoMap.set(`menu:${c}`, { id: r.id, text: body, fallback: false })
+      // R1802：判据与主投递路径同源。缺 message_id 时菜单**已送达**（用户看得见），
+      // 只是无法锚定这张卡 → 后续切页会改为新发一张。仅记 warn，不 rollback。
+      const mdv = protoDeliveryVerdict(r)
+      if (mdv.delivered && r.id) protoMap.set(`menu:${c}`, { id: r.id, text: body, fallback: false })
+      else if (mdv.delivered)
+        await log("warn", `menu degraded (chat=${sanitizeLog(c)}) no message_id，菜单已送达但无法锚定`)
+      menuViewNow.set(c, "root")
       return
     }
     if (text === "/help" || cmd === "help" || text === "/start" || cmd === "start") {
@@ -6490,21 +7280,40 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         }
         return {}
       }
-      if (arg === "stop") {
+      const scopeAll = arg === "stop all"
+      if (arg === "stop" || scopeAll) {
         // R1061：/loop stop 必须**总是**写共享总闸。旧实现 target 存在时只 doStop
         // （doStop 刻意不写总闸，避免卡上 ⏹ 误停两会话），总闸停在 stopped=false，
         // auto-continue 每分钟继续评估 → "命令暂停后循环仍然跑"。
-        persistLoopStop("user /loop stop")
+        persistLoopStop(scopeAll ? "user /loop stop all" : "user /loop stop", scopeAll)
         const target = fixedTarget ?? (await activeFront())
         if (target) await doStop(target)
-        await reply(chatID, "[tg-bridge] loop stopped（已写停机总闸，仅 /loop start 或人工再开能恢复）")
+        await reply(
+          chatID,
+          scopeAll
+            ? "[tg-bridge] loop stopped（**全部 Bot** 已停：全局闸写入，仅 /loop start all 恢复）"
+            : `[tg-bridge] loop stopped（本 Bot=${BOT_ID} 已停循环；其它 Bot 不受影响。/loop start 恢复本 Bot，/loop stop all 可停全部）`
+        )
         return
       }
-      if (arg === "start") {
-        clearLoopStop()
+      if (arg === "start" || arg === "start all") {
+        const all = arg === "start all"
+        if (all) {
+          writeLoopCtl((j) => {
+            j.stopped = false
+            for (const k of Object.keys(j.bots ?? {})) (j.bots[k] as any).stopped = false
+          })
+        } else {
+          clearLoopStop()
+        }
         const target = fixedTarget ?? (await activeFront())
         if (target && haltedSet.delete(target)) savePersistedState()
-        await reply(chatID, "[tg-bridge] loop armed（仅当前 TG 目标会话；/loop stop 或停止键可再次暂停）")
+        await reply(
+          chatID,
+          all
+            ? "[tg-bridge] loop armed（全部 Bot 已恢复循环）"
+            : `[tg-bridge] loop armed（本 Bot=${BOT_ID} 已恢复循环；其它 Bot 保持各自状态。/loop start all 可恢复全部）`
+        )
         // 显式 start 后才恢复停止期间挂起的注入队列。
         for (const sid of new Set(pinQueue.map((qq) => qq.sid))) void pumpInject(sid)
         void refreshQueuePin()
@@ -6513,11 +7322,28 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const ctl = readCtl()
       const stopped = ctl?.stopped === true
       const by = stopped && ctl?.by ? ` by=${ctl.by}` : ""
+      // R1724：逐 Bot 闸状态（用户要求「不同机器人的循环设置要求单独」）。
+      const botGates: string[] = (() => {
+        try {
+          const bots = (ctl?.bots ?? {}) as Record<string, { stopped?: unknown; sids?: unknown }>
+          const names = Object.keys(bots).sort()
+          if (names.length === 0) return []
+          return names.map((k) => {
+            const e = bots[k] ?? {}
+            const st = e.stopped === true ? "停" : "运行"
+            const sid0 = Array.isArray(e.sids) && typeof e.sids[0] === "string" ? (e.sids[0] as string).slice(0, 12) : "-"
+            return `${k}=${st}${sid0}`
+          })
+        } catch {
+          return []
+        }
+      })()
       // 逐会话如实播报：只说全局"running"会掩盖"某个会话其实没在循环"——
       // 这正是用户报告"另一个会话总是不循环"却从状态里看不出来的原因。
       const lines: string[] = [
-        `[tg-bridge] loop status: ${stopped ? `stopped${by}（/loop start 恢复）` : "running（用户主动停止前一直循环）"}`,
+        `[tg-bridge] loop status: ${stopped ? `stopped${by}（全局闸，/loop start all 恢复）` : "running（用户主动停止前一直循环）"}`,
       ]
+      if (botGates.length > 0) lines.push(`· 逐 Bot 闸：${botGates.join("  ")}`)
       try {
         // 循环资格（粘性标志，与 auto-continue 同一份文件）
         const sticky = new Set<string>()
@@ -6562,10 +7388,44 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       const shape = bgApiShape(client)
       const envOn = bgEnvOn()
       const capLabel = bgApiLabel(shape) === "无（不支持）" ? "无（不支持）·HTTP直连可用" : bgApiLabel(shape)
+      // HTTP 直连可用性=宿主机服务注册可读（url+password 都在才算）。
+      const bgHttpReady = ((): boolean => {
+        try {
+          const reg = JSON.parse(readFileSync(`${process.env.HOME ?? "/root"}/.local/state/opencode/service.json`, "utf8")) as {
+            url?: string
+            password?: string
+          }
+          return Boolean(reg?.url && reg?.password)
+        } catch {
+          return false
+        }
+      })()
+      // R1505：状态用等宽表格回显（代码块恒定等宽 + box-drawing 边框对齐全靠等宽）。
+      // R1509/R1510：配置清单按用户设计反馈用「键值列表」——标题+━分隔线、无竖线边框；
+      // R1510 起用 tab 对齐（tabAlign:true，键补到 8 的倍数-1 + 单个 \t，值落 8 的倍数列）。
+      const rpcSupport = (() => {
+        const s: any = shape
+        return Boolean(s?.promote || s?.subagent)
+      })()
+      const bgTable = (): string =>
+        renderKvList(
+          [
+            ["进程内后台 RPC", rpcSupport ? "✅ 支持" : "❌ 不支持"],
+            ["HTTP 直连兜底", bgHttpReady ? "✅ 可用（RPC 缺失时自动降级）" : "❌ 服务注册不可读"],
+            ["实验开关", envOn ? "✅ 开" : "⭕ 未开"],
+            ["自动转后台", curBg.enabled ? "✅ 开" : "❌ 关"],
+            ["冷却时间", `${Math.round(curBg.cooldownMs / 1000)}s`],
+            ["Shell 自动后台", curBg.shellPromo !== false ? "✅ 开" : "❌ 关"],
+            ["Shell 提升熔断", curBg.shellPromo !== false ? "✅ 开（强制）" : "❌ 关"],
+            ["插件层超时阈值", `${Math.round(curBg.promoteMs / 1000)}s`],
+          ],
+          { title: "⚙️ 后台策略", tabAlign: true },
+        ) +
+        `\n· ${BG_ENV_VAR}=${envOn ? "开" : "未开"}（列表里列窄，完整变量名放这里）`
       const bgStatus = (extra = ""): string =>
-        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellPromo !== false ? "开" : "关"}${extra}\n` +
+        `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellPromo !== false ? "开" : "关"}｜超时阈值=${Math.round(curBg.promoteMs / 1000)}s${extra}\n` +
         "· 提升：把**正在阻塞**的同步子代理转后台（无端点时走宿主 HTTP 直连）\n" +
-        "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜状态：/background status"
+        "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜/background th <秒>（超时阈值）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
         const sessAny = (client as any)?.session
         const expSess = (client as any)?.experimental?.session
@@ -6584,15 +7444,16 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         }
       }
       const bgArg = commandArg(text)
-      // R1822：shell 开关的 toggle 基准改用真正生效的 shellPromo（菜单「shell 自动后台」据此显示），
-      // 否则按钮显示的开/关与实际插件强制提升状态不一致（用户反馈"转后台按钮不能实际控制"）。
+      // R1822：shell 开关的 toggle 基准改用**真正生效**的 shellPromo（菜单「🖥 shell 自动后台」据此显示）。
+      // 此前 toggle 基准是未被任何机制消费的 shellAuto → 按钮显示的"开/关"与实际强制提升状态不一致，
+      // 用户反馈「菜单里的转后台按钮不能实际控制是否自动转后台」。
       const bgAct = parseBgArg(bgArg, { ...curBg, shellAuto: curBg.shellPromo !== false })
       if (bgAct.kind === "help") {
-        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background status\n${bgStatus()}`)
+        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background th <秒> | /background status\n${bgStatus()}`)
         return
       }
       if (bgAct.kind === "status") {
-        await reply(chatID, bgStatus())
+        await reply(chatID, bgTable())
         return
       }
       if (bgAct.kind === "set") {
@@ -6603,6 +7464,11 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       if (bgAct.kind === "setshell") {
         writeBg({ ...curBg, shellAuto: bgAct.enabled, shellPromo: bgAct.enabled })
         await reply(chatID, `[tg-bridge] shell 自动后台 → ${bgAct.enabled ? "开" : "关"}\n${bgStatus()}`)
+        return
+      }
+      if (bgAct.kind === "setth") {
+        writeBg({ ...curBg, promoteMs: bgAct.ms })
+        await reply(chatID, `[tg-bridge] 插件层超时阈值 → ${Math.round(bgAct.ms / 1000)}s（shell 跑超自动转后台；可再 /background th <秒> 调整）\n${bgTable()}`)
         return
       }
       const bgTarget = fixedTarget ?? (await activeFront())
@@ -7193,6 +8059,28 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
     commandReplyMode = Boolean(u?.callback_query) || raw.startsWith("/")
     try {
       await handleUpdateInner(u)
+    } catch (err) {
+      // R1817：这里**必须**自己兜住。改之前**没有 catch** → 抛错一路冒到 poll 的
+      // for 循环，**整批剩余 update 全部不再处理**（for 被抛断，批次提交 L7347 也不执行），
+      // 而失败那条的 offset 早在 handleUpdateInner 的 commitOffset(uid) 就提交了
+      // → 那条用户消息**永久不再投递**，日志里只剩一句与网络错误**长得一模一样**的
+      // `poll error:`，连"丢了哪条"都查不出来。这正是 R1728 记的形态 B（整条事件消失）。
+      //
+      // 为什么不重试（这是本轮最关键的取舍，写死在这里以免后人"顺手优化"）：
+      //   重试需要**同时**撤销两处状态 —— offset **和** 去重环 seenUpdates。
+      //   只撤销 offset 是**无效**的：TG 重投同一 update_id 会命中 handleUpdateInner
+      //   开头的去重判据直接 return，消息照样丢，而且**连 poll error 都不会再有**
+      //   （从"有一条线索"退化成"彻底静默"，比改之前更糟）。
+      //   而真重试的代价是**重复副作用**：处理函数可能已经 reply() 回 Telegram 之后
+      //   才抛错，重投就会**再发一遍**给用户 —— 那正是 R1807–R1811 追了 5 轮的重复卡片。
+      //   在**零观测**到真实丢失（92 条 poll error 全是网络层签名：71 条证书校验、
+      //   21 条 socket 关闭，OTHER=0）的前提下，用"可能重复"换"可能丢失"是**不对称**的赌注。
+      //   → 本轮只保证「不丢整批 + 留精确痕迹」。重试语义登记待决策，不擅自改。
+      const why = sanitizeLog(err)
+      await log(
+        "error",
+        `inbound handler error (uid=${String(u?.update_id ?? "?")}, NOT retried, THIS UPDATE IS LOST): ${why}`,
+      )
     } finally {
       commandReplyMode = false
     }
@@ -7313,6 +8201,10 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         return // 关键：不走 touchPeer、不推进 offset、不 noteInbound
       }
       const result = Array.isArray(j?.result) ? j.result : []
+      // R1758：每次 poll 返回都刷新同伴账本（**含空数组**），否则没收到消息的 bot
+      // 永远读不到同伴领先 → 落 no-peer → 不报警（自我抑制死结，见 touchPeer 注释）。
+      touchPeer()
+      if (result.length > 0) noteInbound()
       for (const u of result) {
         await handleUpdate(u)
       }
@@ -7324,6 +8216,55 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
         await flushQueue()
       } catch {
         /* best-effort */
+      }
+      // R1740：入站静默告警。**必须在"成功返回"分支里评估**（含 result 为空）——
+      // R1739 查到的 bot3 那 59 秒窗口就是这个形态：没有 poll error、没有 drop、
+      // 没有任何日志，当场完全无痕。空返回本身是常态（长轮询 30s 超时 + 用户不说话），
+      // 所以判据只看**持续时长**，由 inboundSilenceVerdict 处理（已双向验证 + 8 变异体）。
+      const sv = inboundSilenceVerdict({
+        now: Date.now(),
+        lastInboundAt,
+        restoredAt: j.lastinbound ?? 0,
+        bootAt: botBootAt,
+        peerLastInboundAt,
+        thresholdMs: 10 * 60_000,
+        throttleMs: 30 * 60_000,
+        lastWarnAt: lastInboundSilentWarnAt,
+        // 照抄 protoSilentVerdict 调用的同一写法（见下方 watchdog 处）：
+        // 用 globalThis 上的 GEN_KEY 标记判断自己是不是当前代。**不要自己发明别名** ——
+        // 我第一版写了 `currentGen()` 这个并不存在的函数，而 bun build 不会报未定义标识符，
+        // 于是构建门禁给了假绿。判据引用的每个符号都必须 grep 出定义。
+        isCurrentGen: (globalThis as Record<string, unknown>)[GEN_KEY] === myGen,
+      })
+      // ⚠️ R1779 重大更正：此告警**降级为 info 诊断，不再作为 error 上报**。
+      //
+      // R1779 用 getMe 逐个核对了三个 token 的真实身份（决定性证据）：
+      //   tg.env        (primary) → @codecilbot      id=8892941675
+      //   tg-fallback.env (alt)   → @opencodev2_bot  id=8964069383
+      //   tg-bot3.env   (bot3)    → @cilv2bot        id=8858162646
+      // **三个 token 对应三个不同的 Telegram bot，各有独立 getUpdates 队列。**
+      // → 我 R1743 起赖以成立的隐含前提「三个 bot 共享同一个消息源」**是假的**。
+      //   用户只跟 alt 说话时，primary/bot3 收不到 update 是**完全正常的**。
+      // → `peer-ahead`（"同伴有流量而我没有 = 我坏了"）在原理上**无法判定**：
+      //   同伴的流量对另一个 bot 的健康状况**不构成任何证据**。
+      //
+      // 而"不可判定"我却按 error 上报，等于把一个无法证伪的猜测包装成故障结论，
+      // 正是我一路在反对的信号稀释。按 R1743 自己写下的取舍原则（宁可漏报不要误报）降级。
+      //
+      // 保留 info 诊断是为了**保留可观测性**：真出故障时有人能查"这个 bot 多久没收到 update"。
+      // 若将来要做可靠的入站故障检测，唯一可行方向是**每个 bot token 单消费者 + 自行计数**
+      // （现状已如此），并配合"Telegram 侧确实有未投递消息"的独立证据 —— 而不是跨 bot 比较。
+      if (sv.silent && Date.now() - lastInboundSilentWarnAt > 6 * 3600_000) {
+        lastInboundSilentWarnAt = Date.now()
+        // R1778：必须打 reason。只打 basis 时，reason="peer-ahead" 会显示成「基准=boot」，
+        // 读起来像纯时长告警 —— 我据此白绕了一整轮。basis 与 reason 是两个维度，缺一不可读。
+        await log(
+          "info",
+          `[diag] inbound idle ${Math.round(sv.durationMs / 60_000)}min (bot=${BOT_ID}, reason=${sv.reason}, 基准=${sv.basis}): ` +
+            `轮询活着（心跳照常、无 poll error）但无入站。` +
+            `⚠️ **这不是故障判定**：三 bot 是三个独立 Telegram bot（@codecilbot / @opencodev2_bot / @cilv2bot），` +
+            `用户未对本 bot 说话时本就是静默，跨 bot 比较无法判定本 bot 是否漏收（R1779）。`,
+        )
       }
     } catch (err) {
       const why = sanitizeLog(err)
@@ -7431,31 +8372,32 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
       return
     }
     const real = await peekLatestUpdateId()
-    if (real === null) {
-      // 没有待处理更新时无法用服务器证伪。改用**兄弟基线**：同一 chat 里的另一个 Bot
-      // 真实处理到的 update_id 是可靠参照（两者计数空间同步推进）。若我们比它高出
-      // 100 万以上，几乎可以断定 offset 落在了别人的计数空间里。
-      const sibling = siblingBaseline()
-      if (sibling && persistedOffset > sibling + 1_000_000) {
-        await log(
-          "error",
-          `offset implausible vs sibling (periodic): stored=${persistedOffset} sibling=${sibling} (差 ${persistedOffset - sibling}); rewinding (入站会被静默丢弃)`
-        )
-        persistedOffset = sibling
-        seenUpdates.clear()
-        savePersistedState()
-      }
-      return
-    }
-    if (!Number.isFinite(persistedOffset) || persistedOffset <= 0) return
-    if (persistedOffset <= real) return
+    // R1818：判定提成纯函数 offsetRewindTarget（_v2compat），分支互斥且穷举。
+    // 旧实现在这里把**常态** ahead=1 当成「offset 越界」并回退到 real = 已处理过的那条，
+    // 再 seenUpdates.clear() → 重载后那条会被重新投递、重复回复用户。
+    // 02:06:44.950Z 生产实证：stored=530870734 server=530870733 ahead=1; rewinding。
+    const rw = offsetRewindTarget({
+      stored: persistedOffset,
+      real,
+      lastReal: lastRealUpdateId,
+      // 无条件求值是无害的（纯函数只在 real===null 时才读它）；不写成条件求值是为了
+      // 免得「什么时候求值」变成一条隐含契约，日后改纯函数时踩坑。
+      sibling: siblingBaseline(),
+    })
+    if (rw.target === null) return
 
-    const ahead = persistedOffset - real
     await log(
       "error",
-      `offset ahead of server (${reason}): stored=${persistedOffset} server=${real} ahead=${ahead}; rewinding (入站会被静默丢弃)`
+      `${rw.why === "sibling-space" ? "offset implausible vs sibling" : "offset ahead of server"} (${reason}): stored=${persistedOffset} target=${rw.target} server=${real ?? "null"} lastReal=${lastRealUpdateId} ahead=${real === null ? "n/a" : persistedOffset - real} why=${rw.why}; rewinding (入站会被静默丢弃)`,
     )
-    persistedOffset = real
+    // ★ 必须同时写**内存态** offset。旧代码只写 persistedOffset，而
+    //   `let offset = persistedOffset` 一辈子只在 setup 跑一次 → 自愈在**当前活实例**
+    //   里完全无效，必须等下次热重载才生效 —— 而那恰好是最坏的时机：重载会把已回退的
+    //   落盘值灌进 offset，使**已处理过的 update 被重新投递**。
+    //   R1818 实测：02:06:44 那次回退当场就是无效的（当时靠 40 秒后的新入站
+    //   把落盘值又推回去而侥幸没出事，不是设计）。
+    offset = rw.target
+    persistedOffset = rw.target
     seenUpdates.clear()
     savePersistedState()
   }
@@ -7464,6 +8406,29 @@ const filterMenu = (): { text: string; kb: unknown[][] } => {
   // 而它的看门狗最多 3 秒后才会中断。若新实例 POLL_MS(2s) 就首 poll，必然与旧实例
   // 撞一次 409（两个 Bot 同一毫秒各一次）。把首轮延后到看门狗之后 → 抖动归零。
   // 冷启动没有旧实例，这个 4s 只是入站首条消息的固定延迟，可接受。
+  // R1728 投递静默 watchdog：只**告警不自动重载**。
+  // 不自动重载的理由：自动重载可能打断正在进行的一次对话/提问，风险不对称；
+  // 而这次故障的代价是"静默 30 分钟无人知晓"，告警已经把"不可观测"变成"可观测"。
+  // 判据要严：仅当「本 Bot 桥已加载完成 + 投静音默超阈值 + 循环本身没停」时才报，
+  // 否则深夜无人值守时会刷出一堆"正常安静"的假警报。
+  const PROTO_SILENT_WARN_MS = 12 * 60_000
+  const PROTO_SILENT_THROTTLE_MS = 15 * 60_000
+  setInterval(() => {
+    const now = Date.now()
+    const v = protoSilentVerdict(now, lastProtoSendAt, lastProtoSilentWarnAt, {
+      thresholdMs: PROTO_SILENT_WARN_MS,
+      throttleMs: PROTO_SILENT_THROTTLE_MS,
+      loopStopped: loopStopped(),
+      isCurrentGen: (globalThis as Record<string, unknown>)[GEN_KEY] === myGen,
+    })
+    if (!v.warn) return
+    lastProtoSilentWarnAt = now
+    void log(
+      "warn",
+      `proto silent ${v.minutes}min (bot=${BOT_ID}): 桥仍活着但没有成功投递过。` +
+        `若循环正在注入，疑似热重载半完成导致事件流断开 → 需 reload 桥：bash tests/reload.sh --wait bridge`
+    )
+  }, 5 * 60_000)
   let pollTimer: ReturnType<typeof setInterval> | null = null
   let bootTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     pollTimer = setInterval(() => {
@@ -8051,10 +9016,17 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
           if (protoMap.has(`${sid}:message:${id}:1`)) continue
           const txt = String(m?.text ?? m?.info?.text ?? "").trim()
           if (!txt) continue
+          // R1605：与正链同款转换（mdTableToHtml 包表格 <pre>）——补发路径此前直发
+          // txt.slice，含表格的报告在换代补发时仍显示原始管道符（R1602 覆盖空档）。
+          const body = closeUnclosedPre(fenceSafe(mdTableToHtml(mdBoldToHtml(txt))).slice(0, 1200))
           const key = `${sid}:message:${id}:1`
-          const r = await sendTextRaw(chat, protoBlock(`💬 回复 · 补发 · ${sessionTag(sid)}`, htmlEsc(txt.slice(0, 1200))), true)
-          if (r.r === "sent" && r.id) {
-            protoMap.set(key, { id: r.id, text: txt.slice(0, 1200), fallback: r.fallback === true })
+          const r = await sendTextRaw(chat, protoBlock(`💬 回复 · 补发 · ${sessionTag(sid)}`, body), true)
+          // R1802：判据与主投递路径同源。`missed` 统计的是**补发了几条**，不是"成功锚定了几条"
+          // —— TG 收下就算补发成功，缺 message_id 只让我方无法改写那张卡。故按 delivered 计数。
+          const cdv = protoDeliveryVerdict(r)
+          if (cdv.delivered) {
+            if (r.id) protoMap.set(key, { id: r.id, text: body, fallback: r.fallback === true })
+            else await log("warn", `catch-up degraded (${sanitizeLog(key)}) no message_id，无法锚定该补发卡`)
             missed++
           }
         }
@@ -8198,13 +9170,100 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     runOffsetCheck("periodic")
   }, 10 * 60_000)
 
-  // R1827: assistant 推送的事件驱动路径存在结构性盲区——宿主不保证为每条 assistant
-  // 消息都发 message.updated，事件 info 也可能没有 role/parts（实测非主实例会话多条
-  // 带正文的 assistant 消息完全未推送，而同期 tool 消息正常 → 用户看到「信息从不发送」）。
-  // 修法与 turn-end note 同源：轮询抓 front 会话尾部消息，凡 proto 无记录的 assistant
-  // 正文/思考补推。幂等：已推送的键存在于 protoMap → 直接跳过；与事件路径并发时由
-  // protoSend 内的 shouldSend/sentHash 二次去重。只补正文/思考，tool 由事件路径负责。
-  const catchupBootAt = Date.now()
+  // R1567：turn-end note 改为**轮询**（用户指令：AI 主动结束输出→每轮一条短提示）。
+  // 实证：宿主写完 time.completed 后不再发 message.updated 事件（msg_0eacd1e69 在
+  // 01:36:47 后零事件、01:36:48.4 才被 auto-continue 轮询读出终态）→ 事件驱动
+  // 结构性看不见终态，必须与 auto-continue（L1584 acTimer 轮询）同源。从尾部反向
+  // 找最近一条 completed>0 的 assistant 消息，按消息 id 去重；不受 loopStopped 限制
+  // （无论有无循环都要提示）；pausedMode / TURN_END_NOTIFY 门控不变。
+  setInterval(() => {
+    void (async () => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      if (!TURN_END_NOTIFY || pausedMode) return
+      // R1596：非主实例不发 turn-end note（alt/bot3 的 front 是各自项目的会话，见
+      // TURN_NOTE_OWNER_ONLY 注释）——放在最前，避免镜像/异项目会话白跑采样。
+      if (noteOwnerOnlySkipped({ ownerOnly: TURN_NOTE_OWNER_ONLY, isOwner: QUEUE_CARD_OWNER })) return
+      const sid = fixedTarget ?? frontSessionID ?? persistedFront
+      if (!sid || !isPrimaryPush(sid)) return
+      const chat = pushChatResolve()
+      if (!chat) return
+      try {
+        const pe = await client.session.messages({ path: { id: sid } })
+        const arr = Array.isArray(pe?.data) ? pe.data : []
+        if (!arr.length) return
+        for (let i = arr.length - 1; i >= 0; i--) {
+          const m = arr[i] as any
+          if (String(m?.role ?? m?.info?.role ?? "") !== "assistant") continue
+          const completed = Number(m?.time?.completed ?? m?.info?.time?.completed ?? 0)
+          if (!(completed > 0)) continue
+          // R1569：热重载后新实例 Set 为空，旧消息（含已通知过的）会再补发 →
+          // 只认本实例启动之后完成的消息。
+          if (completed < turnNoteBootAt) break
+          // R1597：安静窗——完成不足 TURN_NOTE_QUIET_MS 的消息跳过评估（宿主注入
+          // 下一条循环提示前撞上的轮询会误判"已停摆"）。等下轮再评估。
+          if (completed > Date.now() - TURN_NOTE_QUIET_MS) continue
+          const mid = String(m?.id ?? m?.info?.id ?? "")
+          const noteKey = `${sid}:${mid}`
+          if (turnEndNotified.has(noteKey)) break
+          turnEndNotified.add(noteKey)
+          if (turnEndNotified.size > 1024) {
+            const fk = turnEndNotified.values().next()
+            if (!fk.done) turnEndNotified.delete(fk.value)
+          }
+          // R1570：lastRound 采样只走 protoPush（full 档）——镜像档/被 filt 挡住的
+          // 文本不更新，note 会显示过时 R。这里从已完成消息的 text parts **即时采样**，
+          // 与 L3557 同一正则（兼容 [ROUND n] 与 [ROUND Rn]），取不到才回落 lastRound。
+          // R1595：采样顺带不用了——判据改「续跑检测」（见下），ROUND 标记不再参与门控。
+          let noteRound = lastRound.get(sid)
+          for (const pp of partsOf(m)) {
+            if (String(pp?.type ?? "") !== "text") continue
+            const t = String(pp?.text ?? "").trim()
+            if (!t) continue
+            noteRound = extractRound(t)
+            if (noteRound) break
+          }
+          if (noteRound && noteRound !== lastRound.get(sid)) {
+            lastRound.set(sid, noteRound)
+            savePersistedState()
+          }
+          // R1603：note 门控 = **M 之后是否还有任何消息**（用户真实指令：输出结束应该
+          // 在不发送消息（包括循环提示）就不会继续时发送）。宿主的循环提示是 type=
+          // 'synthetic'、无 parts 的行，旧判据（R1595：按比 M 新的用户消息文本前缀匹配
+          // 循环提示）role 过滤/partsOf 都取不到 → 漏检（实测 primary note 每 20s 复活，
+          // 06:16:14 后累计 9 条）。任何比 M 新的行（提示/真实 TG/下一轮报告/事件）都是
+          // "还会继续"的信号；M 是会话最后一条 = 停摆 → 才发「✅ 输出结束」。
+          let newerMessage = false
+          for (let j = i + 1; j < arr.length; j++) {
+            const u = arr[j] as any
+            if (String(u?.id ?? u?.info?.id ?? "")) { newerMessage = true; break }
+          }
+          if (noteSkipped({ newerMessage, loopSkip: TURN_NOTE_LOOP_SKIP })) break
+          const note = turnEndLine(
+            TURN_NOTE_LOOP_SKIP
+              ? { loop: false, name: sessionNameOf(sid) }
+              : { loop: !loopStopped(), round: noteRound, name: sessionNameOf(sid) }
+          )
+          void sendQueued(String(chat), note)
+            .then(() => log("info", `turn-end note sent (session=${sanitizeLog(sid).slice(0, 12)} mid=${mid.slice(0, 12)})`))
+            .catch(() => { /* best-effort */ })
+          break
+        }
+      } catch {
+        /* best-effort */
+      }
+    })()
+  }, 20_000)
+
+  // R1827：事件驱动的 assistant 推送存在**结构性盲区**（与 R1567 turn-note 同源：
+  // 宿主不保证为每条 assistant 消息都发 message.updated；即便发了，事件里的 `info`
+  // 也可能没有 role/parts —— auto-continue 的 "empty-verdict" 日志实锤了这种骨架事件）。
+  // 实测：bot3（非主实例、front 是其项目的循环会话）03:08–04:29 多条**带正文**的
+  // assistant 消息完全未推送（proto 里毫无记录，而同期 tool 消息正常）→ 用户视角
+  // 「bot3 的信息和思考从不发送」。
+  // 修法：与 turn-note 同源的**轮询补扫**——定期抓 front 会话尾部消息，凡 proto 无记录
+  // 的 assistant 正文/思考补推。幂等性：① 已推送的键存在于 protoMap（热重载后由持久化
+  // proto 恢复）→ 直接跳过；② 与事件路径并发时由 protoSend 内的 shouldSend/sentHash
+  // 二次去重。只补正文/思考（tool 由事件路径负责，避免无谓的编辑风暴）。
   setInterval(() => {
     void (async () => {
       if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
@@ -8240,9 +9299,10 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         if (!hasText) continue
         const mid = String(m?.id ?? m?.info?.id ?? "")
         if (!mid) continue
-        // 只补本实例启动之后创建的消息，避免每次热重载把旧历史重新推一遍。
+        // 与 turn-note 同一"本实例启动基线"：只补 boot 之后创建的消息，
+        // 避免每次热重载把旧历史重新推一遍。
         const createdAt = Number(m?.time?.created ?? m?.info?.time?.created ?? 0)
-        if (!(createdAt > catchupBootAt)) continue
+        if (!(createdAt > turnNoteBootAt)) continue
         const msgKey = mid.slice(0, 20)
         const seen = [...protoMap.keys()].some(
           (k) => k.startsWith(`${sid}:message:${msgKey}:`) || k.startsWith(`${sid}:thinking:${msgKey}:`)

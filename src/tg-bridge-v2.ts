@@ -226,7 +226,23 @@ export default {
     const live = snapshotV2lib("bridge")
     // 不带 query：与 v2lib 内部 "./_v2compat" 同一 URL，避免 _v2compat 出现两个实例
     // （它有模块级 Map/Set/db 句柄，劈成两半会让 token 统计与 db 缓存各算各的）。
-    const { v2Bridge } = (await import(`${live}/_v2compat.ts`)) as { v2Bridge: (...a: any[]) => any }
+    const compat: any = await import(`${live}/_v2compat.ts`)
+    const { v2Bridge } = compat as { v2Bridge: (...a: any[]) => any }
+    // R1790：**装载时**先保全上一进程留下的日志。
+    // R1786 实测 /tmp/opencode 在进程重启时被整体清空（三个日志全归零，
+    // systemd-tmpfiles-clean.timer=active），而未到 2MB 阈值时 rotateIfNeeded 不触发
+    // → 重启前的日志既没归档也不轮转，直接消失（实际损失 04:00–08:07 全部诊断证据）。
+    //
+    // 为什么放**入口装载器**而不是 _v2compat 顶层：顶层会被 tests/*.test.ts 的 import 触发
+    // （log-rotate / scope-guard 等 10 个测试文件都 import tg-bridge），那就会在**跑测试时
+    // 轮转生产日志**。入口是生产专用路径，且每次 setup 只执行一次。
+    try {
+      const r = compat?.archiveOnStartup?.({ path: compat.TAP_PATH, archiveDir: compat.LOG_ARCHIVE_DIR })
+      if (r?.rotated) diag(`[tg-bridge-v2] 启动前日志已归档 ${r.archive} (归档 ${r.archivedBytes}B / 留尾 ${r.keptBytes}B)`)
+    } catch (e) {
+      // 保全失败绝不能挡住启动：日志是诊断材料，不是命脉
+      diag(`[tg-bridge-v2] 启动日志保全失败（不影响启动）: ${String(e).slice(0, 140)}`)
+    }
     for (const [idx, bot] of bots.entries()) {
       try {
         const mod: any = await import(`${live}/tg-bridge.ts?bot=${bot.id}&v=${version}`)
@@ -663,3 +679,251 @@ export default {
 // reload(content) 20260928T142117Z [tg-bridge-v2.ts retry]
 
 // reload(content)  [R1488 auth promote]20260928T142744Z
+
+// reload 1790610307296
+
+// reload 1790611374213
+
+// reload 1790612695647
+
+// reload 1790613746
+
+// reload(content) 20260929T013100Z R1565 turn-end short message per round (TG user instruction)
+// reload(content) R1566-completed-refetch 1790645795
+// reload(content) R1567-turn-end-poll 1790645986
+// reload(content) R1569-round-regex 1790646220
+// reload(content) R1569-note-boot-guard 1790646308
+// reload(content) R1570-note-round-src 1790646383
+// reload(content) R1571-extractRound-shared 1790657371
+// reload(content) R1593-turn-note-loop-skip 1790661686
+// reload(content) R1595-continuation-gate 1790662138
+// reload(content) R1596-note-owner-only 1790662389
+// reload(content) R1597-note-quiet-window 1790662574
+// reload(content) R1602-md-table-pre 1790663595
+// reload(content) R1603-note-newer-message 1790663595
+// reload(content) R1605-resend-table-chain 1790664000
+// reload(content) R1607-shell-bg-hint 1790686020689
+// reload(content) R1609-stale-card-gate 1790686531148
+// reload(content) R1610-exact-key-hint 1790686962884
+
+// reload(content) 20260929T144115Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T011235Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T014412Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T020943Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T021351Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T022108Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T023815Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T031214Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T031613Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T031814Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T031835Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T032934Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T032939Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T032939Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T033244Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T033325Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T034233Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T034233Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T035945Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T041001Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T041950Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T045427Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T050235Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T061313Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T061827Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T083358Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T084215Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T085612Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T092200Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T103024Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T103459Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T110230Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T111230Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T112303Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T112806Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T113356Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T114001Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T114759Z [tg-bridge-v2.ts]
+
+// reload(content) 20261001T120534Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T013837Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T015954Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T020047Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T021016Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T022017Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T024107Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T025313Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T030258Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T030950Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T045150Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T053243Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T055332Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T060209Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T061533Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T062006Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T062822Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T081456Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T082703Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T084633Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T085613Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T090753Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T091248Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T091534Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T092223Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T092713Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T093434Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T094018Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T094609Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T103111Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T104444Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T105828Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T110948Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T112428Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T120553Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T120932Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T122601Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T123242Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T124705Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T125330Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T130246Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T131204Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T131935Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T133422Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T134005Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T134840Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T135839Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T141322Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T142312Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T143424Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T144119Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T145403Z [tg-bridge-v2.ts]
+
+// reload(content) 20261003T150245Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T050718Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T051437Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T051747Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T052221Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T052611Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T053420Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T053714Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T053741Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T054032Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T054445Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T055255Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T060704Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T063336Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T064018Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T065305Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T065638Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T070622Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T072956Z [tg-bridge-v2.ts]
+
+// reload(content) 20261004T075520Z [tg-bridge-v2.ts]
+
+// reload(content) 20261005T001133Z [tg-bridge-v2.ts]

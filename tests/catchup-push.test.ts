@@ -41,7 +41,10 @@ test("补扫幂等：跳过 proto 已有记录的键，且只补 boot 后消息"
   const block = lines.slice(start, idx).join("\n")
   expect(block).toContain("protoMap.keys()")
   expect(block).toContain("seen")
-  expect(block).toContain("catchupBootAt")
+  // 只补 boot 之后创建的消息（热重载不重推旧历史）。
+  // R1894：该基线由 catchupBootAt 改名为 turnNoteBootAt（与 turn-note 共用同一启动基线），
+  // 发布仓策展测试曾硬编码旧名 → 整仓 sanitize 同步 live 后此用例变红。
+  expect(block).toContain("turnNoteBootAt")
 })
 
 test("补扫只推正文/思考，且走 full 档 protoPushAssistantMessage", () => {

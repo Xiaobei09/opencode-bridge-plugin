@@ -35,14 +35,26 @@ export type BgCfg = {
    */
   shellAuto: boolean
   /**
-   * 插件层强制：shell 跑超 1 分钟由**插件**转后台（用户 2026-09-28：「我说的不是模型判断，
+   * 插件层强制：shell 跑超 N 秒由**插件**转后台（用户 2026-09-28：「我说的不是模型判断，
    * 是插件判断」）。由桥的 Hooks.tool 同名覆盖 shell 实现，execute 由插件掌控才能中途计时提升。
    * 默认**开**=用户既定口径；置 false 即整体熔断（覆盖立即退出、回退宿主行为）。
    */
   shellPromo: boolean
+  /**
+   * 插件层转后台的时间阈值 ms（R1505 起可调，用户新增需求）。默认 60_000=60s
+   * （用户口径「跑超 1 分钟」）。范围 5s~600s，归一化时钳制。
+   */
+  promoteMs: number
 }
 
-export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false, shellPromo: true }
+export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false, shellPromo: true, promoteMs: 60_000 }
+
+/** 阈值可选档位（菜单按钮轮切用；命令亦可直接写任意秒数）。 */
+export const BG_TH_STEPS: number[] = [30_000, 60_000, 90_000, 120_000, 180_000]
+
+/** 阈值合法区间（5s~600s）。 */
+export const BG_TH_MIN = 5_000
+export const BG_TH_MAX = 600_000
 
 export const normalizeBg = (j: any): BgCfg => ({
   enabled: typeof j?.enabled === "boolean" ? j.enabled : DEFAULT_BG.enabled,
@@ -50,6 +62,10 @@ export const normalizeBg = (j: any): BgCfg => ({
     Number.isFinite(Number(j?.cooldownMs)) && Number(j.cooldownMs) >= 0 ? Number(j.cooldownMs) : DEFAULT_BG.cooldownMs,
   shellAuto: typeof j?.shellAuto === "boolean" ? j.shellAuto : DEFAULT_BG.shellAuto,
   shellPromo: typeof j?.shellPromo === "boolean" ? j.shellPromo : DEFAULT_BG.shellPromo,
+  promoteMs:
+    Number.isFinite(Number(j?.promoteMs)) && Number(j.promoteMs) >= BG_TH_MIN && Number(j.promoteMs) <= BG_TH_MAX
+      ? Math.round(Number(j.promoteMs))
+      : DEFAULT_BG.promoteMs,
 })
 
 export const readBg = (path: string = BG_PATH): BgCfg => {
@@ -141,6 +157,7 @@ export type BgAction =
   | { kind: "help" }
   | { kind: "set"; enabled: boolean }
   | { kind: "setshell"; enabled: boolean }
+  | { kind: "setth"; ms: number }
 
 export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
   const toks = String(arg ?? "")
@@ -164,6 +181,20 @@ export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
     if (val === "on" || val === "开" || val === "1" || val === "true") return { kind: "setshell", enabled: true }
     if (val === "off" || val === "关" || val === "0" || val === "false") return { kind: "setshell", enabled: false }
     if (val === "toggle" || val === "") return { kind: "setshell", enabled: !cur.shellAuto }
+    return { kind: "help" }
+  }
+  if (head === "th" || head === "threshold" || head === "time" || head === "阈值") {
+    // 插件层 shell>N 秒转后台阈值。裸 `th` = 轮切到下一档；`th <秒>` = 直接设（范围钳制）。
+    if (val === "") {
+      const i = BG_TH_STEPS.indexOf(cur.promoteMs)
+      // 在档位表内 → 轮切下一档；不在（命令直设的任意秒数）→ 回到默认 60s 档。
+      if (i >= 0) return { kind: "setth", ms: BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] }
+      return { kind: "setth", ms: DEFAULT_BG.promoteMs }
+    }
+    const n = Number(val)
+    if (Number.isFinite(n) && n >= BG_TH_MIN / 1000 && n <= BG_TH_MAX / 1000) {
+      return { kind: "setth", ms: Math.round(n * 1000) }
+    }
     return { kind: "help" }
   }
   if (head === "on" || head === "开") return { kind: "set", enabled: true }

@@ -4,6 +4,8 @@ import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unli
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl } from "./loop-guard"
+// R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
+import { classifyAbort, noteAbortEvent } from "./abort-classify"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
@@ -13,6 +15,8 @@ const COMPACT_EVERY = 450
 const ABORT_STALE_MS = 3 * 60 * 1000
 const STALL_SESSION_MSGS = 600
 
+// 规范状态文件仍为 REDACTED_ROOT/.opencode/loop-state.md（本会话约定）；提示词**刻意不写死路径**，
+// 以满足用户要求"不强调循环具体存放文件"。agent 可从该文件的头部/上下文获知规范位置。
 const ROUND_PROMPT = `继续自动筛查循环（直到用户按 ESC 中断为止；本机制不再依赖回复中的 [STATUS] 标记判定，每次助手回合完成便自动续跑）:
 
 本轮开始请先复述两个要点:
@@ -149,6 +153,29 @@ const readCtl = (): any => {
     }
   }
   return {}
+}
+// R1724（用户指令「不同机器人的循环设置要求单独」）：
+// loop-ctl.json 原先是**三 bot 共用的单一全局闸** → 任一 Bot 的 /loop stop 会停掉全部。
+// 现在扩成兼容式双层：
+//   { stopped, by, ts, bots: { "<botId>": { stopped, by, reason, ts, sids: [...] } } }
+//   * `stopped`（顶层）= **全局闸**，语义不变（守卫 PROBLEM/WEBSEARCH 仍用它停全部）；
+//   * `bots[x].stopped` = **单 Bot 闸**，只停该 Bot 当前 front 会话（按 sids 匹配）。
+// 判定优先级：全局闸 true → 一律停；否则看该 sid 命中的单 Bot 条目。
+// 纯函数、无 IO —— 单测可直接钉行为，且桥与本侧共用同一套判据（防两边漂移）。
+export const loopGateStopped = (raw: unknown, sessionID: string): boolean => {
+  const j = (raw ?? {}) as { stopped?: unknown; bots?: unknown }
+  if (j.stopped === true) return true
+  const bots = j.bots
+  if (!bots || typeof bots !== "object") return false
+  for (const v of Object.values(bots as Record<string, unknown>)) {
+    const e = (v ?? {}) as { stopped?: unknown; sids?: unknown }
+    if (e.stopped !== true) continue
+    const sids = Array.isArray(e.sids) ? (e.sids as unknown[]).filter((x): x is string => typeof x === "string") : []
+    // sids 为空 = 该条目还没绑定会话（如刚写下、front 尚未解析）→ **不**据此停任何会话，
+    // 宁可漏停也不误停（误停会让用户以为 Bot 挂了，正是本次要修的症状）。
+    if (sids.includes(sessionID)) return true
+  }
+  return false
 }
 // 停止总闸只允许最新实例写：热重载后陈旧实例仍可能收到 assistant 中断事件，
 // 误写 stopped=true 会把用户正在跑的循环静默停掉。代号放 globalThis，
@@ -450,8 +477,9 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // (and an old TUI copy could overwrite loop-ctl after /stop).
   const isServe = typeof process !== "undefined" && process.argv.some((arg) => arg === "serve")
   if (!isServe) {
-    // TUI 不跑续跑循环，但必须把 ESC/宿主 interrupt 立即写成全局停门；
-    // 否则服务侧只能等下一次评估，GUI 看起来像“按了也没停”。
+    // TUI 不跑续跑循环：按 ESC 只应「暂停该会话本轮」（R1553，per-session），
+    // 不写全局停门；TUI 是独立进程，内存 skipState 传不到 serve 侧，只落盘遥测，
+    // serve 侧 ≤60s 一拍 evaluate 会看到该消息 error=aborted 并走 pause，用户下条消息自然恢复。
     return {
       event: async ({ event }: any) => {
         if (event?.type !== "message.updated") return
@@ -460,7 +488,19 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
         const err: any = info?.error
         const signal = typeof err === "string" ? err : `${err?.name ?? ""} ${err?.type ?? ""} ${err?.message ?? ""}`
         if (info?.role === "assistant" && isAbortSignal(err) && /aborted|interrupt/i.test(signal)) {
-          writeCtlStopped(true, "user", "GUI/TUI interrupt")
+          // R1553：ESC = 仅暂停该会话本轮，**不写全局 loop-ctl 硬闸**（此前写
+          // stopped=true 导致整循环死透）。TUI 侧是独立进程/实例，内存 skipState
+          // 传不到 serve 侧 —— 只落盘遥测，serve 侧下一拍 evaluate（≤60s）会看到
+          // 该消息 error=aborted 并走 pause（per-session），用户下条消息自然恢复。
+          noteAbortEvent({
+            ts: Date.now(),
+            session: String(info?.sessionID ?? ""),
+            name: typeof err === "string" ? err : String(err?.name ?? err?.type ?? "unknown"),
+            verdict: "pause",
+            fresh: true,
+            userAfter: false,
+            src: "tui-event",
+          })
         }
       },
     }
@@ -602,7 +642,12 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
 
   const markerApplied = new Map<string, string>()
   const applyMarker = async (sessionID: string, enabled: boolean): Promise<void> => {
-    // R1832：换代护栏（唯一写入入口统一拦截，理由见 live v2lib/auto-continue.ts 同名注释）。
+    // R1832：换代护栏（唯一写入入口统一拦截）。applyMarker 由多个 caller 异步触发
+    // （acTimer/markerTimer/boot），而 acTimer 的 AC_GEN_KEY 判定在其回调**末尾**
+    // （末尾判定是为保留最后一次 superseded 日志）：被换代的实例在 clearInterval 前，
+    // 仍会用**最长 2s 缓存**的 currentLoopTarget() 应用一次标题标记，可能给旧会话临时
+    // 挂上 [LOOP]（新实例一般 5s 内自愈，但这本可避免）。在此统一拦一道，任何 caller
+    // 的时序都不会再让陈旧实例写标记。判断只拦**过期**实例，当前实例恒等于 myGenAc。
     if ((globalThis as Record<string, unknown>)[AC_GEN_KEY] !== myGenAc) return
     if (!isSessionID(sessionID)) return
     const sessionAny = (client as any)?.session
@@ -640,7 +685,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     if (!sessionID || !isSessionID(sessionID)) return
     let enabled = true
     try {
-      enabled = readCtl()?.stopped !== true
+      enabled = !loopGateStopped(readCtl(), sessionID)
     } catch {
       enabled = true
     }
@@ -652,7 +697,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     const cur = currentLoopTarget()
     let state = "running"
     try {
-      if (readCtl()?.stopped === true) state = "stopped"
+      if (cur && loopGateStopped(readCtl(), cur)) state = "stopped"
     } catch {
       /* keep default */
     }
@@ -771,8 +816,12 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       rejectedLifetime = true
       ctxLifetimeRejected++
       if (ctxLifetimeRejected <= 5 || ctxLifetimeRejected % 50 === 0) {
+        // R1736：用 info 而非 error。**这是一个已被成功处理的正常动作**，不是失败：
+        // 守卫识别出宿主把生命周期累计值当窗口值丢了，随后回退到 ledger 继续判定。
+        // 记成 error 会污染"error 级日志数 = 0"这个健康判据 —— R1736 就因为它一度
+        // 看到 10 条 error 而白查一轮（真问题只有 0 条）。日志文本保持可 grep。
         await log(
-          "error",
+          "info",
           `auto-continue: ctx usage rejected (lifetime counter, not window): sid=${sanitizeLog(sessionID).slice(0, 12)} u=${Math.round(u)} win=${CONTEXT_WINDOW} (rejected x${ctxLifetimeRejected})`
         )
       }
@@ -905,7 +954,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     kind: "round" | "recover"
   ): Promise<"ok" | "backoff" | "duplicate" | "stopped" | "deferred"> => {
     // 评估与实际 promptAsync 之间仍可能发生 ESC/主动停止；发送前再过一道总闸。
-    if (readCtl()?.stopped === true) {
+    // R1724：按会话判定（全局闸 + 该 sid 命中的单 Bot 闸）。
+    if (loopGateStopped(readCtl(), sessionID)) {
       await log("info", `auto-continue: ${kind}-inject suppressed before claim (session=${sanitizeLog(sessionID)})`)
       return "stopped"
     }
@@ -940,7 +990,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     // 用户指令：排队内容单独注入，不拼进循环文本（搭便车已下线）
     try {
       // claim 后、真正触网前再检查一次，避免 stop 落在 await/调度间隙。
-      if (readCtl()?.stopped === true) {
+      if (loopGateStopped(readCtl(), sessionID)) {
         unclaimInject(sessionID, msg.id)
         await log("info", `auto-continue: ${kind}-inject suppressed after claim (session=${sanitizeLog(sessionID)})`)
         return "stopped"
@@ -954,7 +1004,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         "session.promptAsync",
       )
       // promptAsync 返回不等于回合已经启动完成；若停止在调用期间到达，立即补发中断。
-      if (readCtl()?.stopped === true) {
+      if (loopGateStopped(readCtl(), sessionID)) {
         try {
           await (client.session as any).interrupt?.({ path: { id: sessionID } })
         } catch {
@@ -1312,18 +1362,43 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         settle(msg)
         if (isFatal(msg)) {
           const n = errorName(msg)
-          const completed = Number((msg as any).time?.completed ?? 0)
-          if (n === "MessageAbortedError") {
-            const fresh = completed > 0 && Date.now() - completed < ABORT_STALE_MS
-            const userAfter = lastUserTime > completed
-            if (fresh && !userAfter) {
-              // TUI/宿主的中断（ESC 或 /stop）必须留下持久停门；否则下一轮
-              // interval/rollcall 会把同一会话重新拉起。
-              writeCtlStopped(true, "user", "fresh assistant abort")
-              await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} error=${n} -> STOP(fresh user abort; persisted)`)
+          // R1548：ESC/宿主中断不再只认精确名 "MessageAbortedError"（host 实测写
+          // error=aborted），中止族错误统一过 classifyAbort：
+          //   新鲜且无用户后续  → 持久停闸（ESC//stop 语义）
+          //   新鲜但有用户后续  → 不停闸不发恢复提示（用户消息自然续跑，防双发）
+          //   陈旧（或无穷锚）  → 走既有 RECOVER（与 provider 瞬时错误同等待遇）
+          if (isAbortSignal(msg.error)) {
+            const d = classifyAbort({
+              completed: Number((msg as any).time?.completed ?? 0),
+              created: Number((msg as any).time?.created ?? 0),
+              lastUserTime,
+              staleMs: ABORT_STALE_MS,
+            })
+            noteAbortEvent({
+              ts: Date.now(),
+              session: sessionID,
+              name: n,
+              verdict: d.verdict,
+              fresh: d.fresh,
+              userAfter: d.userAfter,
+              src: "eval",
+            })
+            if (d.verdict === "pause") {
+              // R1553：ESC/宿主中断 = 仅暂停该会话本轮，**不写全局 loop-ctl 硬闸**、
+              // 不注入恢复提示；该会话下一条真实用户消息自然解除暂停（skipState 的
+              // lastId===newestId 短路逻辑保证）。其他会话照常循环，各会话相互独立。
+              skipState.set(sessionID, { lastId: newestId, reason: "user-abort-pause" })
+              await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} error=${n} -> PAUSE(session round paused; user message will resume, others continue)`)
               return
             }
-            await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} error=${n} -> RECOVER(abort, age=${Math.round((Date.now() - completed) / 1000)}s, userAfter=${userAfter})`)
+            if (d.verdict === "skip") {
+              // 用户在中止后继续发言：不自动注入恢复提示（避免与用户消息双发），
+              // 也不停闸 —— 用户消息/下一次评估自然续跑。
+              await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} error=${n} -> SKIP(abort but user active after; not reinjecting)`)
+              return
+            }
+            const age = d.anchor > 0 ? Math.round((Date.now() - d.anchor) / 1000) : -1
+            await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} error=${n} -> RECOVER(abort, age=${age}s, userAfter=${d.userAfter})`)
           } else {
             const streak = (fatalStreak.get(sessionID) ?? 0) + 1
             fatalStreak.set(sessionID, streak)
@@ -1723,9 +1798,22 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (info?.role === "assistant") {
           const err: any = info.error
           if (isAbortSignal(err)) {
-            // 事件到达即落盘，不等下一轮 evaluate；GUI/ESC 中断必须立即停循环。
-            writeCtlStopped(true, "user", "assistant interrupted")
-            await log("info", `auto-continue: assistant interrupted; loop stop persisted (${sanitizeLog(sid).slice(0, 12)})`)
+            // R1553：ESC/宿主中断 = 仅暂停该会话本轮（per-session skipState），
+            // 不写全局 loop-ctl 硬闸；该会话下一条用户消息自然恢复，其他会话照常。
+            if (sid) {
+              skipState.set(sid, { lastId: String(info?.id ?? ""), reason: "user-abort-pause" })
+              evaluateQueued(sid)
+            }
+            noteAbortEvent({
+              ts: Date.now(),
+              session: sid ?? "",
+              name: String(err?.name ?? err?.type ?? "unknown"),
+              verdict: "pause",
+              fresh: true,
+              userAfter: false,
+              src: "serve-event",
+            })
+            await log("info", `auto-continue: assistant interrupted; session pause persisted per-session (${sanitizeLog(sid).slice(0, 12)})`)
             return
           }
         }

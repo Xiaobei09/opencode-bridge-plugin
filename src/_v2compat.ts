@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { appendFileSync, chmodSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { gzipSync } from "node:zlib"
 import { makeBgWatch } from "./bg-watch"
 import { readBg } from "./bg-mode"
 
@@ -20,8 +21,10 @@ export interface V1Client {
   }
 }
 
-const TAP_PATH = "/tmp/opencode/v2plugin.log"
+export const TAP_PATH = "/tmp/opencode/v2plugin.log"
 const TAP_MAX = 2000000
+/** R1736：轮转时把被丢弃的部分 gzip 存这里（不丢证据）。R1735 已手工验证过这条路可行。 */
+export const LOG_ARCHIVE_DIR = "REDACTED_ROOT/.opencode/log-archive"
 const PRIVATE_FILE_MODE = 0o600
 // 插件日志含会话 ID、chat ID 与工具摘要；启动时修复旧文件权限，重建时沿用 0600。
 try {
@@ -29,31 +32,428 @@ try {
 } catch {
   /* file may not exist yet; creation below uses mode 0600 */
 }
-const tapLine = (line: string): void => {
+/**
+ * R1736：日志轮转 —— **保留的部分照旧，但被丢弃的部分改为 gzip 归档**。
+ *
+ * 为什么改（不是降噪，而是归档）：
+ *   原实现超限后 `data.slice(0.75)` → **前 75% 直接蒸发**。实测增速 ~10.5 KB/min、
+ *   上限 2 MB → 每 1–2.4 小时丢一次历史。于是 2026-10-01 02:37 那次"静默 30 分钟"
+ *   的证据，会被**我自己的日志策略**在约 1 小时后销毁 —— 而事后复盘恰恰依赖它。
+ *   R1735 已经手工归档过一次并验证可回溯（1.25 MB → 145 KB gzip），证明这条路可行。
+ *   与"把日志调少"相比，归档**不丢任何信息**：诊断能力完整保留，代价只是每 1–2 小时
+ *   一次几十 KB 的写入。降噪（bg-watch 948 行、心跳类 ~990 行）另作打算 —— 那些行
+ *   每条当初都有存在理由（例如 `fired=false` 正是"该弹窗没弹"的唯一依据），不能粗暴关掉。
+ *
+ * 拆成独立函数是为了**能真测**：原来这段逻辑内嵌在 tapLine 里、路径写死，
+ * 只能靠"等它自然发生"来观察 —— 而那意味着又一次"没验证过"。
+ */
+export type RotateResult = { rotated: boolean; archive?: string; keptBytes: number; archivedBytes: number; contended?: boolean }
+
+/**
+ * R1789：进程重启前的日志保全。
+ *
+ * 为什么要它：`/tmp/opencode` 会被清空（R1786 实测 08:07 重启时该目录三个日志**全部**归零，
+ * `systemd-tmpfiles-clean.timer` = active），而未到 2MB 阈值时 `rotateIfNeeded` 根本不会触发
+ * —— 于是重启前那 1.25MB 历史**既没归档也不轮转，直接消失**，且不留任何指针。
+ * R1786 实际损失了 04:00–08:07 的全部诊断证据。
+ *
+ * 做法：启动时若既有日志 ≥ minBytes，先强制归档到 archiveDir（R1786 已证 /root 不随 /tmp 消失），
+ * 只留 keepRatio 的尾巴（默认 5%）便于看重启前最后状态，并在日志里写 `[log] rotated` 指针。
+ *
+ * ⚠️ 刻意**不放在模块顶层**：tests/log-rotate.test.ts 会 import 本模块，
+ * 顶层执行会顺带轮转**生产日志**。故只导出函数，由启动路径显式调用（R1790 接线）。
+ */
+export function archiveOnStartup(o: {
+  path: string
+  archiveDir: string
+  minBytes?: number
+  keepRatio?: number
+  now?: number
+}): RotateResult {
+  const minBytes = o.minBytes ?? 65536
+  let size = 0
   try {
-    let size = 0
-    try {
-      size = statSync(TAP_PATH).size
-    } catch {
-      size = 0
+    size = statSync(o.path).size
+  } catch {
+    size = 0 // 文件不存在 = 新进程首启，无可保全
+  }
+  if (size < minBytes) return { rotated: false, keptBytes: size, archivedBytes: 0 }
+  // max: 0 → size(>0) > 0 恒成立，强制走归档分支；keepRatio 0.95 = 归档前 95%、留尾 5%
+  return rotateIfNeeded({ path: o.path, max: 0, archiveDir: o.archiveDir, keepRatio: o.keepRatio ?? 0.95, now: o.now })
+}
+
+/**
+ * R1814：轮转失败后，「归档到底有没有被回滚掉」的**唯一合法措辞**。
+ *
+ * 提成纯函数不是为了好看，是因为这条措辞**是** R1813 缺陷本体：
+ * R1813 在失败路径上先 append 一行写死的「…archive rolled back」，**然后**才去
+ * `unlinkSync(archive)`，而那个 unlink 失败会被 `catch{}` 吞掉 —— 于是
+ * **痕迹行在日志删不掉时仍然宣称「已回滚」**。R1813 修的病叫"谎报"，
+ * 它自己的失败路径又长出一个谎报。fs 动作没法在单测里造出「已建成却删不掉」
+ * （`chattr +i` 会让 `writeFileSync` 先失败，`archive` 直接是 undefined），
+ * 所以把**措辞**从 fs 副作用里剥出来穷举。
+ *
+ * 三个分支必须互斥且都不含歧义：
+ *  - 没建成归档（写档就失败了）：**不能说"已回滚"**，那是在声称做过一件没做的事
+ *  - 建成且删掉了：唯一的"成功"措辞
+ *  - 建成但没删掉：**必须带路径**，否则复盘者无从去 log-archive/ 手工处理
+ */
+export const rollbackVerdict = (hadArchive: boolean, orphanPath: string): string => {
+  if (!hadArchive) return "no archive was created"
+  if (orphanPath === "") return "archive rolled back"
+  return `archive NOT rolled back: ${orphanPath}`
+}
+
+/**
+ * R1818：offset 自愈的**目标值**判定（纯函数，分支互斥且穷举）。
+ *
+ * ## 这里原来错在哪（生产已触发过一次）
+ * offset 的约定是 `offset = 本 Bot 最后处理成功的 update_id + 1`。
+ * `real` 是服务端**当前最新** update_id（`getUpdates?offset=-1&limit=1` 的返回值，
+ * **不 +1**）。于是只要服务端队列非空，就有 `stored = real + 1`，即 `ahead = 1`。
+ * 旧判据只有 `if (stored <= real) return`，**没有 ahead 下限** → 把这个**常态**
+ * 当成「offset 越界」，回退到 `real`，也就是**那条已经处理过的 update**；
+ * 紧接着又 `seenUpdates.clear()` 清空去重环 → 它会被重新投递并**重复回复用户**。
+ * 实证：2026-10-01T02:06:44.950Z primary 触发过一次，日志原文
+ * `offset ahead of server (…): stored=530870734 server=530870733 ahead=1; rewinding`。
+ * 当时没造成重复，纯粹是因为 40 秒后有新入站把落盘值又推了回去 —— **侥幸，不是设计**。
+ *
+ * ## 目标值为什么不是 `real`
+ * `real` 回答的是「服务端**有什么**」，不是「我们**消费到哪**」。拿它当 offset 会把
+ * 已处理的 update 重新纳入投递范围。真正的恢复点是 `lastReal + 1`：它只在
+ * `handleUpdateInner` 收到**真实** update 时推进（合成事件不推进），因此永远落在
+ * 本 Bot 自己的计数空间里，**即使 persistedOffset 已被污染也可靠**。
+ * 没有本地记录（lastReal<=0，刚启动）时才退回旧行为 `real`。
+ *
+ * ## 分支穷举（互斥）
+ *   - `sibling-space`：拿不到服务端真值，且 stored 高出兄弟基线 100 万以上 → 目标=兄弟
+ *   - `server-real`  ：stored 真的超前于本地消费位置 → 目标=lastReal+1（无记录则 real）
+ *   - `ok`           ：**常态**（含 ahead=1、stored<=real、stored 非法）→ 不动
+ */
+export type OffsetRewind = { target: number | null; why: "ok" | "sibling-space" | "server-real" }
+export const offsetRewindTarget = (o: {
+  stored: number
+  real: number | null
+  lastReal: number
+  sibling: number | null
+}): OffsetRewind => {
+  if (o.real === null) {
+    // 兄弟基线**只在拿不到服务端真值时**才用 —— 刻意保持原实现的这个可达性。
+    // 若放宽成「总是查兄弟」，一条 sibling=1 的坏状态文件就会让 stored>1000001 的
+    // 正常实例被判成「落在别人的计数空间」，凭空造出一条新的误报通道。
+    if (o.sibling !== null && Number.isFinite(o.stored) && o.stored > o.sibling + 1_000_000) {
+      return { target: o.sibling, why: "sibling-space" }
     }
-    if (size > TAP_MAX) {
-      // rotate instead of dropping: keep last quarter so observability never blinds
+    return { target: null, why: "ok" }
+  }
+  if (!Number.isFinite(o.stored) || o.stored <= 0) return { target: null, why: "ok" }
+  if (o.stored <= o.real) return { target: null, why: "ok" }
+  const target = Number.isFinite(o.lastReal) && o.lastReal > 0 ? o.lastReal + 1 : o.real
+  // ★ R1818 的核心修复：目标不比现值小就**什么都不做**。
+  // 常态 stored = lastReal+1 = real+1 → target === stored → 返回 ok，误触发归零。
+  // 这条守卫同时覆盖 ahead=1 与「target 恰好等于 stored」两种边界。
+  if (target >= o.stored) return { target: null, why: "ok" }
+  return { target, why: "server-real" }
+}
+
+export function rotateIfNeeded(o: { path: string; max: number; archiveDir: string; incoming?: string; keepRatio?: number; now?: number }): RotateResult {
+  const keepRatio = o.keepRatio ?? 0.75
+  let size = 0
+  try {
+    size = statSync(o.path).size
+  } catch {
+    size = 0
+  }
+  if (size <= o.max) return { rotated: false, keptBytes: size, archivedBytes: 0 }
+
+  // ── R1812：跨进程互斥（R1811 判"代价高于收益"，本轮**改判**）──────────────
+  // R1811 只找到通道 ①（归档重叠，R1810 实测 7706 行），当时判"锁会引入留锁风险，
+  // 代价高于收益"→ 不做。R1812 查出**同一个缺失的互斥**还有第二个通道：
+  //
+  //   ② **整行静默丢失**（本轮新发现，且日志里永远查不到）：
+  //      本函数 readFileSync(o.path) 之后、[writeFileSync(o.path, keep+…)]
+  //      （**截断重写**）之前，另一个实例的 tapLine 会 appendFileSync 进来一行。
+  //      那一行既不在 `drop`（归档用的是**更早那次读**算出来的），也不在 `keep`
+  //      （同样是更早那次读的后 25%）→ **整行蒸发，无任何痕迹**。
+  //      这正是 R1786 吃过的同型亏（04:00–08:07 的日志被自己的策略销毁），
+  //      区别是那次是"没归档"，这次是"归档了但中间那几行没了"。
+  //
+  // 一个缺失的互斥造成**两个**独立的真实丢数据通道 → 收益翻倍，锁必须做。
+  //
+  // 三条设计约束（每条都对应一个具体的坏想法）：
+  //  ① 锁必须覆盖 read→archive→truncate **全程**。只锁归档那一步等于没锁——
+  //     通道 ② 的窗口在归档**之后**。
+  //  ② 拿不到锁就**本轮不轮转、直接返回**，绝不等待/重试：`tapLine` 是每一行日志
+  //     都会走的热路径，等锁会把日志写入阻塞在文件 IO 上（更糟：日志一停，
+  //     watchdog 的判据就跟着瞎）。持锁者会替我们轮转。
+  //  ③ 必须防"进程猝死留下锁 → 日志无限增长"：锁 mtime 超过 LOCK_STALE_MS 即可 steal。
+  const ROTATE_LOCK_STALE_MS = 30_000
+  const lockPath = `${o.path}.rotlock`
+  const acquireRotateLock = (): number | undefined => {
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const data = readFileSync(TAP_PATH, "utf8")
-        const keep = data.slice(Math.floor(data.length * 0.75))
-        const nl = keep.indexOf("\n")
-        writeFileSync(TAP_PATH, (nl >= 0 ? keep.slice(nl + 1) : keep) + `${line}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+        return openSync(lockPath, "wx", PRIVATE_FILE_MODE)
       } catch {
+        let stale = true
         try {
-          writeFileSync(TAP_PATH, `${line}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+          stale = Date.now() - statSync(lockPath).mtimeMs > ROTATE_LOCK_STALE_MS
+        } catch {
+          stale = true // 锁 vanished → 当作可抢
+        }
+        if (!stale) return undefined
+        try {
+          unlinkSync(lockPath)
         } catch {
           /* ignore */
         }
       }
-      return
     }
+    return undefined
+  }
+  const lockFd = acquireRotateLock()
+  // R1815：拿不到锁 → `contended`。这不是"报个状态"，而是**唯一一处能让通道②变得可测**的地方：
+  // tapLine 的 appendFileSync 发生在**锁之外**（结构决定的，见 tapLine 注释），所以另一个
+  // 进程被挡在这里之后**照样会写**，而那一行正好可能落进持锁者的 read→rename 窗口。
+  // 不置这个标志，那个窗口就永远是隐形的——R1812 加锁时误以为已经关掉了通道②。
+  if (lockFd === undefined) return { rotated: false, keptBytes: size, archivedBytes: 0, contended: true }
+  try {
+    // 拿锁后必须**重新量一次**：抢锁期间持锁者可能刚截断过，size 也许已回落到阈值下。
+    // 不重量就会在"文件其实已经不大"的情况下白建一个空归档（比原 bug 更隐蔽）。
+    let size2 = 0
+    try {
+      size2 = statSync(o.path).size
+    } catch {
+      size2 = 0
+    }
+    if (size2 <= o.max) return { rotated: false, keptBytes: size2, archivedBytes: 0 }
+
+    let data = ""
+    try {
+      data = readFileSync(o.path, "utf8")
+    } catch {
+      // 读不出来就退化成"只留新行"（与原行为一致），不让日志写入整体失败
+      try {
+        writeFileSync(o.path, `${o.incoming ?? ""}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+      } catch {
+        /* ignore */
+      }
+      return { rotated: true, keptBytes: 0, archivedBytes: 0 }
+    }
+
+    // R1791：切点必须落在**行边界**。
+    // 原来 `cut` 是字节偏移，于是跨切点那一行前半截进归档（成为半行）、
+    // 后半截被下面那句 `keep.indexOf("\n")` 整段丢弃 → **每次轮转净丢一整行**。
+    // 证据：R1790 首个生产归档 v2plugin-20261001T083322Z.log.gz 的末行就是半行
+    //   `…T08:31:14.524Z [tg-bridge/alt] info`（缺 `: message`），活动日志首行已是下一条 `.528`。
+    // 代价虽小（约 2100 行丢 1 行），但丢的可能是"崩溃前最后一条出站"这种关键行。
+    const cut = Math.floor(data.length * keepRatio)
+    const cutLine = data.lastIndexOf("\n", cut - 1) + 1 // 最后一个完整行的行尾之后
+    // 一个完整行都凑不齐（cut 之前没有任何换行）→ 无从干净切分。
+    // 此时**不轮转**：宁可让文件超限，也不能丢日志。正常路径不会走到
+    // （minBytes=64KB、TAP_MAX=2MB 都远大于单行长度），但必须有断言钉住这条退化路径。
+    if (cutLine <= 0) return { rotated: false, keptBytes: size, archivedBytes: 0 }
+    const drop = data.slice(0, cutLine) // 末尾必为换行 → 归档末行是完整行
+    const keep = data.slice(cutLine) // 已从行首开始，**不能再 skip**（skip 会整行丢掉一条完整行）
+
+    // ── R1811：防「归档重叠」─────────────────────────────────────────────────
+    // `rotateIfNeeded` 是「先写归档、再 writeFileSync 截断」**两步、非原子**。
+    // 若归档写成而截断没生效（进程死在两步之间；或两个轮转者——三 bot 实例 / 多进程
+    // 共用同一份 tap 文件，`poll lease` 机制本身就说明会争用——读到同一份未截断的文件），
+    // 下一次轮转会把**同一前缀再归档一遍**。
+    // 生产实证（R1810）：v2plugin-20261001T033605Z 与 T045928Z 两档**重叠 7706 行**
+    // （后一档 9143 行里 7706 行逐字相同，且首行时间与前一档完全一样 00:42:55）。
+    //
+    // 修法：**把指针行当账本**。指针行本来就必须写进日志（R1735 的运维坑：否则日后复盘
+    // 看到日志少一大段，却完全不知道去哪找），于是顺手在末尾追加
+    // `through T<ISO>` = 本次归档**最后一行**的时间戳。下次轮转若 `drop` 里已含这样的
+    // 指针行，说明这段前缀**已经归档过** → 只归档 T 之后的新行；截断照旧照做。
+    //
+    // 为什么不用独立状态文件：指针行与被归档内容在**同一个文件、同一次 writeFileSync** 里，
+    // 不存在"状态写了但没截断"的中间态——而独立状态文件必须额外处理这个窗口，
+    // 恰好就是它要修的那个窗口。
+    // ★ R1811 撤回记录（保留这段注释是有意的，别当垃圾删）：
+    // 我第一版修法是"指针行当账本"——指针行末尾写 `through T<ISO>`，下次轮转若 `drop`
+    // 里已含该时间点，就把 `drop` 裁成那行之后的新行（增量归档）。
+    // **写完自己推演，发现它在真实失败模式下是死代码**：
+    //   ① 正常流程：`through T` 那一行**已随截断离开文件**（T 就是 drop 的最后一行，
+    //      keep 从它的下一行开始）→ 下次在 `drop` 里**找不到**那行 → 裁剪永不触发；
+    //   ② 跨进程竞态：B 读的是**截断前**的内容，里面**根本没有 A 的指针行**
+    //      （A 的指针行是随截断一起写进新文件的）→ 裁剪同样永不触发。
+    // 两条路都落空，还平白多出"读到指针行就裁、裁错就丢日志"的新风险 → 本轮撤回。
+    //
+    // 正确修法是**跨进程互斥**：read→archive→truncate 全程持 `openSync(lock,"wx")`
+    // 排他锁（配过期超时防猝死留锁），拿不到锁就本轮不轮转。
+    // 本轮**不实施**：该竞态 8 档里只出现 1 次、此后 6 轮全 0 重叠；而排他锁会引入
+    // "留锁 → 日志无限增长"这个**新的**失效模式，代价高于当前收益 → 登记为"复发即实施"。
+    //
+    // 本轮只做**零行为变更**的一件事：指针行末尾追加 ` through T<ISO>`，
+    // 让每档归档自带边界 —— 将来一旦复发，一眼就能看出"重叠从哪一行开始"。
+    const ISO_HEAD = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z) /
+    const dLines = drop.split("\n")
+
+    // 先归档再截断：归档失败也要照常轮转（不能因为归档不上就无限增长）
+    let archive: string | undefined
+    const ts = new Date(o.now ?? Date.now()).toISOString().replace(/[-:]/g, "").replace(/\..+$/, "Z")
+    try {
+      mkdirSync(o.archiveDir, { recursive: true })
+      archive = `${o.archiveDir}/v2plugin-${ts}.log.gz`
+      writeFileSync(archive, gzipSync(Buffer.from(drop, "utf8")), { mode: PRIVATE_FILE_MODE })
+    } catch {
+      archive = undefined
+    }
+
+    // 指针行：轮转后必须**在日志里留下"历史被挪到哪了"**，否则未来复盘时看到日志突然
+    // 少了一大段，却完全不知道去哪找 —— 这正是 R1735 发现的那个运维坑本身。
+    // 写成 ASCII：日志可能被 grep/awk 按字节处理，且这份指针是要给人看的最短路径。
+    // R1811：末尾追加 ` through T<ISO>`（本次归档**最后一行**的时间戳）——
+    // 这行同时就是下一轮"已归档到哪"的账本，见上面 R1811 注释。
+    // 取 ISO 要**从末尾往前找**：`drop` 的最后一行有可能本身就是上一轮的指针行（无时间戳）。
+    let lastIso = ""
+    for (let i = dLines.length - 2; i >= 0; i--) {
+      const m = ISO_HEAD.exec(dLines[i] ?? "")
+      if (m) {
+        lastIso = m[1] ?? ""
+        break
+      }
+    }
+    const marker = archive
+      ? `[log] rotated: older lines archived to ${archive} (read: zcat <file>)${lastIso ? ` through T${lastIso}` : ""}\n`
+      : ""
+    // ── R1813：截断写必须是「**原子替换 + 可失败可见**」────────────────────
+    // 旧写法 `writeFileSync(o.path, keep+marker+…)` 有**两个**独立缺陷，R1812 的锁都盖不住
+    // （锁防的是"两个轮转者"，而 03:36:05 那次**只有一个**写入者 pid=671）：
+    //
+    //   ① **静默失败**：writeFileSync 抛错（ENOSPC/EACCES/EMFILE…）会一路冒到 tapLine 的
+    //      `catch {}` 被吞掉 → 归档**已经落盘**却谎称"这些行已归档"，而日志**根本没被截断**、
+    //      指针行也没写进去。后果不是丢数据，而是**下一次轮转把同一批行再归档一遍**
+    //      （R1810 实测的 7707 行重叠，失败点已用指针行计数法定位到 03:36:05 那一次：
+    //      T045928Z 跨度 00:42:55→04:00:35 完整包含 T033605Z 的 7707 行，且两档指针行都是 0）。
+    //      零痕迹 —— 这就是为什么它躲过了 3 轮筛查。
+    //   ② **失败即毁日志**：writeFileSync 是**截断写**，中途失败会在 o.path 留下一个
+    //      **残缺文件**。那比"不轮转"糟得多：keep 区（已归档的那 75% 的最新部分）当场蒸发。
+    //
+    // 修法：写临时文件 → `renameSync` 原子替换（同目录内 rename 是原子的）。
+    //   - 成功：与旧行为**逐字一致**（content 完全相同，inode 换了但路径语义不变）。
+    //   - 失败：**原日志一个字节都没动过**（rename 从未发生），删掉临时文件即可；
+    //     再把 `rotated` 报 false，让 tapLine 继续 appendFileSync（那行日志不会因此丢）。
+    //   - 留痕：写一条 `[log] rotate FAILED`（**不能走 tapLine/logLine**：那会重入本函数
+    //     拿锁 → 自死锁），直接 appendFileSync 到 o.path。此时文件必然完好（写失败了才到这），
+    //     所以这条痕迹**一定留得住**——这正是旧实现最缺的东西。
+    const tmpPath = `${o.path}.rot-tmp`
+    let truncated = false
+    try {
+      writeFileSync(tmpPath, keep + marker + `${o.incoming ?? ""}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+      renameSync(tmpPath, o.path)
+      truncated = true
+    } catch {
+      // 只清临时文件。**绝不碰 o.path**：它现在仍是那份完整未截断的日志，是唯一的数据副本。
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!truncated) {
+      // 归档已经落盘却没截断 → 它是一份**重复副本**（R1810 的重叠就是它）。
+      // 留着它只会让下次轮转再重叠一次；但删之前必须先留下"发生过什么"的痕迹。
+      //
+      // R1814：痕迹行与回滚**换序**，并让它**只说实话**。R1813 写的是「先 append 一行
+      // 『…archive rolled back』，再去 unlink」——两个毛病叠在一起：
+      //   ① unlink 可能**失败**，而失败被 `catch{}` 吞掉 → 痕迹行仍然宣称"已回滚"，
+      //      **说谎**。R1813 修的就是"谎报"，结果自己在失败路径上又造了一个。
+      //   ② 删不掉的归档会**永久留在** log-archive/ 里，且文件名与真归档**一模一样**。
+      //      这比重叠更坏：重叠的归档**内容至少是对的**；冒充的归档会让
+      //      "这些行已经安全归档了"这个判断彻底失效（复盘者按名字读它，读到的却是
+      //      一份**会与后续档无限重叠**的副本）。
+      // → 所以：**先回滚、拿到真实结果、再写痕迹**，痕迹里带上真实结果；
+      //   删不掉就改名成 `.orphan`，让"这不能当归档用"**写在文件名里**，
+      //   这样即使痕迹行也丢了，看名字的人也不会上当。
+      let orphanPath = ""
+      if (archive) {
+        try {
+          unlinkSync(archive)
+        } catch {
+          const orphan = `${archive}.orphan`
+          try {
+            renameSync(archive, orphan)
+            orphanPath = orphan
+          } catch {
+            // 连改名都不行（目录不可写等）：如实记下**原路径**并明说"删不掉"，
+            // 绝不粉饰。复盘时按这个名字去 log-archive/ 手工处理。
+            orphanPath = `${archive} (rename to .orphan also failed)`
+          }
+        }
+      }
+      const verdict = rollbackVerdict(archive !== undefined, orphanPath)
+      const stamp = new Date(o.now ?? Date.now()).toISOString()
+      try {
+        appendFileSync(o.path, `${stamp} [log] rotate FAILED (truncate aborted; log left intact; ${verdict})\n`, {
+          encoding: "utf8",
+          mode: PRIVATE_FILE_MODE,
+        })
+      } catch {
+        /* ignore */
+      }
+      try {
+        // stderr 是最后一道留痕：万一 o.path 连 append 都失败（磁盘满），这里仍在。
+        console.error(`[log] rotate FAILED (truncate aborted): log left intact; ${verdict}`)
+      } catch {
+        /* ignore */
+      }
+      // keptBytes 用 size2（拿锁后重量的那个），不是外层 size —— 外层是**抢锁前**的陈旧值，
+      // 报它会让"日志还剩多大"这个数字在故障现场直接说谎。
+      return { rotated: false, archive: undefined, keptBytes: size2, archivedBytes: 0 }
+    }
+    return { rotated: true, archive, keptBytes: keep.length, archivedBytes: archive ? drop.length : 0 }
+  } finally {
+    // 释放锁**必须**在 finally：上面任何一条 return（含"重新量后已达标"那条）
+    // 都会跳过它。漏掉一次就是 30 秒内日志不轮转 —— 按约束 ② 那不阻塞写入，
+    // 但会白白让文件超限 30 秒，所以不能省。
+    try {
+      closeSync(lockFd)
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(lockPath)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// 轮转争用计数：tapLine 在锁**之外** append，所以被挡在锁外的另一个写入者仍会落一行，
+// 而那一行可能正好落在持锁者的 read→rename 窗口里 → 整行蒸发（R1812 通道②）。
+// R1812 加锁时**误以为已经关掉了它** —— 锁只关掉了通道①（两个轮转者）。
+// 这里不做修复，只让它**可数**：争用才计数（不是"真的丢了"才计），计数为 0 就等于
+// 证明这个宿主上从来没有第二个写入者，那个窗口也就不存在。措辞必须说"可能"。
+let rotateContended = 0
+let rotateContendedTraceAt = 0
+const ROTATE_CONTENDED_TRACE_MS = 60_000
+
+const tapLine = (line: string): void => {
+  try {
+    const r = rotateIfNeeded({ path: TAP_PATH, max: TAP_MAX, archiveDir: LOG_ARCHIVE_DIR, incoming: line })
+    if (r.rotated) return
     appendFileSync(TAP_PATH, `${line}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+    if (r.contended) {
+      rotateContended += 1
+      // 节流留痕。**不能走 logLine**：它会 tapLine 回来 → 再次进 rotateIfNeeded → 争用时
+      // 计数再增 → 自己把自己的节流窗口吃掉，且这条痕迹是被争用的写入**推**出来的，
+      // 用它计数会把"观测"变成"观测的一部分"。
+      if (Date.now() - rotateContendedTraceAt >= ROTATE_CONTENDED_TRACE_MS) {
+        rotateContendedTraceAt = Date.now()
+        try {
+          appendFileSync(
+            TAP_PATH,
+            `${new Date().toISOString()} [log] rotate CONTENDED (n=${rotateContended}; another writer holds the lock, lines appended in its read-rename window MAY be lost)\n`,
+            { encoding: "utf8", mode: PRIVATE_FILE_MODE },
+          )
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
   } catch {
     /* best-effort */
   }
@@ -1294,20 +1694,45 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
               return true
             }
           },
-          promoteMs: 60_000,
+          promoteMs: () => {
+            // R1505：阈值可调（background-mode.json 的 promoteMs，默认 60s）。
+            // 每次起计时现读 → 用户 `/background th 90` 改完立即生效，无需重载插件。
+            try {
+              const ms = readBg().promoteMs
+              return Number.isFinite(ms) && ms >= 1_000 ? ms : 60_000
+            } catch {
+              return 60_000
+            }
+          },
           log: (line) => logLine(id, "info", `[bg-watch] ${line}`),
-          promote: async (sid: string) => {
+          promote: async (sid: string, evId?: string) => {
             // 优先进程内 client RPC（免票）；不行再走本机 HTTP 兜底。
             const c: any = (context as any)?.client
+            // R1607：转后台成功后通知桥侧（各 bot 实例注册的全局钩子）在
+            // 「原来消息」（shell 执行卡片）末尾追加一行提示 —— 用户指令
+            // 「在shell提升到后台时，在原来消息末尾增加一行提示」。
+            const firePromotedHooks = async (sid: string, evId?: string): Promise<void> => {
+              const G = globalThis as any
+              const arr = Array.isArray(G.__oc_bg_promoted_hooks__) ? [...G.__oc_bg_promoted_hooks__] : []
+              for (const h of arr) {
+                try {
+                  await h?.fn?.(sid, evId)
+                } catch (err) {
+                  logLine(id, "warn", `[bg-watch] promoted hook err: ${String(err).slice(0, 120)}`)
+                }
+              }
+            }
             try {
               if (c && typeof c.background === "function") {
                 const out = await c.background({ sessionID: sid })
                 logLine(id, "info", `[bg-watch] promote via client.background sid=${sid.slice(0, 12)} ok`)
+                await firePromotedHooks(sid, evId)
                 return out
               }
               if (c?.session && typeof c.session.background === "function") {
                 const out = await c.session.background({ sessionID: sid })
                 logLine(id, "info", `[bg-watch] promote via client.session.background sid=${sid.slice(0, 12)} ok`)
+                await firePromotedHooks(sid, evId)
                 return out
               }
             } catch (err) {
@@ -1316,6 +1741,7 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
             try {
               const out = await postLocalAPI(sid, "background")
               logLine(id, "info", `[bg-watch] promote via HTTP /background sid=${sid.slice(0, 12)} ok`)
+              await firePromotedHooks(sid, evId)
               return out
             } catch (err) {
               logLine(id, "error", `[bg-watch] promote 全部路径失败: ${String(err).slice(0, 200)}`)

@@ -32,12 +32,18 @@ export interface BgWatchEvent {
 export interface BgWatchDeps {
   /** 熔断：false 时全程静默。外面接 config（默认读 background-mode.json 的 shellPromo）。 */
   enabled: () => boolean
-  /** 超时阈值 ms，默认 60_000 */
-  promoteMs?: number
+  /**
+   * 超时阈值 ms，默认 60_000。
+   * R1505 起接受「数字」或「返回数字的函数」：函数会在**每次起计时时**现读
+   * （读 background-mode.json 的 promoteMs），做到改配置立即生效、无需重载。
+   */
+  promoteMs?: number | (() => number)
   /** 只读日志（可空） */
   log?: (line: string) => void
-  /** 触发转后台：POST /api/session/:id/background（注入以便单测） */
-  promote: (sessionID: string) => Promise<unknown>
+  /** 触发转后台：POST /api/session/:id/background（注入以便单测）。
+   *  R1610：第二参 evId = 被 promote 调用的标识（watch key 第三段，v2 为 call_XXX / TUI 为 call_function_XXX），
+   *  桥侧据此精确编辑对应执行卡、避免扫描选错卡与日志洪泛。 */
+  promote: (sessionID: string, evId?: string) => Promise<unknown>
   /** 测试注入时钟 */
   now?: () => number
   /** 测试注入计时器 */
@@ -48,6 +54,7 @@ export interface BgWatchDeps {
 interface WatchEntry {
   timer: unknown
   startedAt: number
+  thresholdMs: number
   fired: boolean
 }
 
@@ -55,11 +62,15 @@ const keyOf = (ev: BgWatchEvent): string =>
   `${ev.sessionID ?? "?"}:${ev.messageID ?? "?"}:${ev.id ?? "?"}`
 
 export function makeBgWatch(deps: BgWatchDeps) {
-  const promoteMs = deps.promoteMs ?? DEFAULT_PROMOTE_MS
   const log = deps.log ?? (() => {})
   const now = deps.now ?? Date.now
   const setTimer = deps.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimeoutFn ?? ((t) => clearTimeout(t as ReturnType<typeof setTimeout>))
+  /** 现读阈值：数字直接用（保持 R1488 语义）；函数每次起计时时调一次（改配置立即生效）。 */
+  const th = (): number => {
+    const v = typeof deps.promoteMs === "function" ? deps.promoteMs() : deps.promoteMs
+    return typeof v === "number" && Number.isFinite(v) ? Math.max(1, Math.round(v)) : DEFAULT_PROMOTE_MS
+  }
   const entries = new Map<string, WatchEntry>()
   let dead = false
 
@@ -69,13 +80,16 @@ export function makeBgWatch(deps: BgWatchDeps) {
     if (!e) return // after 已清过 → 不 promote
     if (e.fired) return
     e.fired = true
-    log(`promote session=${String(sid).slice(0, 12)} (elapsed=${Math.round((now() - e.startedAt) / 1000)}s >= ${Math.round(promoteMs / 1000)}s)`)
+    log(`promote session=${String(sid).slice(0, 12)} (elapsed=${Math.round((now() - e.startedAt) / 1000)}s >= ${Math.round(e.thresholdMs / 1000)}s)`)
     // 保持 e.fired=true 与 entries 存在，避免竞态双发；after 到达时由 onAfter 清理。
-    deps.promote(sid).catch((err) => log(`promote failed: ${String(err).slice(0, 120)}`))
+    // R1610：把被 promote 的调用标识（key 第三段 = ev.id，v2 为 call_XXX、TUI 为 call_function_XXX）
+    // 一并传给 promote，桥侧借此**精确**定位那张执行中卡片，避免扫描选错卡/日志洪泛。
+    const evId = String(key).split(":").slice(2).join(":") || undefined
+    deps.promote(sid, evId).catch((err) => log(`promote failed: ${String(err).slice(0, 120)}`))
   }
 
   return {
-    /** execute.before：tool=shell 且开启时起 60s 计时 */
+    /** execute.before：tool=shell 且开启时起计时（阈值现读） */
     onBefore(ev: BgWatchEvent): void {
       if (dead) return
       if (!deps.enabled()) return
@@ -83,10 +97,11 @@ export function makeBgWatch(deps: BgWatchDeps) {
       const key = keyOf(ev)
       const old = entries.get(key)
       if (old) clearTimer(old.timer)
-      const entry: WatchEntry = { timer: null as unknown, startedAt: now(), fired: false }
-      entry.timer = setTimer(() => fire(key, String(ev.sessionID ?? "")), promoteMs)
+      const ms = th()
+      const entry: WatchEntry = { timer: null as unknown, startedAt: now(), thresholdMs: ms, fired: false }
+      entry.timer = setTimer(() => fire(key, String(ev.sessionID ?? "")), ms)
       entries.set(key, entry)
-      log(`watch start tool=${ev.tool} key=${key} (promote in ${Math.round(promoteMs / 1000)}s)`)
+      log(`watch start tool=${ev.tool} key=${key} (promote in ${Math.round(ms / 1000)}s)`)
     },
     /** execute.after：该步结束 → 计时作废 */
     onAfter(ev: BgWatchEvent): void {
