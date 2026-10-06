@@ -1143,6 +1143,20 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       // R1048：关闭清单**优先于**粘性标志 —— 用户显式 /loop off 的会话，
       // 即使历史上被登记过、或消息里带标记词，也不该被驱动。
       let loop = loopSessions.has(sessionID) && !loopOffSessions.has(sessionID)
+      // R1896：front/pinned 目标会话默认入循环（「默认一直跑，/loop stop 才停」是
+      // /loop help 承诺的语义）。缺口：正向注册表 loop-sessions.json 只有「消息带标记词」
+      // 或「/loop on」时才会被创建；文件不存在（新装/清库/迁移）时，R1839 的"目标保命"
+      // 合并（persistLoopSessions 内）又被 loopSessionsDirty 挡住永不执行 → front 会话
+      // 恒 loop=no → 每分钟 `eval begin … loop=no -> skip`，用户看到"自动循环没生效"，
+      // 而标题上却还挂着 [LOOP]（marker 由 syncLoopMarker 按闸门状态写，与注册表无关，
+      // 两套状态因此漂移）。标记词检测只是补充判据，不是唯一入口；显式 /loop off 仍然最优先。
+      if (!loop && !loopOffSessions.has(sessionID) && isLoopTarget(sessionID)) {
+        loop = true
+        if (!loopSessions.has(sessionID)) {
+          loopSessions.add(sessionID)
+          loopSessionsDirty = true
+        }
+      }
       let assistantCount = 0
       let lastUserTime = 0
       let lastAssistant: { info: AssistantMessage; text: string; parts: any[] } | undefined
