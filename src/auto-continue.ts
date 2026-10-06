@@ -293,10 +293,53 @@ const readLoopTarget = (): string => {
 // 为什么不是"每个 Bot 一个 auto-continue 实例"：同进程多实例会互相踩代号/租约/事件
 // 订阅（实测主实例定时器直接不触发，排查成本极高）。一个定时器 + 多个目标没有这个问���。
 // 附加目标由 AC_EXTRA_TARGETS 指定（逗号分隔的状态文件路径），各自 front 优先、pinned 兜底。
-const EXTRA_TARGET_PATHS = (process.env.AC_EXTRA_TARGETS ?? "")
-  .split(",")
-  .map((x) => x.trim())
-  .filter((x) => x.startsWith("/"))
+//
+// R1899：env 缺省时**从 Bot 注册表自动发现**。此前本 env 从未在任何配置里出现过 →
+// EXTRA_TARGET_PATHS 恒空 → 单实例只驱动 tg-chats.json（primary）的目标，bot2/bot3
+// 的 front 会话从不进目标集、也永不注册进 loop-sessions → 用户实测「另外那个会话
+// 也不能自动循环」（2026-10-07）。而"多目标单实例"本就是设计架构（见上文注释），
+// 只是入口一直没人配。自动发现的状态文件命名与 tg-bridge 装载器的 statePath 推导
+// 完全一致（首个沿用 tg-chats.json，其余 tg-chats-<id>.json，sfx=`-${id}`），
+// 这样保住「往注册表加一个 bot 即一键接入（含循环目标）」的性质——env 显式配置时
+// 仍优先生效（显式覆盖推导）。纯函数导出可单测（不碰文件系统/进程 env）。
+export const resolveExtraTargetPaths = (
+  envVal: string | undefined,
+  registryJson: string | null,
+  root = "REDACTED_ROOT",
+): string[] => {
+  const fromEnv = (envVal ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x) => x.startsWith("/"))
+  if (fromEnv.length > 0) return fromEnv
+  if (!registryJson) return []
+  try {
+    const j = JSON.parse(registryJson) as { bots?: unknown[] }
+    const bots = Array.isArray(j.bots) ? j.bots : []
+    const out: string[] = []
+    bots.forEach((b, i) => {
+      const raw = (b as { id?: unknown } | null)?.id
+      const id = typeof raw === "string" ? raw : ""
+      if (!/^[A-Za-z0-9_-]+$/.test(id)) return
+      const p = i === 0 ? `${root}/.config/opencode/tg-chats.json` : `${root}/.config/opencode/tg-chats-${id}.json`
+      if (!out.includes(p)) out.push(p)
+    })
+    return out
+  } catch {
+    /* 注册表 JSON 坏了：退回"无附加目标"，不打断主目标 */
+    return []
+  }
+}
+const EXTRA_TARGET_PATHS = resolveExtraTargetPaths(
+  process.env.AC_EXTRA_TARGETS,
+  (() => {
+    try {
+      return readFileSync(process.env.TG_BOTS_PATH ?? "REDACTED_ROOT/.config/opencode/tg-bots.json", "utf8")
+    } catch {
+      return null
+    }
+  })(),
+)
 const readTargetFrom = (path: string): string => {
   try {
     const j = JSON.parse(readFileSync(path, "utf8")) as any
