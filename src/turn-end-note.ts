@@ -67,6 +67,13 @@ export const SYNTHETIC_LOOP_MARKERS = [
 export const isLoopPromptText = (text: string): boolean =>
   SYNTHETIC_LOOP_MARKERS.some((p) => String(text ?? "").startsWith(p))
 
+/** 自动循环注入提示（R227）：附在每次自动注入文本的**尾部**。
+ * 必须是尾部追加而非前缀 —— SYNTHETIC_LOOP_MARKERS 用 startsWith 判定，
+ * 前缀一旦挪动，tg-bridge 的合成消息识别与 turn-end 的 loop 判定会同时漏检。
+ * 文案与 tg-bridge 的注入回执保持同语义：明确「非用户新指令」。 */
+export const AUTO_INJECT_HINT =
+  "\n\n（自动注入提示：本消息由自动筛查循环自动发出，非用户新指令；如用户无新发言，按 (a) 复述“自动注入,无新指令”后继续。）"
+
 export const turnEndLine = (c: TurnEndCtx): string => {
   const head = c.loop ? "✅ 本轮完成" : "✅ 输出结束"
   const parts: string[] = [head]

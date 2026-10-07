@@ -6,6 +6,8 @@ import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailable
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
 import { classifyAbort, noteAbortEvent } from "./abort-classify"
+// R227：自动循环注入提示 —— 每次注入文本尾部统一附带，单一常量防三处漂移。
+import { AUTO_INJECT_HINT } from "./turn-end-note"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
@@ -1039,10 +1041,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         return "stopped"
       }
       // promptAsync 同样可能挂起 —— 一次挂起就会堵死该会话的整条评估链（见 evaluateQueued）。
+      // R227：尾部附自动注入提示（不动前缀，SYNTHETIC_LOOP_MARKERS 的 startsWith 判定不受影响）。
       await withTimeout(
         client.session.promptAsync({
           path: { id: sessionID },
-          body: { parts: [{ type: "text", text }] },
+          body: { parts: [{ type: "text", text: `${text}${AUTO_INJECT_HINT}` }] },
         }),
         "session.promptAsync",
       )
