@@ -67,4 +67,28 @@ describe("根菜单整理", () => {
     expect(dropRow).toBeGreaterThan(2) // 诊断/日志/列表排在危险动作之前
     expect(r[dropRow].map((x) => x.callback_data)).toContain("ma:dropq") // 两个 🗑 同排
   })
+
+  // R234 子页整理小步4：loop 页 4 行无孤行（除返回）；bg 页由 6 竖排收敛为 4 行、前两行成对。
+  it("loop 页 4 行：前 3 行成对，仅返回独立；紧急动作在首行", () => {
+    const r = rows("loop")
+    expect(r).toHaveLength(4)
+    for (let i = 0; i < 3; i++) expect(r[i], `row ${i}`).toHaveLength(2)
+    expect(r[3]).toHaveLength(1)
+    const first = r[0].map((x) => x.callback_data)
+    expect(first).toContain("ma:stop")
+    expect(first).toContain("ma:retry")
+    // 守卫详情与其两个开关连续排布（不隔行）
+    const info = r.findIndex((row) => row.some((x) => x.callback_data === "ma:guardinfo"))
+    const prob = r.findIndex((row) => row.some((x) => x.callback_data === "ma:guardprob"))
+    expect(prob).toBe(info + 1)
+  })
+
+  it("bg 页 4 行：前两行成对（动作+状态、两个自动开关），阈值独占第三行", () => {
+    const r = rows("bg")
+    expect(r).toHaveLength(4)
+    expect(r[0].map((x) => x.callback_data)).toEqual(["ma:bg", "ma:bgstatus"])
+    expect(r[1].map((x) => x.callback_data)).toEqual(["ma:bgauto", "ma:bgshell"])
+    expect(r[2].map((x) => x.callback_data)).toEqual(["ma:bgth"])
+    expect(r[3][0].callback_data).toBe("m:root")
+  })
 })

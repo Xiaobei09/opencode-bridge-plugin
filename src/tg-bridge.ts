@@ -2985,23 +2985,24 @@ export const buildMenuKeyboard = (
   }
   if (view === "loop") {
     // 只放「循环/回合/守卫」——后台相关挪去独立的 bg 页，队列/补发挪去 sys（R1505 归组）。
+    // R234 子页整理小步4：由 5 行 3 处孤行收敛为 4 行（守卫详情与循环开关联排，
+    // 两个守卫开关成对）；紧急动作（停止回合/重试）仍在首行最易点到。
     return [
       [b("⏹ 停止当前回合", "ma:stop"), b("🔁 重试上一条", "ma:retry")],
-      [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop")],
+      [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop"), b("🛡 守卫详情/最近触发", "ma:guardinfo")],
       [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
-      [b("🛡 守卫详情/最近触发", "ma:guardinfo")],
       [b("⬅️ 返回", "m:root")],
     ]
   }
   if (view === "bg") {
     // 后台专门页（R1505）：提升 + 自动转后台 + shell 自动后台 + 阈值 + 能力状态。
+    // R234 子页整理小步4：原 6 行每行 1 键（全竖排）→ 4 行；「立即转后台」与能力状态
+    // 联排（动作+其依据顺手可查），两个自动开关成对；阈值按钮文案较长独占一行。
     const nextSec = Math.round(bgThNext(bgMs) / 1000)
     return [
-      [b("🧵 立即转后台", "ma:bg")],
-      [b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto")],
-      [b(bgShellAuto ? "🖥 shell 自动后台：开" : "🖥 shell 自动后台：关", "ma:bgshell")],
+      [b("🧵 立即转后台", "ma:bg"), b("ℹ️ 后台能力/直连状态", "ma:bgstatus")],
+      [b(bgAutoOn ? "⚡ 自动转后台：开" : "⚡ 自动转后台：关", "ma:bgauto"), b(bgShellAuto ? "🖥 shell 自动后台：开" : "🖥 shell 自动后台：关", "ma:bgshell")],
       [b("⏱ 超时阈值：" + Math.round(bgMs / 1000) + "s › " + nextSec + "s", "ma:bgth")],
-      [b("ℹ️ 后台能力/直连状态", "ma:bgstatus")],
       [b("⬅️ 返回", "m:root")],
     ]
   }
