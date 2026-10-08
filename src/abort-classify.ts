@@ -38,6 +38,11 @@ export interface AbortClassifyArgs {
   staleMs?: number
   /** 测试注入时钟，默认 Date.now() */
   now?: number
+  /**
+   * 本插件实例的启动时刻（Date.now()）。R1910：用于区分「进程重启打断的在途回合」与
+   * 「用户按 ESC」。见 classifyAbort 内说明；缺省不参与判定（老行为）。
+   */
+  bootAt?: number
 }
 
 export interface AbortDecision {
@@ -54,8 +59,19 @@ export const classifyAbort = (a: AbortClassifyArgs): AbortDecision => {
   const anchor = a.completed > 0 ? a.completed : a.created
   const fresh = anchor > 0 && now - anchor < staleMs
   const userAfter = anchor > 0 && a.lastUserTime > anchor
+  // R1910：进程自己重启/热重载会打断在途回合（host 在**上一实例创建**的 assistant 消息上
+  // 写 error=aborted）。这不是用户按 ESC，不能按"新鲜中止 → pause"处理：pause 分支会
+  // `settle()` 把该消息记进 `decided`，而 evaluate 在拿消息后 `if (decided.has(msg.id)) return`
+  // 是**唯一不打日志的静默早退** —— 于是该会话此后每 60s 的评估都被它吞掉，永远走不到
+  // classifyAbort 的"超龄(>staleMs) → recover"分支，症状是**该会话循环永久停摆且无任何日志**
+  //（实测 bot2 两度停摆 30+ 分钟）。
+  // 判据：消息 time.created 早于本实例启动时刻 = 它是上一实例的在途回合、被我们的启动杀掉
+  //（真正的用户 ESC 只会发生在本实例启动之后，created >= bootAt）。→ recover 走既有恢复提示。
+  const restartCaused =
+    a.bootAt !== undefined && a.bootAt > 0 && a.created > 0 && a.created < a.bootAt
   let verdict: AbortVerdict = "recover"
-  if (fresh && !userAfter) verdict = "pause"
+  if (restartCaused) verdict = userAfter ? "skip" : "recover"
+  else if (fresh && !userAfter) verdict = "pause"
   else if (fresh && userAfter) verdict = "skip"
   return { verdict, fresh, userAfter, anchor }
 }

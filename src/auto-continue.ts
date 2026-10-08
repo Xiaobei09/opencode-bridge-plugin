@@ -15,6 +15,9 @@ const CONTEXT_WINDOW = 1_048_576
 const COMPACT_THRESHOLD = 0.7
 const COMPACT_EVERY = 450
 const ABORT_STALE_MS = 3 * 60 * 1000
+// R1910：本插件实例启动时刻。用于 classifyAbort 区分「进程重启打断的在途回合」（created
+// 早于本实例启动 → recover）与「用户按 ESC」（created 晚于启动 → pause）。见 abort-classify。
+const AC_BOOT_AT = Date.now()
 const STALL_SESSION_MSGS = 600
 
 // 规范状态文件仍为 REDACTED_ROOT/.opencode/loop-state.md（本会话约定）；提示词**刻意不写死路径**，
@@ -1443,6 +1446,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               created: Number((msg as any).time?.created ?? 0),
               lastUserTime,
               staleMs: ABORT_STALE_MS,
+              bootAt: AC_BOOT_AT,
             })
             noteAbortEvent({
               ts: Date.now(),
