@@ -3,7 +3,7 @@ import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
-import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl } from "./loop-guard"
+import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
 import { classifyAbort, noteAbortEvent } from "./abort-classify"
 // R227：自动循环注入提示 —— 每次注入文本尾部统一附带，单一常量防三处漂移。
@@ -1507,16 +1507,27 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           const gsig = detectGuardSignals(fullText, lastAssistant.parts)
           const gv = guardVerdict(gcfg, gsig)
           if (gv.trip && guardTripped.get(sessionID) !== msg.id) {
-            guardTripped.set(sessionID, msg.id)
-            writeCtlStopped(true, "auto-guard", gv.reason)
-            noteGuardTrip(gv.kind, gv.reason, sessionID)
-            settle(msg)
-            skipState.set(sessionID, { lastId: newestId, reason: "auto-guard" })
-            await log(
-              "info",
-              `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} -> SKIP(auto-guard ${gv.kind}: ${sanitizeLog(gv.reason).slice(0, 120)}; /loop start or menu resume to continue)`,
-            )
-            return
+            // R1902 持久化判重：同一条消息只判停一次，跨进程重启生效。
+            // 否则陈旧消息里的旧 [STATUS: STOP] 会在每次部署重启后重新拉全局闸
+            // （in-memory guardTripped 随重启清零 → /loop start 清闸也活不过下次重启）。
+            if (alreadyTripped(readGuardLastTrip(), sessionID, msg.id)) {
+              guardTripped.set(sessionID, msg.id)
+              await log(
+                "info",
+                `auto-continue: guard trip skipped (message already judged, run continues; session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(msg.id)})`,
+              )
+            } else {
+              guardTripped.set(sessionID, msg.id)
+              writeCtlStopped(true, "auto-guard", gv.reason)
+              noteGuardTrip(gv.kind, gv.reason, sessionID, msg.id)
+              settle(msg)
+              skipState.set(sessionID, { lastId: newestId, reason: "auto-guard" })
+              await log(
+                "info",
+                `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} -> SKIP(auto-guard ${gv.kind}: ${sanitizeLog(gv.reason).slice(0, 120)}; /loop start or menu resume to continue)`,
+              )
+              return
+            }
           }
         }
       }

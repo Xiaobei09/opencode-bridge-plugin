@@ -56,17 +56,31 @@ export const writeGuard = (cfg: GuardCfg, extra?: { lastTrip?: unknown }, path: 
   renameSync(tmp, path)
 }
 
-/** 记一次触发（供菜单回显）。**不**改开关本身。 */
-export const noteGuardTrip = (kind: string, reason: string, sessionID: string, path: string = GUARD_PATH): void => {
+/**
+ * 记一次触发（供菜单回显 + 跨重启判重）。**不**改开关本身。
+ *
+ * R1902：msgId 一并落盘 —— 守卫的 in-memory 判重（auto-continue 的 guardTripped Map）
+ * 在进程重启后清零，陈旧助手消息里的旧宣告会被**再次**拉闸（事故 2026-10-07：
+ * bot2 00:01 的 [STATUS: STOP] 在每次部署重启后一分钟内重新停掉全局循环）。
+ */
+export const noteGuardTrip = (
+  kind: string,
+  reason: string,
+  sessionID: string,
+  msgId: string = "",
+  path: string = GUARD_PATH
+): void => {
   try {
     const cur = readGuard(path)
-    writeGuard(cur, { lastTrip: { kind, reason: String(reason ?? "").slice(0, 200), sid: sessionID, at: Date.now() } }, path)
+    writeGuard(cur, { lastTrip: { kind, reason: String(reason ?? "").slice(0, 200), sid: sessionID, msgId, at: Date.now() } }, path)
   } catch {
     /* best-effort：记不住不影响停机本身 */
   }
 }
 
-export const readGuardLastTrip = (path: string = GUARD_PATH): { kind?: string; reason?: string; sid?: string; at?: number } | undefined => {
+export const readGuardLastTrip = (
+  path: string = GUARD_PATH
+): { kind?: string; reason?: string; sid?: string; msgId?: string; at?: number } | undefined => {
   try {
     const t = JSON.parse(readFileSync(path, "utf8"))?.lastTrip
     return t && typeof t === "object" ? t : undefined
@@ -76,6 +90,25 @@ export const readGuardLastTrip = (path: string = GUARD_PATH): { kind?: string; r
 }
 
 // ── 判定（纯函数）──────────────────────────────────────────────────────────
+
+/**
+ * R1902：这条消息是不是**已经判停过**（持久化判重，跨重启生效）？
+ *
+ * 事故（2026-10-07）：bot2 会话 00:01 的助手消息以独占行 [STATUS: STOP] 正当宣告停机，
+ * 但 in-memory 的 guardTripped Map 随进程重启清零 → 每次部署重启后 1 分钟内，
+ * 评估器再次看到这条**陈旧**消息 → 重新拉全局闸 → /loop start 清闸也只能活到下次重启。
+ * 用户观感就是「自动循环又失效了，两个会话都是这样」（闸是全局的，一个 bot 的旧宣告杀全部）。
+ *
+ * 判据：lastTrip 记录的 sid+msgId 与当前完全一致 = 同一条消息已判过，不再重复拉闸
+ * （此时放行继续注入 —— 用户 /loop start 的语义就是"这条我已处理，继续跑"）。
+ * 旧格式记录（无 msgId 字段）一律视为"没判过"：宁可多判一次并写入新格式，也不静默漏判。
+ */
+export const alreadyTripped = (
+  lastTrip: { sid?: string; msgId?: string } | undefined,
+  sid: string,
+  msgId: string
+): boolean =>
+  !!lastTrip && !!lastTrip.msgId && lastTrip.sid === sid && lastTrip.msgId === msgId
 
 /**
  * 三种信号**都必须独占一行**才生效。
