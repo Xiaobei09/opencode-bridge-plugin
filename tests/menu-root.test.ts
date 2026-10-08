@@ -48,4 +48,23 @@ describe("根菜单整理", () => {
       }
     }
   })
+
+  // R234 sys 页分组重排：诊断置顶、危险动作成对集中、除「返回」外全部成对（消除孤行）。
+  it("sys 页 10 行：前 9 行成对，仅末行返回按钮独立", () => {
+    const r = rows("sys")
+    expect(r).toHaveLength(10)
+    for (let i = 0; i < 9; i++) expect(r[i], `row ${i}`).toHaveLength(2)
+    expect(r[9]).toHaveLength(1)
+    expect(r[9][0].callback_data).toBe("m:root")
+  })
+
+  it("sys 页首行是只读诊断（info/digest），两个丢弃按钮成对同排且位于诊断之后", () => {
+    const r = rows("sys")
+    const firstData = r[0].map((x) => x.callback_data)
+    expect(firstData).toContain("ma:info")
+    expect(firstData).toContain("ma:digest")
+    const dropRow = r.findIndex((row) => row.some((x) => x.callback_data === "ma:drop"))
+    expect(dropRow).toBeGreaterThan(2) // 诊断/日志/列表排在危险动作之前
+    expect(r[dropRow].map((x) => x.callback_data)).toContain("ma:dropq") // 两个 🗑 同排
+  })
 })

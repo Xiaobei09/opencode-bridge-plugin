@@ -3005,18 +3005,22 @@ export const buildMenuKeyboard = (
       [b("⬅️ 返回", "m:root")],
     ]
   }
+  // R234 sys 页分组重排（菜单整理小步2）：
+  //  · 分区顺序 = 使用频率与风险：只读诊断置顶 → 队列操作 → 修整 → 危险动作（两个 🗑 丢弃
+  //    成对集中在一行，便于一眼识别、也避免与查看类动作穿插误点）→ 会话与身份 → 元信息 → 设置。
+  //  · 消除孤行按钮：原 12 行里 selfmute/healcards 各自独占一行，现全部成对（仅「返回」独立收尾）。
+  //  · 动作表零改动：所有 callback_data 沿用既有键，MENU_ACTION_TEXT 映射原样生效。
   if (view === "sys") {
     return [
       [b("ℹ️ 目标详情", "ma:info"), b("🕒 最近动态", "ma:digest")],
-      [b("📋 查看队列", "ma:queue"), b("🚀 立即补发", "ma:flush")],
-      [b("📡 队列置顶", "qpin"), b("🧽 清理旧按钮", "ma:stripall")],
-      [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
       [b("❌ 错误日志", "ma:errors"), b("📜 运行日志", "ma:logs")],
-      [b("🗂 会话列表", "ma:sessions"), b("🧬 迁移到新会话", "ma:migrate")],
-      [b("🤖 版本/owner", "ma:owner"), b("🪪 我是谁", "ma:whoami")],
-      [b("❓ 帮助", "ma:help"), b("🔢 版本号", "ma:version")],
-      [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute")],
-      [b("🩹 纠正卡住的工具卡", "ma:healcards")],
+      [b("📋 查看队列", "ma:queue"), b("🗂 会话列表", "ma:sessions")],
+      [b("🚀 立即补发", "ma:flush"), b("📡 队列置顶", "qpin")],
+      [b("🧽 清理旧按钮", "ma:stripall"), b("🩹 纠正卡住的工具卡", "ma:healcards")],
+      [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
+      [b("🧬 迁移到新会话", "ma:migrate"), b("🪪 我是谁", "ma:whoami")],
+      [b("🤖 版本/owner", "ma:owner"), b("🔢 版本号", "ma:version")],
+      [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute"), b("❓ 帮助", "ma:help")],
       [b("⬅️ 返回", "m:root")],
     ]
   }
@@ -6416,7 +6420,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         `状态文件 ${sanitizeLog(STATE_PATH)}`,
         `本 Bot 应答：${selfMute ? "只答命令" : "开启"}`,
         "",
-        "点下面查看诊断或执行维护动作。",
+        "上半页只读诊断；中段队列维护与丢弃（🗑）；底部为设置与帮助。",
       ].join("\n")
     }
     return [
