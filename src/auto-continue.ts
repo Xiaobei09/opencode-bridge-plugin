@@ -195,10 +195,75 @@ const ownsCtlWriter = (): boolean => {
   if (ctlInstanceGen <= 0) return true
   return (globalThis as Record<string, unknown>)[CTL_WRITER_KEY] === ctlInstanceGen
 }
+// R1915：守卫拉闸粒度从「全局单闸」改为「按会话所属 bot 的单 Bot 闸」。
+// 用户反馈（2026-10-08）：「停止应只停有问题的那个 bot，其他 bot 继续循环」。
+// 此前守卫写顶层 stopped=true（全局闸）→ 任一 bot 的 [SIGNAL:PROBLEM] 连坐停全部，
+// 恢复也要 /loop start all 清全部，与 R1724「不同机器人的循环设置要求单独」冲突。
+// 现在与桥侧 persistLoopStop(scopeAll=false) 同一模型：写 bots[<botId>].stopped=true，
+// 顶层 stopped 不动；该 bot 之后的 eval 被 loopGateStopped 命中即停，其他 bot 照常注入。
+// sid→bot 归属：从现有 loop-ctl 的 bots.<id>.sids 账本反查；单 bot 未写 sids（旧版本）
+// 或多 bot 共享同 sid 等无法唯一归属的场合，**降级回全局闸**（宁可全停也不错放）。
+const findOwnerBotId = (raw: unknown, sessionID: string): string | undefined => {
+  const j = (raw ?? {}) as { bots?: unknown }
+  const bots = j.bots
+  if (!bots || typeof bots !== "object") return undefined
+  let owner: string | undefined
+  for (const [bid, v] of Object.entries(bots as Record<string, unknown>)) {
+    const e = (v ?? {}) as { sids?: unknown }
+    const sids = Array.isArray(e.sids) ? (e.sids as unknown[]).filter((x): x is string => typeof x === "string") : []
+    if (sids.includes(sessionID)) {
+      if (owner !== undefined) return undefined // 多 bot 同 sid：无法唯一归属
+      owner = bid
+    }
+  }
+  return owner
+}
+const writeCtlBotStopped = (sessionID: string, by: string, reason = ""): boolean => {
+  if (!ownsCtlWriter()) return true // 非最新实例：不自作主张（调用侧仍可继续按已停处理）
+  try {
+    const prev = readCtl()
+    const bid = findOwnerBotId(prev, sessionID)
+    if (bid === undefined) {
+      // 找不到唯一归属（罕见：桥未绑定 sids / 多 bot 同 sid）→ 兜底写全局闸，保底别漏停。
+      writeCtlStopped(true, by, reason)
+      return true
+    }
+    const out = { ...prev, stopped: false }
+    const bots = { ...(out.bots ?? {}) }
+    const e = { ...((bots[bid] ?? {}) as object), stopped: true, by, reason: reason.slice(0, 200), ts: Date.now() }
+    bots[bid] = e
+    out.bots = bots
+    atomicWriteJson(LOOP_CTL_PATH, out)
+    return true
+  } catch {
+    writeCtlStopped(true, by, reason)
+    return true
+  }
+}
+/** SKIP 日志用：读该会话所属 bot 条目的 by/reason（bot 级闸的备注），供排队展示。 */
+const botStopMeta = (raw: unknown, sessionID: string): { by?: string; reason?: string } => {
+  try {
+    const j = (raw ?? {}) as { bots?: unknown }
+    const bots = j.bots
+    if (!bots || typeof bots !== "object") return {}
+    for (const v of Object.values(bots as Record<string, unknown>)) {
+      const e = (v ?? {}) as { stopped?: unknown; sids?: unknown; by?: unknown; reason?: unknown }
+      if (e.stopped !== true) continue
+      const sids = Array.isArray(e.sids) ? (e.sids as unknown[]).filter((x): x is string => typeof x === "string") : []
+      if (!sids.includes(sessionID)) continue
+      return { by: String(e.by ?? ""), reason: String(e.reason ?? "") }
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
 const writeCtlStopped = (stopped: boolean, by: string, reason = ""): void => {
   if (!ownsCtlWriter()) return
   try {
     // R1849：总闸跨进程共享，与 tg-bridge 的 `mutateLoopCtlFile` 同一文件。裸写有
+    // O_TRUNC 窗口，读侧（本侧 `readCtl`、桥侧 `loopStopped`）会 parse 失败 → 误判
+    // 为「没停」。改用 atomicWriteJson（tmp+rename）。
     // O_TRUNC 窗口，读侧（本侧 `readCtl`、桥侧 `loopStopped`）会 parse 失败 → 误判
     // 为「没停」。改用 atomicWriteJson（tmp+rename）。
     // R1891：必须**合并**而非覆盖。本文件按 loopGateStopped 的 schema 同时收两套账本：
@@ -1313,7 +1378,10 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (loopStoppedSkip && (loopStoppedSkip.reason === "loop-stopped" || loopStoppedSkip.reason === "auto-guard")) {
           let gateOpen = false
           try {
-            gateOpen = (readCtl()?.stopped ?? false) !== true
+            // R1915：清闸判定按会话感知 bot 级闸 —— 顶层 stopped 只是全局闸一种形态，
+            // 守卫/单 bot 停写在 bots[&lt;id&gt;].stopped。若只认顶层，单 bot 停期间
+            // gateOpen 恒 true → 粘性 skip 被误清，守卫等于没停。
+            gateOpen = !loopGateStopped(readCtl(), sessionID)
           } catch {
             gateOpen = true
           }
@@ -1351,11 +1419,16 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       try {
         const ctl = readCtl()
-        if (ctl?.stopped === true) {
+        // R1915：SKIP 判定兼容 bot 级闸 —— 守卫单 bot 停（bots[&lt;id&gt;].stopped）后，
+        // 该 bot 的会话也要能进这条统一 SKIP 路径（此前只认顶层 stopped，bot 级闸的
+        // 会话会漏掉 SKIP、每拍白跑 eval 到 inject 才被 loopGateStopped 挡）。
+        if (loopGateStopped(ctl, sessionID)) {
           // 停止是硬闸：只有桥接的显式 `/loop start` 才能解除。
           // 任意普通用户消息（包括含“循环”字样的历史消息）都不得自动复活自动续跑。
+          const stopBy = ctl?.stopped === true ? (ctl?.by ?? "?") : botStopMeta(ctl, sessionID)?.by ?? "?"
+          const stopReason = ctl?.stopped === true ? ctl?.reason : botStopMeta(ctl, sessionID)?.reason
           skipState.set(sessionID, { lastId: newestId, reason: "loop-stopped" })
-          await log("info", `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} -> SKIP(loop stopped by=${ctl?.by ?? "?"}${ctl?.reason ? ` reason=${sanitizeLog(ctl.reason).slice(0, 80)}` : ""}, /loop start to resume)`)
+          await log("info", `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} -> SKIP(loop stopped by=${stopBy}${stopReason ? ` reason=${sanitizeLog(stopReason).slice(0, 80)}` : ""}, /loop start to resume)`)
           return
         }
       } catch {
@@ -1532,7 +1605,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               )
             } else {
               guardTripped.set(sessionID, msg.id)
-              writeCtlStopped(true, "auto-guard", gv.reason)
+              // R1915：守卫按“出问题那个 bot”停单 bot 闸，其余 bot 照常循环（用户要求）。
+              writeCtlBotStopped(sessionID, "auto-guard", gv.reason)
               noteGuardTrip(gv.kind, gv.reason, sessionID, msg.id)
               settle(msg)
               skipState.set(sessionID, { lastId: newestId, reason: "auto-guard" })
