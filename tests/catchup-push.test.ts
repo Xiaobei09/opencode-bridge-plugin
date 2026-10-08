@@ -41,10 +41,22 @@ test("补扫幂等：跳过 proto 已有记录的键，且只补 boot 后消息"
   const block = lines.slice(start, idx).join("\n")
   expect(block).toContain("protoMap.keys()")
   expect(block).toContain("seen")
-  // 只补 boot 之后创建的消息（热重载不重推旧历史）。
+  // 只补 boot 之后创建或完成的消息（热重载不重推旧历史）。
   // R1894：该基线由 catchupBootAt 改名为 turnNoteBootAt（与 turn-note 共用同一启动基线），
   // 发布仓策展测试曾硬编码旧名 → 整仓 sanitize 同步 live 后此用例变红。
   expect(block).toContain("turnNoteBootAt")
+})
+
+test("R1912：跨重载完成的消息（createdAt<boot 但 completedAt>boot）也在补扫范围内", () => {
+  const idx = lines.findIndex((l) => l.includes("proto catchup pushed"))
+  let start = idx
+  while (start > 0 && !lines[start].includes("setInterval(() =>")) start--
+  const block = lines.slice(start, idx).join("\n")
+  // 双门控：创建于 boot 后（live）或完成于 boot 后（跨重载完成）都应补推；
+  // 二者皆 boot 前（旧历史）跳过。
+  expect(block).toContain("completedAt")
+  expect(block).toMatch(/createdAt > turnNoteBootAt \|\|/)
+  expect(block).toContain("completedAt > 0 && completedAt > turnNoteBootAt")
 })
 
 test("补扫只推正文/思考，且走 full 档 protoPushAssistantMessage", () => {

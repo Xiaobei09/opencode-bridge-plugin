@@ -9521,10 +9521,16 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         if (!hasText) continue
         const mid = String(m?.id ?? m?.info?.id ?? "")
         if (!mid) continue
-        // 与 turn-note 同一"本实例启动基线"：只补 boot 之后创建的消息，
+        // 与 turn-note 同一"本实例启动基线"：只补 boot 之后**创建或完成**的消息，
         // 避免每次热重载把旧历史重新推一遍。
+        // R1912：纯 createdAt 基线会漏掉「跨重载生成」的消息——createdAt 在 boot 前、
+        // 但正文/完成在 boot 之后才落地（实测 bot3 ROUND 76：09:49 创建，期间经历重载，
+        // ~10:00 才完成 → 旧实例没正文可推、新实例按 createdAt 判 boot 前 → 两侧都跳过，
+        // 正文永久丢失）。这里放宽为「创建于 boot 后 **或** 完成于 boot 后」；boot 前
+        // 已完成的旧历史仍然跳过，热重载不会重推一遍。
         const createdAt = Number(m?.time?.created ?? m?.info?.time?.created ?? 0)
-        if (!(createdAt > turnNoteBootAt)) continue
+        const completedAt = Number(m?.time?.completed ?? m?.info?.time?.completed ?? 0)
+        if (!(createdAt > turnNoteBootAt || (completedAt > 0 && completedAt > turnNoteBootAt))) continue
         const msgKey = mid.slice(0, 20)
         const seen = [...protoMap.keys()].some(
           (k) => k.startsWith(`${sid}:message:${msgKey}:`) || k.startsWith(`${sid}:thinking:${msgKey}:`)
