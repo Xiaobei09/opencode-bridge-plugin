@@ -9,6 +9,7 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | `src/tg-bridge.ts` | 桥主逻辑：长轮询、注入、发送、看门狗、队列卡、proto 镜像 |
 | `src/auto-continue.ts` | 自动循环：evaluate/注入闸/租约/熔断 |
 | `src/tg-bridge-v2.ts` | 插件装载入口（bot 配置与 env 读取） |
+| `src/auto-continue-v2.ts` | 自动循环装载入口（V1 插件经 _v2compat 包成 V2） |
 | `src/_v2compat.ts` | 兼容层 |
 | `src/bg-mode.ts` | 「转后台」能力：原生后台子代理的提升（promote）与整体自动配置 |
 | `src/bg-watch.ts` | 插件层「shell 跑超 N 秒强制转后台」的合规实现 |
