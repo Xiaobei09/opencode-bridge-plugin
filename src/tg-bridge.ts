@@ -512,13 +512,19 @@ export function protoSilentVerdict(
   now: number,
   lastSendAt: number,
   lastWarnAt: number,
-  opts: { thresholdMs: number; throttleMs: number; loopStopped: boolean; isCurrentGen: boolean }
+  opts: { thresholdMs: number; throttleMs: number; loopStopped: boolean; isCurrentGen: boolean; paused?: boolean }
 ): ProtoSilentVerdict {
   const silentMs = now - (lastSendAt || 0)
   const minutes = Math.round(silentMs / 60000)
   if (!opts.isCurrentGen) return { warn: false, minutes, why: "陈旧热重载实例" }
   if (!lastSendAt) return { warn: false, minutes, why: "尚无投递基线" }
   if (silentMs < opts.thresholdMs) return { warn: false, minutes, why: "静默未超阈值" }
+  // R1905：实时推送被**主动暂停**（`/pause` 或菜单「暂停推送」→ pausedMode）时，
+  // 静默同样是预期行为，不是故障。此前判据只看 loopStopped，导致一个"暂停推送"的 bot
+  // 每 15 分钟刷一条"proto silent … 疑似热重载半完成致事件流断开 → 需 reload 桥"的
+  // **误报**（2026-10-08 bot2 实测：paused=true，会话活跃、lastpush 冻结，告警一路
+  // 升级到 61min）。误报的代价是把"主动暂停"误诊成"链路损坏"，诱使去重启/reload。
+  if (opts.paused) return { warn: false, minutes, why: "实时推送已暂停，静默属预期" }
   // 循环闸已停时静默是**预期行为**（用户主动停的），不是故障
   if (opts.loopStopped) return { warn: false, minutes, why: "循环已停，静默属预期" }
   if (lastWarnAt && now - lastWarnAt < opts.throttleMs) return { warn: false, minutes, why: "告警节流中" }
@@ -8566,6 +8572,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       throttleMs: PROTO_SILENT_THROTTLE_MS,
       loopStopped: loopStopped(),
       isCurrentGen: (globalThis as Record<string, unknown>)[GEN_KEY] === myGen,
+      paused: pausedMode, // R1905：主动暂停推送时不误报"断流"
     })
     if (!v.warn) return
     lastProtoSilentWarnAt = now

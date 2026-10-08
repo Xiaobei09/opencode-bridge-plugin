@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test"
 import { readFileSync } from "node:fs"
+import { protoSilentVerdict } from "../src/tg-bridge"
 
 // R1898：投递静默 watchdog 基线（lastProtoSendAt）必须在**源头**刷新。
 //
@@ -36,4 +37,38 @@ test("watchdog 仍以 lastProtoSendAt 为基线（判据未脱钩）", () => {
 test("SendResult 生产者仅 sendTextRaw/editTextRaw 两个（源头覆盖完整）", () => {
   const producers = lines.filter((l) => l.includes("Promise<SendResult>"))
   expect(producers.length).toBe(2)
+})
+
+// R1905：主动暂停推送（pausedMode）时，静默属预期，不得误报"事件流断开"。
+// 触发场景（2026-10-08 bot2 实测）：paused=true，会话活跃、lastpush 冻结 >1h，
+// 旧判据只看 loopStopped → 每 15min 刷一条"疑似热重载半完成 → 需 reload 桥"的误报。
+const NOW = 1_800_000_000_000
+const baseOpts = {
+  thresholdMs: 15 * 60_000,
+  throttleMs: 15 * 60_000,
+  loopStopped: false,
+  isCurrentGen: true,
+}
+
+test("paused=true 时即使静默超阈值也不告警（预期静默）", () => {
+  const v = protoSilentVerdict(NOW, NOW - 61 * 60_000, 0, { ...baseOpts, paused: true })
+  expect(v.warn).toBe(false)
+  expect(v.why).toContain("暂停")
+})
+
+test("paused=false 时同样的静默输入会告警（证明 paused 是唯一差异）", () => {
+  const v = protoSilentVerdict(NOW, NOW - 61 * 60_000, 0, { ...baseOpts, paused: false })
+  expect(v.warn).toBe(true)
+})
+
+test("paused 缺省（旧调用形态）等价于未暂停（向后兼容）", () => {
+  const v = protoSilentVerdict(NOW, NOW - 61 * 60_000, 0, baseOpts)
+  expect(v.warn).toBe(true)
+})
+
+test("watchdog 调用点已把 pausedMode 接进判据（防接线脱钩）", () => {
+  const i = lines.findIndex((l) => l.includes("protoSilentVerdict(now, lastProtoSendAt"))
+  expect(i).toBeGreaterThanOrEqual(0)
+  const block = lines.slice(i, i + 8).join("\n")
+  expect(block.includes("paused: pausedMode")).toBe(true)
 })
