@@ -6033,9 +6033,17 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     return { ok: true }
   }
 
-  /** 触发桥侧重载（与 tests/reload.sh 同一套配方：追加注释改 mtime → 动态 import 失效）。 */
+  /**
+   * 触发桥侧重载：追加注释改入口文件 mtime → 宿主重新 import 入口 → 入口按
+   * v2lib 源文件 mtime 重新快照并动态 import 新实例（generation gating 接管）。
+   *
+   * R1906 修正：入口真实路径是 `<config>/opencode/plugins/tg-bridge-v2.ts`
+   * （`REDACTED_ROOT/.config/opencode/plugins/…`），此前误写成
+   * `REDACTED_ROOT/.opencode/plugins/…`（该目录不存在）→ `/addbot` 的重载
+   * 常年静默失败（appendFileSync 抛 ENOENT 被吞成"失败：…"）。
+   */
   const triggerBridgeReload = (): string => {
-    const entry = "REDACTED_ROOT/.opencode/plugins/tg-bridge-v2.ts"
+    const entry = "REDACTED_ROOT/.config/opencode/plugins/tg-bridge-v2.ts"
     const note = `\n// addbot reload ${new Date().toISOString()}\n`
     try {
       appendFileSync(entry, note, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
@@ -8579,7 +8587,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     void log(
       "warn",
       `proto silent ${v.minutes}min (bot=${BOT_ID}): 桥仍活着但没有成功投递过。` +
-        `若循环正在注入，疑似热重载半完成导致事件流断开 → 需 reload 桥：bash tests/reload.sh --wait bridge`
+        `若循环正在注入，疑似热重载半完成导致事件流断开 → 需 reload 桥：` +
+        `touch REDACTED_ROOT/.config/opencode/plugins/tg-bridge-v2.ts（重载入口）或 opencode service restart`
     )
   }, 5 * 60_000)
   let pollTimer: ReturnType<typeof setInterval> | null = null

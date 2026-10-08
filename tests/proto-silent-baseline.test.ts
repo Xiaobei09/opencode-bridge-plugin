@@ -72,3 +72,23 @@ test("watchdog 调用点已把 pausedMode 接进判据（防接线脱钩）", ()
   const block = lines.slice(i, i + 8).join("\n")
   expect(block.includes("paused: pausedMode")).toBe(true)
 })
+
+// R1906：可操作性修复 —— 恢复动作引用的路径必须真实存在。
+// 事故：watchdog 文案让用户跑 `bash tests/reload.sh --wait bridge`，而仓库内**从无**
+// 该脚本（假红长期潜伏）；且 `/addbot` 的 triggerBridgeReload 入口路径写成
+// `<root>/.opencode/plugins/…`（该目录不存在，应为 `<root>/.config/opencode/plugins/…`），
+// 导致重载静默失败。本测试钉死"引用路径必须与真实入口一致"。
+test("watchdog 文案不再引用不存在的 tests/reload.sh", () => {
+  const texts = lines.filter((l) => l.includes("proto silent") || l.includes("需 reload 桥"))
+  expect(texts.length).toBeGreaterThanOrEqual(1)
+  for (const t of texts) expect(t.includes("tests/reload.sh")).toBe(false)
+})
+
+test("triggerBridgeReload 入口路径指向真实的 <config>/opencode/plugins 目录（R1906）", () => {
+  const i = lines.findIndex((l) => l.includes("triggerBridgeReload ="))
+  expect(i).toBeGreaterThanOrEqual(0)
+  // 声明与函数体内各自出现一次入口路径；抓函数体后 3 行内的 entry 赋值
+  const block = lines.slice(i, i + 5).join("\n")
+  expect(block.includes("/.config/opencode/plugins/tg-bridge-v2.ts")).toBe(true)
+  expect(block.includes("/.opencode/plugins/tg-bridge-v2.ts")).toBe(false)
+})
