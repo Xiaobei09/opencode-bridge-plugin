@@ -1310,7 +1310,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       // 闸仍关（stop 未解除）时保持粘性静默；闸方开时清单条目一次性失效。
       {
         const loopStoppedSkip = skipState.get(sessionID)
-        if (loopStoppedSkip && loopStoppedSkip.reason === "loop-stopped") {
+        if (loopStoppedSkip && (loopStoppedSkip.reason === "loop-stopped" || loopStoppedSkip.reason === "auto-guard")) {
           let gateOpen = false
           try {
             gateOpen = (readCtl()?.stopped ?? false) !== true
@@ -1321,7 +1321,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             skipState.delete(sessionID)
             await log(
               "info",
-              `auto-continue: loop-stopped skip cleared (gate reopened, session=${sanitizeLog(sessionID).slice(0, 12)})`
+              `auto-continue: loop-stopped skip cleared (gate reopened, session=${sanitizeLog(sessionID).slice(0, 12)}, reason=${loopStoppedSkip.reason})`
             )
           }
         }
