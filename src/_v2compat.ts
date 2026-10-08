@@ -634,7 +634,14 @@ const DB_PATH = "REDACTED_ROOT/.local/share/opencode/opencode.db"
 const HISTORY_LIMIT = 200
 
 let dbHandle: any = null
-let dbFailed = false
+// R1911：此前是永久闩锁（`dbFailed` 变量一旦置位就再也不清）—— 启动瞬间 DB 打开失败一次，本实例生命周期内
+// openDb 永远返回 null，history/usage **永久降级**且日志只报一次（无从察觉）。改为「失败进入
+// 冷却、冷却过后自动重试」：宿主启动瞬间的瞬态失败（DB 被占用/WAL 未就绪）会自愈。
+// 冷却期内不重复尝试（避免每次读历史都撞一遍），日志节流 60s（避免刷屏）。
+let dbFailAt = 0
+let dbFailLogAt = 0
+const DB_RETRY_MS = 30_000
+const DB_FAIL_LOG_MS = 60_000
 // ctx.session 能力快照只打一次（方法名，无凭据）
 let compactCapsLogged = false
 // 宿主未提供压缩入口时置位，避免每 30 分钟重复失败探测
@@ -658,14 +665,25 @@ const COMPACT_UNAVAILABLE_MSG =
   "compact unavailable in this host build (no ctx.session.compact, no /compact command, local API needs auth); use /migrate to carry a summary into a new session"
 
 const openDb = async (): Promise<any> => {
-  if (dbHandle || dbFailed) return dbHandle
+  if (dbHandle) return dbHandle
+  const now = Date.now()
+  // 冷却期内直接返回（不重试、不刷日志）；冷却过后允许重新尝试。
+  if (dbFailAt > 0 && now - dbFailAt < DB_RETRY_MS) return null
   try {
     const mod: any = await import("bun:sqlite")
     dbHandle = new mod.Database(DB_PATH, { readonly: true })
+    dbFailAt = 0 // 打开成功：清掉失败态
     return dbHandle
   } catch (err) {
-    dbFailed = true
-    logLine("v2compat", "error", `bundb unavailable, history empty: ${String(err).slice(0, 160)}`)
+    dbFailAt = now
+    if (now - dbFailLogAt > DB_FAIL_LOG_MS) {
+      dbFailLogAt = now
+      logLine(
+        "v2compat",
+        "error",
+        `bundb unavailable, history empty: ${String(err).slice(0, 160)} (R1911: ${DB_RETRY_MS / 1000}s 后自动重试)`
+      )
+    }
     return null
   }
 }
