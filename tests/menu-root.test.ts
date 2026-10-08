@@ -92,3 +92,26 @@ describe("根菜单整理", () => {
     expect(r[3][0].callback_data).toBe("m:root")
   })
 })
+
+// R1908：菜单回调完整性 —— 防止未来新增按钮用了没有分派分支的前缀、或跳到
+// 不存在的视图（点下去只回"未知动作/无反应"）。这是对**真实菜单枚举**的钉死，
+// 而不是抄一份前缀白名单。
+describe("菜单回调完整性（R1908）", () => {
+  const VIEWS = ["root", "sess", "push", "loop", "bg", "sys"]
+  // handleCallback(data.split(":")) 实际分派的前缀（见 tg-bridge.ts 的 parts[0] 分支）
+  const HANDLED_PREFIXES = new Set(["m", "ma", "flt", "use", "stop", "retry", "qpin", "full", "fold", "qa", "qfree", "q"])
+
+  it("每个视图的每个按钮前缀都有分派分支，m: 只跳已知视图", () => {
+    for (const view of VIEWS) {
+      for (const btn of flat(view)) {
+        const data = String((btn as Btn).callback_data ?? "")
+        if (!data) continue
+        const parts = data.split(":")
+        expect(HANDLED_PREFIXES.has(parts[0]), `${view} 非法前缀：${data}`).toBe(true)
+        if (parts[0] === "m") {
+          expect(VIEWS.includes(parts[1]), `${view} 跳未知视图：${data}`).toBe(true)
+        }
+      }
+    }
+  })
+})
