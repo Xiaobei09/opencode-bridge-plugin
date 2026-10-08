@@ -388,6 +388,16 @@ export const mergeLoopRegistry = (
   const room = Math.max(0, cap - tg.length)
   return [...others.slice(-room), ...tg].slice(-cap)
 }
+// R1909：串行评估链的「楔子（wedge）」计时必须从**链真正开始**那一刻起算，绝不能在每次
+// 入队时重置。否则：定时器每 60s 对每个目标调一次 evaluateQueued，而阈值 EVAL_WEDGE_MS=90s
+// —— 每次入队都把计时归零，`held` 永远 <90s，看门狗永不触发。症状：某会话评估链一旦挂起
+// （promptAsync/fetch 悬挂）就**永久静默停摆**（实测 bot2 停摆 30+ 分钟、无 loop wedge 日志）。
+// 规则：无在途链（prevSince===undefined）或刚判定 wedge（需另起新链）时才取 now；否则保留原起点。
+export const advanceQueueSince = (
+  prevSince: number | undefined,
+  now: number,
+  wedged: boolean,
+): number => (prevSince === undefined || wedged ? now : prevSince)
 // R1107：用户主动中断（⏹ doStop 成功）的会话。halted 逐会话持久化在各 Bot 状态文件的
 // halted 数组里（tg-bridge 侧 doStop → savePersistedState）。auto-continue 必须尊重它，
 // 否则"用户主动终止后循环仍继续"。不清共享总闸 → 其它会话/Bot 不受影响；用户新消息
@@ -1767,9 +1777,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     // 不会误删新链。
     const since = queueSince.get(sessionID)
     let prev: Promise<unknown> = Promise.resolve()
+    let wedged = false
     if (since !== undefined) {
       const held = Date.now() - since
       if (held > EVAL_WEDGE_MS) {
+        wedged = true
         void log(
           "error",
           `auto-continue: loop wedge detected (in-flight ${Math.round(held / 1000)}s, session=${sanitizeLog(sessionID).slice(0, 14)}) — 评估链疑似挂起，已另起一条`,
@@ -1782,7 +1794,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       prev = (queue.get(sessionID) ?? Promise.resolve()) as Promise<unknown>
     }
     const next = prev.then(() => evaluate(sessionID)).catch(() => {})
-    queueSince.set(sessionID, Date.now())
+    // R1909：仅在新链起点才重置计时，避免每 60s 的定时器入队把 wedge 计时反复归零。
+    queueSince.set(sessionID, advanceQueueSince(since, Date.now(), wedged))
     queue.set(sessionID, next.finally(() => {
       if (queue.get(sessionID) === next) {
         queue.delete(sessionID)
