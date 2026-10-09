@@ -69,7 +69,8 @@ export type RotateResult = { rotated: boolean; archive?: string; keptBytes: numb
  * 做法：启动时若既有日志 ≥ minBytes，先强制归档到 archiveDir（R1786 已证 /root 不随 /tmp 消失），
  * 只留 keepRatio 的尾巴（默认 5%）便于看重启前最后状态，并在日志里写 `[log] rotated` 指针。
  *
- * ⚠️ 刻意**不放在模块顶层**：tests/log-rotate.test.ts 会 import 本模块，
+ * ⚠️ 刻意**不放在模块顶层**：tests/tap-isolation.test.ts 直接 import 本模块，
+ * 另有多份测试经 tg-bridge 间接 import（R1917 已再加 NODE_ENV=test 路径改写兜底）。
  * 顶层执行会顺带轮转**生产日志**。故只导出函数，由启动路径显式调用（R1790 接线）。
  */
 export function archiveOnStartup(o: {

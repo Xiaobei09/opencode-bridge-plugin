@@ -234,8 +234,8 @@ export default {
     // → 重启前的日志既没归档也不轮转，直接消失（实际损失 04:00–08:07 全部诊断证据）。
     //
     // 为什么放**入口装载器**而不是 _v2compat 顶层：顶层会被 tests/*.test.ts 的 import 触发
-    // （log-rotate / scope-guard 等 10 个测试文件都 import tg-bridge），那就会在**跑测试时
-    // 轮转生产日志**。入口是生产专用路径，且每次 setup 只执行一次。
+    // （menu-root / proto-silent-baseline / tap-isolation 等测试文件会 import tg-bridge），
+    // 那就会在**跑测试时轮转生产日志**。入口是生产专用路径，且每次 setup 只执行一次。
     try {
       const r = compat?.archiveOnStartup?.({ path: compat.TAP_PATH, archiveDir: compat.LOG_ARCHIVE_DIR })
       if (r?.rotated) diag(`[tg-bridge-v2] 启动前日志已归档 ${r.archive} (归档 ${r.archivedBytes}B / 留尾 ${r.keptBytes}B)`)
