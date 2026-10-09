@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test"
 import { readFileSync } from "node:fs"
-import { advanceQueueSince } from "../src/auto-continue.ts"
+import { advanceQueueSince, trackQueuedChain } from "../src/auto-continue.ts"
 
 // R1909：评估链楔子（wedge）看门狗计时回归。
 //
@@ -50,4 +50,51 @@ test("evaluateQueued 已接线到 advanceQueueSince（防回退）", () => {
   const src = readFileSync(new URL("../src/auto-continue.ts", import.meta.url), "utf8")
   expect(src).toContain("queueSince.set(sessionID, advanceQueueSince(")
   expect(src).not.toContain("queueSince.set(sessionID, Date.now())")
+})
+
+// R1918：链完成后必须清理 queue/queueSince。
+// 原实现 finally 里判 `queue.get(sid) === next`，而 queue 存的是 finally 包装后的新
+// promise，永不相等 → 清理从不发生 → queueSince 永停首拍 → 看门狗每 ~120s 误报一次
+// "loop wedge detected"（实测 ~270 次/小时）。本测试钉死"完成即清理"。
+test("R1918：链完成后清理 queue 与 queueSince", async () => {
+  const queue = new Map<string, Promise<unknown>>()
+  const queueSince = new Map<string, number>()
+  const sid = "ses_test_clear"
+  const next = Promise.resolve(1)
+  trackQueuedChain(next, queue, queueSince, sid, undefined, 1000, false)
+  expect(queue.has(sid)).toBe(true)
+  expect(queueSince.get(sid)).toBe(1000)
+  await next
+  await Promise.resolve() // flush finally microtask
+  expect(queue.has(sid)).toBe(false)
+  expect(queueSince.has(sid)).toBe(false)
+})
+
+test("R1918：旧链完成不得误清仍在途的新链", async () => {
+  const queue = new Map<string, Promise<unknown>>()
+  const queueSince = new Map<string, number>()
+  const sid = "ses_test_replace"
+  let resolveOld!: () => void
+  const oldP = new Promise<void>((r) => {
+    resolveOld = r
+  })
+  trackQueuedChain(oldP, queue, queueSince, sid, undefined, 1000, false)
+  let resolveNew!: () => void
+  const newP = new Promise<void>((r) => {
+    resolveNew = r
+  })
+  // 在途链（prevSince=1000, wedged=false）→ 保留起点 1000
+  trackQueuedChain(newP, queue, queueSince, sid, 1000, 2000, false)
+  // 旧链此刻完成：queue 已指向新链，旧链的 finally 不得删除
+  resolveOld()
+  await oldP
+  await Promise.resolve()
+  expect(queue.has(sid)).toBe(true)
+  expect(queueSince.get(sid)).toBe(1000)
+  // 新链完成才清理
+  resolveNew()
+  await newP
+  await Promise.resolve()
+  expect(queue.has(sid)).toBe(false)
+  expect(queueSince.has(sid)).toBe(false)
 })

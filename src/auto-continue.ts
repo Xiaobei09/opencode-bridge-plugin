@@ -488,6 +488,33 @@ export const advanceQueueSince = (
   now: number,
   wedged: boolean,
 ): number => (prevSince === undefined || wedged ? now : prevSince)
+// R1918：把「链入队 + 完成即清理」抽成可测过程。
+// 原实现在 finally 回调里判 `queue.get(sid) === next` —— 但 queue 存的是 `next.finally(cb)`
+// 返回的**另一个** promise，它永不等于 next，于是 `queue.delete/queueSince.delete` **从不执行**。
+// 后果：queueSince 永远停在首拍，`held` 持续增长，看门狗每隔 ~120s 就对每个会话误报一次
+// `loop wedge detected`（≈90 次/小时/会话，实测 3 会话 ~270 次/小时），把真正的挂起淹没在噪声里。
+// 修法：先造 finally 包装 `tracked`，用 `tracked` 自身做身份校验（旧链完成时若 queue 已被
+// 更新的链替换，则不得误清新链）。
+export const trackQueuedChain = (
+  next: Promise<unknown>,
+  queue: Map<string, Promise<unknown>>,
+  queueSince: Map<string, number>,
+  sessionID: string,
+  prevSince: number | undefined,
+  now: number,
+  wedged: boolean,
+): Promise<unknown> => {
+  queueSince.set(sessionID, advanceQueueSince(prevSince, now, wedged))
+  let tracked: Promise<unknown>
+  tracked = next.finally(() => {
+    if (queue.get(sessionID) === tracked) {
+      queue.delete(sessionID)
+      queueSince.delete(sessionID)
+    }
+  })
+  queue.set(sessionID, tracked)
+  return tracked
+}
 // R1107：用户主动中断（⏹ doStop 成功）的会话。halted 逐会话持久化在各 Bot 状态文件的
 // halted 数组里（tg-bridge 侧 doStop → savePersistedState）。auto-continue 必须尊重它，
 // 否则"用户主动终止后循环仍继续"。不清共享总闸 → 其它会话/Bot 不受影响；用户新消息
@@ -1921,14 +1948,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       prev = (queue.get(sessionID) ?? Promise.resolve()) as Promise<unknown>
     }
     const next = prev.then(() => evaluate(sessionID)).catch(() => {})
-    // R1909：仅在新链起点才重置计时，避免每 60s 的定时器入队把 wedge 计时反复归零。
-    queueSince.set(sessionID, advanceQueueSince(since, Date.now(), wedged))
-    queue.set(sessionID, next.finally(() => {
-      if (queue.get(sessionID) === next) {
-        queue.delete(sessionID)
-        queueSince.delete(sessionID)
-      }
-    }))
+    // R1909：仅在新链起点才重置计时（在途链保留原起点）。R1918：完成即清理交给
+    // trackQueuedChain —— 原实现的身份校验写错对象，导致清理从不发生、看门狗反复误报。
+    trackQueuedChain(next, queue, queueSince, sessionID, since, Date.now(), wedged)
   }
 
   // Fallback: session.idle may never be emitted (observed: zero evals).
