@@ -8307,7 +8307,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     if (Date.now() - lastRenameCheck > RENAME_CHECK_MS) {
       lastRenameCheck = Date.now()
       const cur = fixedTarget ?? frontSessionID ?? persistedFront
-      if (typeof cur === "string" && cur.startsWith("ses_")) void renameBotToSession(cur)
+      if (typeof cur === "string" && cur.startsWith("ses_")) {
+        // R1916c：改名前强制刷新标题缓存 —— sessionTitleCache 只在 boot 与闸口命令时
+        // 填充，auto-continue 侧的循环状态标记（[LOOP]/[LOOP:OFF]）是独立进程每 5s 写的，
+        // 不改名时缓存会长期陈旧。实测 R1916 上线后 bot2/bot3 标题已含 [LOOP:OFF] 但
+        // Telegram 机器人名仍是旧标题 → rename 按 (sid|title) 判重静默 no-op。
+        // 60s 一次的 HTTPSessionList 拉取成本可接受（闸口命令场景早已同频调用）。
+        await refreshSessionTitles()
+        void renameBotToSession(cur)
+      }
     }
       const url = `${apiBase}/getUpdates?offset=${encodeURIComponent(offset)}&limit=10&timeout=20`
       pollAbort = new AbortController()
