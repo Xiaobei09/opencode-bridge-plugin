@@ -846,25 +846,33 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
 
   let markerLastSig = ""
   const refreshLoopMarkerIfChanged = (): void => {
-    const cur = currentLoopTarget()
-    let state = "running"
-    try {
-      if (cur && loopGateStopped(readCtl(), cur)) state = "stopped"
-    } catch {
-      /* keep default */
-    }
-    const sig = `${cur}:${state}`
-    // 目标切换/停止后，凡不是当前目标的被标记会话都要清掉 [LOOP]，
+    // R1916：必须遍历**全部**循环目标，而非只第一个。三种 bot（primary/bot2/bot3）
+    // 共享同一 auto-continue 实例（EXTRA_TARGET_PATHS 来自 tg-bots.json 的三个状态文件），
+    // 若只对 currentLoopTarget()[0] 写标题，bot2/bot3 的 front 会话标题永远没有
+    // 循环状态标记（实测：R1916 三态上线后 bot2/bot3 仍是裸标题）。
+    const tgts = currentLoopTargets()
+    const sig = tgts
+      .map((t) => {
+        let st = "running"
+        try {
+          if (loopGateStopped(readCtl(), t)) st = "stopped"
+        } catch {
+          /* keep default */
+        }
+        return `${t}:${st}`
+      })
+      .join("|")
+    // 目标切换/停止后，凡**不是任何目标**的被标记会话都要清掉 [LOOP]/[LOOP:OFF]，
     // 否则会留下“仍在循环”的假标记。集合来自落盘状态，热重载后照样生效。
     // 放在 sig 判断之前：落盘状态可能在本进程启动后才被补写（例如修复残留），
     // 此时 sig 未变，但残留标记仍需清掉。清理后集合即收敛为空，不会反复调 API。
     for (const sid of readMarkedSids()) {
-      if (cur && sid === cur) continue
+      if (tgts.includes(sid)) continue
       void applyMarker(sid, "clear")
     }
     if (sig === markerLastSig) return
     markerLastSig = sig
-    void syncLoopMarker(cur)
+    for (const t of tgts) void syncLoopMarker(t)
   }
   setTimeout(() => {
     refreshLoopMarkerIfChanged()

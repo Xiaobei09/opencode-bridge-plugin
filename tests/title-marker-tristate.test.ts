@@ -79,3 +79,14 @@ test("refreshLoopMarkerIfChanged 清理残留调用为 clear 而非 false", () =
   const stale = lines.find((l) => l.includes("applyMarker(sid, false)"))
   expect(stale).toBeUndefined()
 })
+
+test("R1916b: refresh 遍历全部 targets 而非只第一个(三 bot 标题都要写状态)", () => {
+  const refreshStart = lines.findIndex((l) => l.includes("const refreshLoopMarkerIfChanged"))
+  const block = lines.slice(refreshStart, refreshStart + 30).join("\n")
+  // 必须用全集 currentLoopTargets() 计算 sig，逐个 syncLoopMarker
+  expect(block).toContain("const tgts = currentLoopTargets()")
+  expect(block).toContain("tgts.includes(sid)")
+  expect(block).toContain("for (const t of tgts) void syncLoopMarker(t)")
+  // 不允许再退回「只 cur 一个目标」的写法
+  expect(block).not.toContain("const sig = `${cur}:${state}`")
+})
