@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
@@ -313,6 +313,21 @@ const loopStopped = (): boolean => {
     return false
   }
 }
+// R2228 循环注入提醒：该会话是否归本 Bot。判据用 loop-ctl 的单 Bot sids
+//（与 auto-continue 的注入作用域一致）。跨 Bot 共享目标由各 Bot 按此判据过滤，
+// 保证一次注入只会由一个 Bot 发提醒，不重复刷屏。
+const ownsLoopSession = (sessionID: string): boolean => {
+  try {
+    const j = JSON.parse(readFileSync(LOOP_CTL_PATH, "utf8")) as any
+    const e = j?.bots?.[BOT_ID]
+    if (!e || typeof e !== "object") return false
+    const sids = Array.isArray(e.sids) ? e.sids.filter((x: unknown): x is string => typeof x === "string") : []
+    return sids.includes(sessionID)
+  } catch {
+    return false
+  }
+}
+
 const loopStopTimestamp = (): number => {
   // R1724：per-bot 闸的时间戳要取**该 Bot 条目**的 ts；混用顶层 ts 会让
   // 「停止前后的注入分界」判错（停的明明是本 bot，拿到的却是别处的写入时间）。
@@ -9586,6 +9601,27 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       const s = clean(sessionNameOf(sessionID) || sessionID.slice(0, 12), 28)
       await sendQueued(target, `◻️ 自然停止 · ${s}（无新输出）`)
     }
+  }
+
+  // ---- 循环注入提醒（用户需求：循环消息注入时发消息提醒我）------------------
+  // auto-continue 每次成功注入 round/recover 提示后 fire 到这里；只对本 Bot 拥有
+  // 的循环会话发提醒，并节流 1 条/60s，避免多会话快速轮次时刷屏。失败不阻断桥
+  //（通知是附赠，不是命脉）。
+  let lastInjectNoticeAt = 0
+  try {
+    registerInjectNotifier(`tg-bridge:${BOT_ID}`, async (sessionID, kind) => {
+      if (!ownsLoopSession(sessionID)) return
+      const now = Date.now()
+      if (now - lastInjectNoticeAt < 60_000) return
+      lastInjectNoticeAt = now
+      const chat = pushChatResolve()
+      if (!chat) return
+      const short = sessionID.replace(/^ses_/, "").slice(0, 10)
+      const t = new Date(now).toISOString().slice(11, 19)
+      await reply(chat, `⏱ 循环注入 ${kind === "round" ? "轮次" : "恢复"} · ${short} · ${t}`)
+    })
+  } catch (err) {
+    await log("warn", `inject-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
   }
 
   return {

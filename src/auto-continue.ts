@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
-import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts } from "./_v2compat"
+import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
@@ -1214,6 +1214,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         await log("info", `auto-continue: ${kind}-inject interrupted by stop gate (session=${sanitizeLog(sessionID)})`)
         return "stopped"
       }
+      // R2228 循环注入提醒：注入成功后 fire（由拥有该会话的 Bot 侧发送；
+      // fire-and-forget，通知失败/挂起绝不影响循环主链路）。
+      fireInjectNotices(sessionID, kind)
       return "ok"
     } catch (err) {
       unclaimInject(sessionID, msg.id)
