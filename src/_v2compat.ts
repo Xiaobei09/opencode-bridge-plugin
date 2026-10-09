@@ -1324,23 +1324,36 @@ const toV1Event = async (ev: any): Promise<any> => {
 
 // ---- 循环注入提醒（用户需求：循环消息注入时发消息提醒我）─────────────────
 // 各 Bot 的 tg-bridge 实例在启动时通过 registerInjectNotifier 注册自己的发送器；
-// auto-continue 每次循环注入成功后 fireInjectNotices。注册表放在 _v2compat 是因为
-// 它被三端（tg-bridge-v2 入口 / 各 Bot 桥实例 / auto-continue）共享同一个模块实例
-// （见 tg-bridge-v2 的「不带 query 保证同一 URL」注释），天然是进程内总线。
+// auto-continue 每次循环注入成功后 fireInjectNotices。容器必须挂在 **globalThis**
+// 而不是模块级 Map：tg-bridge 各 Bot 实例从 `.v2lib-live/` 快照加载、auto-continue
+// 从 v2lib 活文件加载，两者 import 到的 _v2compat 是**两个模块实例**——模块级 Map
+// 会被劈成两半（一边注册、一边 fire 无人应答）。globalThis 与 __oc_bg_promoted_hooks__
+// / BG_WATCH_KEY 同套路：进程内共享，跨模块实例可见。
 // 「发往哪个聊天 / 会话归属过滤 / 节流」由各 Bot 发送器内部决定；通知失败一律
 // best-effort，绝不阻塞循环主链路。
 export type InjectNoticeKind = "round" | "recover"
 export type InjectNoticeFn = (sessionID: string, kind: InjectNoticeKind) => void | Promise<void>
-const injectNotifiers = new Map<string, InjectNoticeFn>()
-export const registerInjectNotifier = (key: string, fn: InjectNoticeFn): void => {
-  injectNotifiers.set(key, fn)
+type InjectNotifierEntry = { bot: string; fn: InjectNoticeFn }
+const INJECT_NOTIFIER_KEY = "__oc_inject_notices__"
+const injectNotifierList = (): InjectNotifierEntry[] => {
+  const g = globalThis as { [INJECT_NOTIFIER_KEY]?: InjectNotifierEntry[] }
+  if (!Array.isArray(g[INJECT_NOTIFIER_KEY])) g[INJECT_NOTIFIER_KEY] = []
+  return g[INJECT_NOTIFIER_KEY] as InjectNotifierEntry[]
 }
-export const unregisterInjectNotifier = (key: string): void => {
-  injectNotifiers.delete(key)
+export const registerInjectNotifier = (bot: string, fn: InjectNoticeFn): void => {
+  const arr = injectNotifierList()
+  const idx = arr.findIndex((e) => e.bot === bot)
+  if (idx >= 0) arr[idx] = { bot, fn }
+  else arr.push({ bot, fn })
+}
+export const unregisterInjectNotifier = (bot: string): void => {
+  const arr = injectNotifierList()
+  const idx = arr.findIndex((e) => e.bot === bot)
+  if (idx >= 0) arr.splice(idx, 1)
 }
 export const fireInjectNotices = (sessionID: string, kind: InjectNoticeKind): void => {
-  const fns = [...injectNotifiers.values()]
-  for (const fn of fns) {
+  const fns = [...injectNotifierList()]
+  for (const { fn } of fns) {
     try {
       void Promise.resolve(fn(sessionID, kind)).catch(() => {
         /* best-effort：通知失败不影响循环 */
@@ -1350,7 +1363,7 @@ export const fireInjectNotices = (sessionID: string, kind: InjectNoticeKind): vo
     }
   }
 }
-export const injectNotifierCount = (): number => injectNotifiers.size
+export const injectNotifierCount = (): number => injectNotifierList().length
 
 export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?: V1Hook } | undefined>): Plugin => ({
   id,

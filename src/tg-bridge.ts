@@ -9606,10 +9606,10 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   // ---- 循环注入提醒（用户需求：循环消息注入时发消息提醒我）------------------
   // auto-continue 每次成功注入 round/recover 提示后 fire 到这里；只对本 Bot 拥有
   // 的循环会话发提醒，并节流 1 条/60s，避免多会话快速轮次时刷屏。失败不阻断桥
-  //（通知是附赠，不是命脉）。
+  //（通知是附赠，不是命脉）。注册表经 globalThis 跨模块实例共享（见 _v2compat）。
   let lastInjectNoticeAt = 0
   try {
-    registerInjectNotifier(`tg-bridge:${BOT_ID}`, async (sessionID, kind) => {
+    registerInjectNotifier(BOT_ID, async (sessionID, kind) => {
       if (!ownsLoopSession(sessionID)) return
       const now = Date.now()
       if (now - lastInjectNoticeAt < 60_000) return
@@ -9618,6 +9618,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       if (!chat) return
       const short = sessionID.replace(/^ses_/, "").slice(0, 10)
       const t = new Date(now).toISOString().slice(11, 19)
+      await log("info", `inject notice fire (bot=${BOT_ID}, session=${sanitizeLog(sessionID).slice(0, 12)}, kind=${kind}, chat=${sanitizeLog(chat)})`)
       await reply(chat, `⏱ 循环注入 ${kind === "round" ? "轮次" : "恢复"} · ${short} · ${t}`)
     })
   } catch (err) {
