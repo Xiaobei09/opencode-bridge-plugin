@@ -21,10 +21,19 @@ export interface V1Client {
   }
 }
 
-export const TAP_PATH = "/tmp/opencode/v2plugin.log"
+// R1917：测试隔离 —— `bun test` 会把 NODE_ENV 置为 "test"，而 menu-root /
+// proto-silent-baseline 两个测试会 import tg-bridge → 本模块。此前 TAP_PATH 写死生产
+// 路径，于是**跑一次测试就往生产日志里塞一行 `[v2compat] error: bundb unavailable`**
+// （测试进程打不开 DB 属正常），事后扫描会把这条测试噪声误判成线上故障
+// （R127/R133 已实际发生过这种误读）。故：显式 env 覆盖优先，其次测试环境改走独立
+// 测试路径，生产（NODE_ENV 未设置）保持原路径不变。
+const TEST_TAP_PATH = "/tmp/opencode/v2plugin.test.log"
+const TEST_ARCHIVE_DIR = "/tmp/opencode/log-archive-test"
+export const TAP_PATH = process.env.AC_TAP_PATH ?? (process.env.NODE_ENV === "test" ? TEST_TAP_PATH : "/tmp/opencode/v2plugin.log")
 const TAP_MAX = 2000000
 /** R1736：轮转时把被丢弃的部分 gzip 存这里（不丢证据）。R1735 已手工验证过这条路可行。 */
-export const LOG_ARCHIVE_DIR = "REDACTED_ROOT/.opencode/log-archive"
+export const LOG_ARCHIVE_DIR =
+  process.env.AC_LOG_ARCHIVE_DIR ?? (process.env.NODE_ENV === "test" ? TEST_ARCHIVE_DIR : "REDACTED_ROOT/.opencode/log-archive")
 const PRIVATE_FILE_MODE = 0o600
 // 插件日志含会话 ID、chat ID 与工具摘要；启动时修复旧文件权限，重建时沿用 0600。
 try {
