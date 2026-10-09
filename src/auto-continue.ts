@@ -60,10 +60,32 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
 const VERSION = "r1054-loop-ctl-merge"
-const LOOP_TITLE_MARK = "[LOOP]"
+// R1916（用户指令 2026-10-09）：「增加在循环是否启动在会话名称的显示」。
+// 原实现只有运行态标记 [LOOP]，停止态标题无任何标识 → 会话名只回答了「循环在跑
+// 吗」的一半（跑→有标；停→与从未循环无差别）。现扩展为双标记三态：
+//   · running → 标题尾缀 [LOOP]       （循环进行中，与旧行为一致，向后兼容）
+//   · stopped → 标题尾缀 [LOOP:OFF]   （循环已停止，显式可辨识）
+//   · clear   → 剥掉任一循环标记      （非循环目标/被清理，不显示）
+// 机器人名字由桥侧 renameBotToSession 以会话标题为源自动同步（setMyName），
+// 标题状态变化后 bot 名随之更新（429 冷却期满自动补改，见 tg-bridge 注释）。
+const LOOP_TITLE_MARK_ON = "[LOOP]"
+const LOOP_TITLE_MARK_OFF = "[LOOP:OFF]"
+// 长标记在前：strip 时先剥 [LOOP:OFF] 再剥 [LOOP]，避免「XXX [LOOP] [LOOP:OFF]」
+// 这类历史叠加残留只被删一部分。
+const LOOP_TITLE_MARKS = [LOOP_TITLE_MARK_OFF, LOOP_TITLE_MARK_ON]
 const stripLoopTitle = (title: string): string => {
   let out = String(title ?? "").trim()
-  while (out.endsWith(LOOP_TITLE_MARK)) out = out.slice(0, -LOOP_TITLE_MARK.length).trim()
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const m of LOOP_TITLE_MARKS) {
+      if (out.endsWith(m)) {
+        out = out.slice(0, -m.length).trim()
+        changed = true
+        break
+      }
+    }
+  }
   return out
 }
 const AC_GEN_KEY = process.env.AC_GEN_KEY ?? "__acGen"
@@ -764,7 +786,8 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   }
 
   const markerApplied = new Map<string, string>()
-  const applyMarker = async (sessionID: string, enabled: boolean): Promise<void> => {
+  // R1916：三态标记。state: "running" → [LOOP]；"stopped" → [LOOP:OFF]；"clear" → 剥标记。
+  const applyMarker = async (sessionID: string, state: "running" | "stopped" | "clear"): Promise<void> => {
     // R1832：换代护栏（唯一写入入口统一拦截）。applyMarker 由多个 caller 异步触发
     // （acTimer/markerTimer/boot），而 acTimer 的 AC_GEN_KEY 判定在其回调**末尾**
     // （末尾判定是为保留最后一次 superseded 日志）：被换代的实例在 clearInterval 前，
@@ -786,10 +809,12 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       return
     }
     const base = stripLoopTitle(title)
-    const desired = enabled ? `${base}${base ? " " : ""}${LOOP_TITLE_MARK}` : base
+    const mark = state === "running" ? LOOP_TITLE_MARK_ON : state === "stopped" ? LOOP_TITLE_MARK_OFF : ""
+    const desired = mark ? `${base}${base ? " " : ""}${mark}` : base
+    const visible = state === "running" || state === "stopped"
     if (desired === title) {
       markerApplied.set(sessionID, desired)
-      if (enabled && !readMarkedSids().includes(sessionID)) writeMarkedSids([...readMarkedSids(), sessionID])
+      if (visible && !readMarkedSids().includes(sessionID)) writeMarkedSids([...readMarkedSids(), sessionID])
       return
     }
     if (markerApplied.get(sessionID) === desired) return
@@ -797,8 +822,11 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       await update.call(sessionAny, { path: { id: sessionID }, body: { title: desired || "未命名会话" } })
       markerApplied.set(sessionID, desired)
       const marked = readMarkedSids().filter((x) => x !== sessionID)
-      writeMarkedSids(enabled ? [...marked, sessionID] : marked)
-      await log("info", `loop title marker ${enabled ? "enabled" : "removed"} (session=${sanitizeLog(sessionID).slice(0, 12)})`)
+      writeMarkedSids(visible ? [...marked, sessionID] : marked)
+      await log(
+        "info",
+        `loop title marker ${state} (session=${sanitizeLog(sessionID).slice(0, 12)}, title=${sanitizeLog(desired).slice(0, 60)})`,
+      )
     } catch (err) {
       await log("error", `loop title marker failed (session=${sanitizeLog(sessionID).slice(0, 12)}): ${sanitizeLog(err).slice(0, 120)}`)
     }
@@ -806,13 +834,14 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
 
   const syncLoopMarker = async (sessionID = currentLoopTarget()): Promise<void> => {
     if (!sessionID || !isSessionID(sessionID)) return
-    let enabled = true
+    // R1916：闸门关 → [LOOP:OFF]（显式「循环停止」），闸门开 → [LOOP]。
+    let state: "running" | "stopped" | "clear" = "running"
     try {
-      enabled = !loopGateStopped(readCtl(), sessionID)
+      state = loopGateStopped(readCtl(), sessionID) ? "stopped" : "running"
     } catch {
-      enabled = true
+      state = "running"
     }
-    await applyMarker(sessionID, enabled)
+    await applyMarker(sessionID, state)
   }
 
   let markerLastSig = ""
@@ -831,7 +860,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     // 此时 sig 未变，但残留标记仍需清掉。清理后集合即收敛为空，不会反复调 API。
     for (const sid of readMarkedSids()) {
       if (cur && sid === cur) continue
-      void applyMarker(sid, false)
+      void applyMarker(sid, "clear")
     }
     if (sig === markerLastSig) return
     markerLastSig = sig
