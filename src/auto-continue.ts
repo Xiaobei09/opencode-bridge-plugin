@@ -845,6 +845,12 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   }
 
   let markerLastSig = ""
+  // R1916d：sig 只含 sid:state，察觉不了「标题标记被宿主侧剥掉」这类漂移。每
+  // REFRESH_SELF_HEAL_EVERY 拍（markerTimer=5s → ~60s）对全部目标强制重跑一次
+  // syncLoopMarker：applyMarker 内部先 GET 实时标题——标记已就位则 desired===title
+  // 早退（仅 GET、零 PATCH/零日志），被剥则自动补挂。成本可忽略，换来自愈。
+  let markerSelfHealTick = 0
+  const REFRESH_SELF_HEAL_EVERY = 12
   const refreshLoopMarkerIfChanged = (): void => {
     // R1916：必须遍历**全部**循环目标，而非只第一个。三种 bot（primary/bot2/bot3）
     // 共享同一 auto-continue 实例（EXTRA_TARGET_PATHS 来自 tg-bots.json 的三个状态文件），
@@ -870,7 +876,13 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       if (tgts.includes(sid)) continue
       void applyMarker(sid, "clear")
     }
-    if (sig === markerLastSig) return
+    if (sig === markerLastSig) {
+      // R1916d：sig 未变但标题可能被剥标记 → 定期强制自愈检查（见上注释）。
+      if (++markerSelfHealTick < REFRESH_SELF_HEAL_EVERY) return
+      markerSelfHealTick = 0
+      for (const t of tgts) void syncLoopMarker(t)
+      return
+    }
     markerLastSig = sig
     for (const t of tgts) void syncLoopMarker(t)
   }
