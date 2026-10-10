@@ -115,6 +115,110 @@ export const rollbackVerdict = (hadArchive: boolean, orphanPath: string): string
 }
 
 /**
+ * R2232：「回合是否**真的**空闲」——纯函数，两个注入器共用同一份判据，杜绝两侧漂移：
+ *   · tg-bridge 的泵 `turnActuallyIdle`（注入置顶队列里的用户消息）
+ *   · auto-continue 的循环 `injectAllowed`（注入下一轮 ROUND_PROMPT）
+ *
+ * ## 为什么单看 `time.completed > 0` 不够（用户实报「循环提示词在没有输出完成时注入」）
+ * `time.completed` 只代表**某一步（step）**完成，**不代表回合结束**。宿主在一次用户
+ * 输入触发的多步工具循环里，会在一 step completed 后 ~20ms 就落盘下一步继续跑。
+ * 只看 completed 会把「两轮输出之间」的空档判成空闲 → 注入插进正在跑的回合。
+ * DB 实证（bot3，2026-10-10）：日志 `injected round prompt` 10:48:09.218，可它参照的
+ * 那步早已 completed（10:48:08.751），而**下一步 10:48:08.773 正在运行**（到 10:48:14.412
+ * 才完成）；注入的 prompt 也因此直到 10:48:14.417 才落盘。10:51:58 那次同样（参照步
+ * 10:51:58.011 completed，下一步 10:51:58.029 已在跑，prompt 拖到 10:52:29.319）。
+ *
+ * ## 判据（全部通过才算空闲）
+ *   ① `lastEventTs` 距今 < `eventSettleMs` → 不算（事件静默期，覆盖"正在流式/思考"）。
+ *      **可选**：泵用自己的事件表传入；auto-continue 由 `message.updated` 事件驱动，
+ *      传入同一事件时间会恒判否，故它只用 ④ 的消息级落定窗口。
+ *   ② 存在最后一条 assistant 且其 `time.completed > 0`（否则无助手或仍在跑）。
+ *   ③ 最后一条 assistant 的 `finish` 是 `tool-calls` → 回合未结束（**最可靠的一票**：
+ *      宿主一步完成落盘后若带 tool-calls，紧接着还会跑下一步；opencode 里"回合收尾"的
+ *      最后一步 finish 必为 `stop`）。
+ *   ③b 压缩（compaction）行不当作助手回合：进行中的压缩一律不注入；已完成的压缩不参与
+ *      ③/④ 扫描（它被 rowToV1 渲染成 role=assistant、无 finish 的"假完成消息"，会骗过 ③）。
+ *   ④ 最新一条**非压缩**消息的 `created` 不晚于该 `completed`（否则回合已续到下一步）。
+ *   ⑤ 尾段（末 6 条）没有 `running`/`pending` 的工具。
+ *   ⑥ 该 `completed` 已过去 ≥ `settleMs`（消息级落定窗口，给"下一步即将落盘"留时间）。
+ */
+export const idleVerdict = (o: {
+  rows: unknown
+  now: number
+  eventSettleMs?: number
+  lastEventTs?: number
+  settleMs?: number
+}): { idle: boolean; why: string } => {
+  const now = Number(o.now) || Date.now()
+  const lastEvent = Number(o.lastEventTs ?? 0)
+  const eventSettleMs = Number(o.eventSettleMs ?? 0)
+  if (lastEvent > 0 && eventSettleMs > 0 && now - lastEvent < eventSettleMs) {
+    return { idle: false, why: `event-${Math.round((now - lastEvent) / 1000)}s-ago` }
+  }
+  const arr = Array.isArray(o.rows) ? (o.rows as any[]) : []
+  // ③b 压缩（compaction）判据。
+  // 为什么单列：rowToV1 把压缩行渲染成 role=assistant、completed=created、**无 finish** 的
+  // "假完成消息"。若当作最后一条 assistant，`laFinish=""`（不是 tool-calls）→ 误判回合已停 →
+  // 在会话正压缩时注入。DB 实证（bot3，2026-10-10）：12:09:53.689 决策 msg=msg_125b7fda7001
+  // （=seq 8545，type=compaction，len=46 正是压缩 header），注进了正在压缩的回合。
+  // 语义上压缩不是回合，故：进行中的压缩（compactionStatus!=="completed"）一律不注入；
+  // 已完成的压缩不参与下面 lastAssistant / newest 的扫描（让位给真实助手回合状态）。
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const info = arr[i]?.info ?? arr[i]
+    if (!info?.compaction) continue
+    if (String(info?.compactionStatus ?? "completed") !== "completed") {
+      return { idle: false, why: "compaction-in-flight" }
+    }
+    break
+  }
+  let laCreated = 0
+  let laCompleted = 0
+  let laFinish = ""
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const row: any = arr[i]
+    const info = row?.info ?? row
+    if (info?.compaction) continue
+    if (info?.role !== "assistant") continue
+    laCreated = Number(info?.time?.created ?? row?.time?.created ?? 0)
+    laCompleted = Number(info?.time?.completed ?? row?.time?.completed ?? 0)
+    laFinish = String(info?.finish ?? info?.rawFinish ?? "")
+    break
+  }
+  if (!(laCompleted > 0)) {
+    return { idle: false, why: laCreated === 0 ? "no-assistant" : "assistant-in-flight" }
+  }
+  // ③ 停步原因：tool-calls = 宿主马上还会跑下一步，回合没结束。
+  if (laFinish === "tool-calls" || laFinish === "tool_calls") {
+    return { idle: false, why: "turn-continues(tool-calls)" }
+  }
+  // ④ 最新一条**非压缩**消息的 created 不晚于该 completed（否则回合已续到下一步）。
+  let newest: any = null
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const info = arr[i]?.info ?? arr[i]
+    if (info?.compaction) continue
+    newest = arr[i]
+    break
+  }
+  const nInfo = newest?.info ?? newest
+  const nCreated = Number(nInfo?.time?.created ?? newest?.time?.created ?? 0)
+  if (nCreated > laCompleted) return { idle: false, why: "newer-message" }
+  for (let i = arr.length - 1, seen = 0; i >= 0 && seen < 6; i--, seen++) {
+    const row: any = arr[i]
+    const parts = Array.isArray(row?.parts) ? row.parts : Array.isArray(row?.info?.parts) ? row.info.parts : []
+    for (const pp of parts) {
+      if (String(pp?.type ?? "") !== "tool") continue
+      const stt = String(pp?.state?.status ?? "")
+      if (stt === "running" || stt === "pending") return { idle: false, why: `tool-${stt}` }
+    }
+  }
+  const settleMs = Number(o.settleMs ?? 0)
+  if (settleMs > 0 && now - laCompleted < settleMs) {
+    return { idle: false, why: `settling-${Math.round((now - laCompleted) / 1000)}s` }
+  }
+  return { idle: true, why: "settled" }
+}
+
+/**
  * R1818：offset 自愈的**目标值**判定（纯函数，分支互斥且穷举）。
  *
  * ## 这里原来错在哪（生产已触发过一次）
@@ -841,15 +945,26 @@ const rowToV1 = (row: { id: string; type: string; data: string }, sessionID: str
           ? { input: fbIn }
           : undefined
     const rModel = (d as any)?.model
+    // R2232：把宿主的**停步原因**（`finish` / `rawFinish`）透传给 V1 形态。
+    // 这是判定"回合是否真的结束"的唯一可靠信号：opencode 的助手行**只在一步完成时落盘**，
+    // 所以"看得见的最后一步 completed"常只是**中间步**（它带 `finish=tool-calls`，宿主紧接着
+    // 还会跑下一步）；真正的回合收尾，最后一步的 `finish` 是 `stop`。注入前据此判定，
+    // 就不再依赖"看不见的在飞步"是否已落盘（DB 读不到在飞步，settle 窗口也挡不住长步）。
+    // 实测 bot3：坏注入 11:02:51.498 前那步 finish=tool-calls（回合续到 11:02:55）；
+    // 正常收尾 11:02:55.223 finish=stop（随后 11:03:08 idle outcome=succeeded）。
+    const rFinish = (d as any)?.finish
+    const rRawFinish = (d as any)?.rawFinish
     return {
       id,
       info: {
         id,
         role: "assistant",
-        time: { created: tm.created ?? 0, completed: tm.completed ?? 0 },
+        time: { created: tm.created ?? 0, streamed: tm.streamed ?? 0, completed: tm.completed ?? 0 },
         error: (msgErr ?? null) as any,
         tokens,
         model: rModel && typeof rModel === "object" ? { id: String(rModel.id ?? ""), providerID: String(rModel.providerID ?? "") } : undefined,
+        finish: rFinish === undefined || rFinish === null ? undefined : String(rFinish),
+        rawFinish: rRawFinish === undefined || rRawFinish === null ? undefined : String(rRawFinish),
       },
       parts,
     }
@@ -892,9 +1007,12 @@ const rowToV1 = (row: { id: string; type: string; data: string }, sessionID: str
         time: tm,
       })
     }
+    // R2232-fix：压缩行被渲染成 role=assistant 的"假完成消息"（completed=created、无 finish）。
+    // idleVerdict 若不识别它，会把它当"回合已 stop 的最后一步"→ 在会话正压缩时注入。
+    // 打标记让 idleVerdict 能把它与真实助手区分（详见 idleVerdict ③b）。
     return {
       id,
-      info: { id, role: "assistant", time: { created, completed: created } },
+      info: { id, role: "assistant", time: { created, completed: created }, compaction: true, compactionStatus: status },
       parts,
     }
   }

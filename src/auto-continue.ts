@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
-import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices } from "./_v2compat"
+import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
@@ -59,7 +59,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r1054-loop-ctl-merge"
+const VERSION = "r2233-compaction-idle-guard"
 // R1916（用户指令 2026-10-09）：「增加在循环是否启动在会话名称的显示」。
 // 原实现只有运行态标记 [LOOP]，停止态标题无任何标识 → 会话名只回答了「循环在跑
 // 吗」的一半（跑→有标；停→与从未循环无差别）。现扩展为双标记三态：
@@ -1126,6 +1126,22 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       /* best-effort */
     }
   }
+  // R2232：循环注入的「消息级落定窗口」。宿主一步 completed 后 ~20ms 就会落盘下一步
+  // 继续跑（多步工具循环里很常见），要求 `completed` 距今 ≥ 此值才注入，给"下一步即将
+  // 落盘"留时间。实测那次碰撞是 20ms，4s 有充足余量（宁可晚 4s 也不插进活着的回合）。
+  const ROUND_SETTLE_MS = Number(process.env.AC_ROUND_SETTLE_MS ?? 4_000)
+  // 落定窗口到点后的重评。若此刻下一步已在生成中，会有 message.updated 触发复查；
+  // 但若回合**真的结束**了，就不会再有事件 —— 只靠 60s 间隔太慢。每会话至多一个在途定时器。
+  const settleRetry = new Map<string, ReturnType<typeof setTimeout>>()
+  const scheduleSettleReeval = (sid: string): void => {
+    if (settleRetry.has(sid)) return
+    const h = setTimeout(() => {
+      settleRetry.delete(sid)
+      evaluateQueued(sid)
+    }, ROUND_SETTLE_MS + 500)
+    if (typeof (h as any)?.unref === "function") (h as any).unref()
+    settleRetry.set(sid, h)
+  }
   // 注入闸的唯一入口。返回 false 时**不做任何状态变更**（不 settle、不计数），
   // 这样这一轮仍然算"未处理"：宿主把回合标记 completed 后会有新事件再次评估。
   // ⚠️ 这里的 session id **必须打全**，不能 `slice(0,12)`：相邻的
@@ -1135,15 +1151,40 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   // 迟早让人连不上** —— 与其在分析脚本里做前缀匹配，不如把日志本身统一。
   const injectAllowed = async (sid: string, m: any, tag: string): Promise<boolean> => {
     const t = (m as any)?.time ?? {}
+    const hold = async (why: string): Promise<boolean> => {
+      heldInject.set(sid, Date.now())
+      await log(
+        "info",
+        `auto-continue: hold inject (${tag}, session=${sanitizeLog(sid)}, msg=${String(m?.id ?? "").slice(0, 20)}, ` +
+          `${why}) —— 回合未结束，不往活着的回合里注入（等 completed 事件再来判）`,
+      )
+      return false
+    }
     const v = injectGateVerdict(Number(t.completed ?? 0), Number(t.updated ?? t.created ?? 0), Date.now())
-    if (v.go) return true
-    heldInject.set(sid, Date.now())
-    await log(
-      "info",
-      `auto-continue: hold inject (${tag}, session=${sanitizeLog(sid)}, msg=${String(m?.id ?? "").slice(0, 20)}, ` +
-        `${v.why}) —— 回合未结束，不往活着的回合里注入（等 completed 事件再来判）`,
-    )
-    return false
+    if (!v.go) return hold(v.why)
+    // R2232：`completed > 0` 只代表**这一步**完成，**不代表回合结束**。宿主会在一步
+    // completed 后 ~20ms 落盘下一步继续跑；此刻注入会把 ROUND_PROMPT 插进正在跑的回合
+    // （用户实报「循环提示词在没有输出完成时注入」；DB 实证见 _v2compat.idleVerdict 注释）。
+    // 回源确认整会话确实空闲，判据与泵的 turnActuallyIdle 共用 idleVerdict（防两侧漂移）。
+    try {
+      const res = await withTimeout(client.session.messages({ path: { id: sid } }), "session.messages")
+      const rows = res?.data ?? []
+      const iv = idleVerdict({ rows, now: Date.now(), settleMs: ROUND_SETTLE_MS })
+      if (!iv.idle) {
+        // 仅"落定窗口未到"需要补一拍重评（已在生成中会有 message.updated 来复查）。
+        if (iv.why.startsWith("settling-")) scheduleSettleReeval(sid)
+        return hold(`idle=${iv.why}`)
+      }
+    } catch (err) {
+      // 回源失败：保守不注入 —— 客户端故障时提前注入会插进正在跑的回合。
+      heldInject.set(sid, Date.now())
+      await log(
+        "info",
+        `auto-continue: hold inject (${tag}, session=${sanitizeLog(sid)}) —— 空闲复核查询失败，保守不注入: ${sanitizeLog(err).slice(0, 100)}`,
+      )
+      return false
+    }
+    return true
   }
 
   const inject = async (

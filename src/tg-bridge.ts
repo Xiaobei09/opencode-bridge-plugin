@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
@@ -5952,40 +5952,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         void log("info", `idle check: not idle (${why}, sid=${sanitizeLog(sid).slice(0, 12)})`)
         return false
       }
-      // ① 静默期：最近有事件就不算空闲（覆盖"两轮输出之间"与"长时间正在思考"）
-      const lastEv = lastActivity.get(sid) ?? 0
-      if (lastEv > 0 && Date.now() - lastEv < IDLE_SETTLE_MS) return noIdle(`事件 ${Math.round((Date.now() - lastEv) / 1000)}s 前`)
-      // ② 找到最后一条 assistant
-      let lastAssistantTime = 0
-      let lastAssistantCompleted = 0
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row: any = rows[i]
-        const info = row?.info ?? row
-        if (info?.role !== "assistant") continue
-        lastAssistantTime = Number(info?.time?.created ?? row?.time?.created ?? 0)
-        lastAssistantCompleted = Number(info?.time?.completed ?? row?.time?.completed ?? 0)
-        break
+      // R2232：判据抽到 _v2compat.idleVerdict —— 与 auto-continue 的循环注入共用同一份，
+      // 防两侧漂移。这里只补两件本路径特有的事：① 事件静默期入参（lastActivity）；② busyTurn 兜底。
+      const iv = idleVerdict({ rows, now: Date.now(), lastEventTs: lastActivity.get(sid) ?? 0, eventSettleMs: IDLE_SETTLE_MS })
+      if (iv.idle) {
+        busyTurn.delete(sid)
+        return true
       }
-      if (lastAssistantCompleted <= 0) {
-        // 没有 completed 的 assistant 仍在运行；不把事件丢失误判为空闲。
-        return rows.length > 0 && lastAssistantTime === 0 ? !busyTurn.has(sid) : noIdle("最后一条 assistant 未完成")
+      // 无助手：空会话按既有口径（无 busy 标记即视为空闲）；有行但无助手 = 回合刚开始，不插。
+      if (iv.why === "no-assistant") {
+        return rows.length > 0 ? !busyTurn.has(sid) : noIdle("最后一条 assistant 未完成")
       }
-      // ③ 最后一条消息若是"晚于该 assistant 完成时间的 user 消息" → 回合刚开始，不能插
-      const newest: any = rows[rows.length - 1]
-      const nInfo = newest?.info ?? newest
-      const nCreated = Number(nInfo?.time?.created ?? newest?.time?.created ?? 0)
-      if (nCreated > lastAssistantCompleted) return noIdle("最新消息晚于上一轮完成（回合刚开始）")
-      // ④ 近期任何工具处于 running/pending → 还在干活
-      for (let i = rows.length - 1, seen = 0; i >= 0 && seen < 6; i--, seen++) {
-        const row: any = rows[i]
-        for (const pp of partsOf(row)) {
-          if (String(pp?.type ?? "") !== "tool") continue
-          const stt = String((pp as any)?.state?.status ?? "")
-          if (stt === "running" || stt === "pending") return noIdle(`工具 ${String(pp?.tool ?? "?").slice(0, 16)} 仍 ${stt}`)
-        }
-      }
-      busyTurn.delete(sid)
-      return true
+      return noIdle(iv.why)
     } catch {
       // 状态查询失败时保持等待，不能为了绕过 API 故障而提前注入。
       return false
