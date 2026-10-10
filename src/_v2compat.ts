@@ -1750,12 +1750,20 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
     // 新世代注册前先 dispose 旧世代 → 即使宿主重载时未注销旧钩子，旧钩子也保持失活，
     // 不会双发 promote、不会累积计时器。
     try {
-      const tctx = (context as any)?.tool
       const G = globalThis as any
       const BG_WATCH_KEY = "__oc_bgwatch_v1__"
+      // R2230 重写：持久转发式注册。
+      // 实测教训：execute.before/after 不是每代必达——宿主重载后仍可能把事件投给
+      // **旧代**监听器；旧代码的监听器闭包绑定「本代 watcher」，一旦该 watcher 被下一
+      // 代 dispose（set dead=true），事件到达却静默丢弃 → 症状即用户所报「自动后台不工作」
+      // （watch start 从不出现在日志里，bot3 的 >120s shell 照样被宿主 120s 超时杀掉）。
+      // 修法：每进程只挂一批**转发器**（reg.attached 守卫），闭包引用全局 reg 而非本代
+      // watcher；每次重载只把 reg.active 换成新 watcher。无论宿主把事件投给哪一代哪个
+      // 实例的监听器，最终都转发到当前 active；同 watcher 内部按 key 幂等，不会双发。
+      if (!G[BG_WATCH_KEY]) G[BG_WATCH_KEY] = { active: undefined as any, attached: false }
+      const reg = G[BG_WATCH_KEY]
+      const tctx = (context as any)?.tool
       if (typeof tctx?.hook === "function") {
-        const prev = G[BG_WATCH_KEY] as { dispose?: () => void } | undefined
-        if (prev && typeof prev.dispose === "function") prev.dispose()
         const watcher = makeBgWatch({
           // 熔断：background-mode.json 的 shellPromo（默认 true = 插件层强制开启）
           enabled: () => {
@@ -1820,26 +1828,31 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
             }
           },
         })
-        G[BG_WATCH_KEY] = watcher
-        tctx.hook("execute.before", (ev: any) => {
-          try {
-            watcher.onBefore(ev ?? {})
-          } catch (err) {
-            logLine(id, "error", `[bg-watch] before err: ${String(err).slice(0, 140)}`)
-          }
-        })
-        tctx.hook("execute.after", (ev: any) => {
-          try {
-            watcher.onAfter(ev ?? {})
-          } catch (err) {
-            logLine(id, "error", `[bg-watch] after err: ${String(err).slice(0, 140)}`)
-          }
-        })
-        logLine(id, "info", "[bg-watch] hooks registered (execute.before/after); shell>60s 自动转后台 ON")
-      } else if (!G[BG_WATCH_KEY]) {
-        logLine(id, "error", "[bg-watch] ctx.tool.hook 不可用，插件层转后台未注册（不影响其他功能）")
+        if (reg.active && typeof reg.active.dispose === "function") reg.active.dispose()
+        reg.active = watcher
+        // 转发器只挂一次（同一进程内多实例/多代共享；闭包引用 reg，永不失效）。
+        if (!reg.attached) {
+          reg.attached = true
+          tctx.hook("execute.before", (ev: any) => {
+            try {
+              reg.active?.onBefore?.(ev ?? {})
+            } catch (err) {
+              logLine(id, "error", `[bg-watch] before err: ${String(err).slice(0, 140)}`)
+            }
+          })
+          tctx.hook("execute.after", (ev: any) => {
+            try {
+              reg.active?.onAfter?.(ev ?? {})
+            } catch (err) {
+              logLine(id, "error", `[bg-watch] after err: ${String(err).slice(0, 140)}`)
+            }
+          })
+          logLine(id, "info", "[bg-watch] persistent forwarders attached (forward-to-active)")
+        } else {
+          logLine(id, "info", "[bg-watch] active watcher replaced (forwarders already attached)")
+        }
       } else {
-        logLine(id, "info", "[bg-watch] 已由其他实例注册，跳过（同进程单实例守卫）")
+        if (!reg.attached) logLine(id, "error", "[bg-watch] ctx.tool.hook 不可用，插件层转后台未注册（不影响其他功能）")
       }
     } catch (err) {
       logLine(id, "error", `[bg-watch] register err: ${String(err).slice(0, 140)}`)
