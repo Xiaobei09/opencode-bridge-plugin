@@ -1675,6 +1675,15 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             }
             await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} len=${len} error=${n} -> RECOVER(fatal streak=${streak})`)
           }
+          // R2233：RECOVER 也必须过空闲复核（与 round 路径同一判据）。provider 瞬时错误若宿主
+          // 已自行重试（尾部有更新的 in-flight 步），就不该再往活着的回合里插恢复提示——用户实报的
+          // 「输出未完成就注入」同样覆盖 RECOVER 提示。尾部**孤立**的错误步（completed>0、
+          // finish=error、其后无更新消息）仍判空闲 → 照常恢复，不破坏"可恢复错误不停机"。
+          // 注意：本块入口（msg.error 处）已 settle(msg)，hold 时必须 decided.delete 以便下拍重评。
+          if (!(await injectAllowed(sessionID, msg, "recover:fatal"))) {
+            decided.delete(msg.id)
+            return
+          }
           await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
           settle(msg)
           const r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
@@ -1686,6 +1695,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
         fatalStreak.delete(sessionID)
         await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} len=${len} error=${errorName(msg)} -> RECOVER`)
+        // R2233：同上——宿主已自行重试（尾部有更新的 in-flight 步）时不往活着的回合插恢复提示。
+        if (!(await injectAllowed(sessionID, msg, "recover"))) {
+          decided.delete(msg.id)
+          return
+        }
         await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
         settle(msg)
         const r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
