@@ -90,6 +90,107 @@ export const modelWindowEntries = (j: unknown): Array<{ key: string; context: nu
   return out
 }
 
+// ── R2231 模型选择（模块级纯函数层；测试钉死解析与按钮结构）────────────────────────
+// 数据源 = 宿主 HttpApi `GET /api/model`（形状见 modelWindowEntries 注释；还带
+// name/status/enabled）。解析归「纯函数 → 菜单（buildMenuKeyboard 同族）→ 命令/回调复用」。
+export type ModelEntry = {
+  id: string
+  providerID: string
+  name: string
+  status: string
+  context: number
+  key: string
+  display: string
+}
+/** GET /api/model 响应 → 可选模型表。去 deprecated、禁用；按 active→名称 排序。 */
+export const modelListEntries = (j: unknown): ModelEntry[] => {
+  const root = j as any
+  const list = Array.isArray(root?.data) ? root.data : Array.isArray(root) ? root : []
+  const out: ModelEntry[] = []
+  for (const m of list) {
+    const id = String(m?.id ?? m?.modelID ?? "")
+    const providerID = String(m?.providerID ?? "")
+    if (!id || !providerID) continue
+    if (String(m?.status ?? "") === "deprecated") continue
+    if (m?.enabled === false) continue
+    const name = String(m?.name ?? "")
+    out.push({
+      id,
+      providerID,
+      name,
+      status: String(m?.status ?? ""),
+      context: Number(m?.limit?.context),
+      key: `${providerID}/${id}`,
+      display: name || `${providerID}/${id}`,
+    })
+  }
+  out.sort((a, b) => {
+    const sa = a.status === "active" ? 0 : 1
+    const sb = b.status === "active" ? 0 : 1
+    return sa - sb || a.display.localeCompare(b.display)
+  })
+  return out
+}
+/**
+ * 用户输入 → Model.Ref。优先级：`providerID/id` 精确 → id 精确 → id 忽略大小写 →
+ * name 忽略大小写唯一 → 名称/id 包含且唯一（≥2 字符）。provider 同名时优先当前 provider。
+ */
+export const resolveModelRef = (
+  arg: string,
+  list: ModelEntry[],
+  cur?: { providerID?: string },
+): { id: string; providerID: string; label: string } | null => {
+  const a = String(arg ?? "").trim()
+  if (!a) return null
+  const core = (a.split("@")[0] ?? a).trim() // 丢弃 @variant 尾巴
+  if (!core) return null
+  const pick = (hits: ModelEntry[]): { id: string; providerID: string; label: string } | null => {
+    if (hits.length === 0) return null
+    const m = hits.find((x) => x.providerID === cur?.providerID) ?? hits[0]!
+    return { id: m.id, providerID: m.providerID, label: m.display }
+  }
+  const byKey = list.filter((m) => m.key === core)
+  if (byKey.length > 0) return pick(byKey)
+  const byId = list.filter((m) => m.id === core || m.id.toLowerCase() === core.toLowerCase())
+  if (byId.length > 0) return pick(byId)
+  const byName = list.filter((m) => m.name.toLowerCase() === core.toLowerCase())
+  if (byName.length > 0) return pick(byName)
+  if (core.length >= 2) {
+    const fuzzy = list.filter((m) => m.name.toLowerCase().includes(core.toLowerCase()) || m.id.toLowerCase().includes(core.toLowerCase()))
+    if (fuzzy.length > 0) return pick(fuzzy)
+  }
+  return null
+}
+export const MODEL_PAGE_SIZE = 10
+/**
+ * 模型选择器按钮（纯函数）。每模型一行 `mdl:set:<全局下标>`；多页带翻页；
+ * 底部固定「刷新/关闭」；当前模型前缀 ✅。callback_data 全为短编码（<20 字节）。
+ */
+export const buildModelKeyboard = (list: ModelEntry[], page: number, curKey: string): unknown[][] => {
+  const total = list.length
+  const pages = Math.max(1, Math.ceil(total / MODEL_PAGE_SIZE))
+  const p = Math.min(Math.max(0, Number(page) || 0), pages - 1)
+  const slice = list.slice(p * MODEL_PAGE_SIZE, (p + 1) * MODEL_PAGE_SIZE)
+  const rows: unknown[][] = slice.map((m, i) => {
+    const n = p * MODEL_PAGE_SIZE + i
+    const cur = m.key === curKey
+    const label = `${cur ? "✅ " : ""}${clean(m.display, 44)}`
+    return [{ text: label.slice(0, 50), callback_data: `mdl:set:${n}` }]
+  })
+  if (pages > 1) {
+    rows.push([
+      { text: "⬅️", callback_data: `mdl:pg:${Math.max(0, p - 1)}` },
+      { text: `${p + 1}/${pages}`, callback_data: "mdl:nop" },
+      { text: "➡️", callback_data: `mdl:pg:${Math.min(pages - 1, p + 1)}` },
+    ])
+  }
+  rows.push([
+    { text: "🔄 刷新", callback_data: "mdl:refresh" },
+    { text: "✖️ 关闭", callback_data: "mdl:close" },
+  ])
+  return rows
+}
+
 // ctx 骤降是否算"宿主自动压缩" —— 纯函数，好处是四条否决线都能用行为测试钉死
 // （写成 if 链就只能靠静态断言，那玩意儿今天已经假阳性 4 次）。
 // 背景：2026-09-26T15:36 实测主会话 498.1k → 42.7k（48%→4%，rea=23 条被回收）= 真压缩；
@@ -3041,6 +3142,8 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   bgshell: "/background shell toggle",
   bgth: "/background th",
   bgstatus: "/background status",
+  // R2231 模型选择：菜单按钮等价 /model（选择器独立消息，mdl: 回调驱动）。
+  model: "/model",
   loud: "/loud",
   quiet: "/quiet",
 }
@@ -3132,11 +3235,11 @@ export const buildMenuKeyboard = (
   }
   // R231 根菜单整理：5 个入口排成 3×2（末行不再孤悬一个「系统」）；
   // 「后台」与「系统」原先共用 🛠 图标易混 —— 后台改 ⚙（与其页内「线程/阈值」语义一致）；
-  // 「帮助」提到根行尾，与 sys 页内的 ma:help 共用同一条映射（不新增动作表项）。
+  // R2231 「模型」入驻根菜单（等价 /model），帮助移入系统页（ma:help 仍在）。
   return [
     [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
     [b("🔁 循环", "m:loop"), b("⚙️ 后台", "m:bg")],
-    [b("🛠 系统", "m:sys"), b("❓ 帮助", "ma:help")],
+    [b("🤖 模型", "ma:model"), b("🛠 系统", "m:sys")],
   ]
   }
 
@@ -6352,6 +6455,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /loop [start|stop|status] — 自动循环开关（默认一直跑，用户 /loop stop 才停）",
     "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
     "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
+    "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model <名称> 切换当前会话模型，下次生成生效）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
     "· /compact — 手动触发压缩（本宿主构建不可用时改用 /migrate）",
@@ -6541,7 +6645,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       head,
       `目标会话：<b>${htmlEsc(nm)}</b>`,
       "",
-      "按主题分页：会话 / 推送 / 循环 / 后台 / 系统。",
+      "按主题分页：会话 / 推送 / 循环 / 后台 / 模型 / 系统。",
     ].join("\n")
   }
   // 薄包装：把运行期状态喂给模块级的真定义（测试直接调 buildMenuKeyboard）
@@ -6563,6 +6667,64 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // R1646：每个 chat 当前打开的菜单视图（root/子页）。ma 动作执行后「原地刷新」当前视图，
   // 而不是拽回根页 —— 用户明确要"点按钮不回到主菜单"。sync 时保持与 card 一致。
   const menuViewNow = new Map<string, string>()
+
+  // ── R2231 模型选择：宿主直连 + 选择器缓存 ─────────────────────────────
+  // 复用 R1881/R1399 的同源凭证（service.json + Basic encode("opencode:"+pw)）。
+  // 所有宿主往返带显式 15s 超时（与文件内其它网络调用一致，避免半边僵死卡住命令应答）。
+  const modelHttp = async (path: string, init?: RequestInit): Promise<{ ok: boolean; status: number; body: any }> => {
+    try {
+      const home = process.env.HOME ?? "/root"
+      const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
+        url?: string
+        password?: string
+      }
+      const url = String(reg?.url ?? "").replace(/\/+$/, "")
+      const pw = String(reg?.password ?? "")
+      if (!url || !pw) return { ok: false, status: 0, body: { error: "service.json 缺 url/password" } }
+      const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
+      const headers: Record<string, string> = { Authorization: `Basic ${token}`, ...((init?.headers as Record<string, string>) ?? {}) }
+      if (init?.method && init.method !== "GET") headers["Content-Type"] = "application/json"
+      const r = await fetch(`${url}${path}`, {
+        ...(init ?? {}),
+        headers,
+        signal: AbortSignal.timeout(15_000),
+      })
+      const raw = await r.text().catch(() => "")
+      let body: any = null
+      try {
+        body = JSON.parse(raw)
+      } catch {
+        body = raw
+      }
+      return { ok: r.ok, status: r.status, body }
+    } catch (err) {
+      return { ok: false, status: 0, body: { error: String(err).slice(0, 120) } }
+    }
+  }
+  /** GET /api/model → 可选模型表（过滤+排序交给纯函数）。空表=直连不可用/无模型。 */
+  const modelHttpList = async (): Promise<ModelEntry[]> => modelListEntries((await modelHttp("/api/model")).body)
+  /** GET /api/session/{sid} → 当前模型 ref（{id, providerID}），取不到返回 null。 */
+  const modelHttpSession = async (sid: string): Promise<{ id: string; providerID: string; variant?: string } | null> => {
+    const b = (await modelHttp(`/api/session/${encodeURIComponent(sid)}`)).body
+    const m = (b && typeof b === "object" ? (b.model ?? b) : null) as any
+    if (m && typeof m.id === "string" && typeof m.providerID === "string") {
+      return { id: m.id, providerID: m.providerID, variant: typeof m.variant === "string" ? m.variant : undefined }
+    }
+    return null
+  }
+  /** POST /api/session/{sid}/model → 204 表示切换成功。 */
+  const modelHttpSet = async (sid: string, ref: { id: string; providerID: string }): Promise<{ ok: boolean; status: number; body: any }> =>
+    modelHttp(`/api/session/${encodeURIComponent(sid)}/model`, {
+      method: "POST",
+      body: JSON.stringify({ model: ref }),
+    })
+  /** 选择器缩略缓存（每个 chat 一份，90s TTL）：按钮回调按下标解析模型，无需把长 id 塞进 64B 的 callback_data。 */
+  const modelMenuCache = new Map<string, { list: ModelEntry[]; ts: number }>()
+  const modelMenuText = (curKey: string, list: ModelEntry[]): string => {
+    const curName = list.find((m) => m.key === curKey)
+    const curLine = curKey ? `当前：<b>${htmlEsc(curName?.display ?? curKey)}</b>` : "当前：未知"
+    return ["<b>🤖 选择模型</b>", curLine, `共 ${list.length} 个模型。点名称切换（下次生成生效）；也可发 /model <名称或 id>。`].join("\n")
+  }
   const handleCallback = async (cq: any): Promise<void> => {
     try {
     const data = String(cq?.data ?? "")
@@ -6668,6 +6830,90 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         await log("info", `menu action opened submenu, card kept (act=${act})`)
       }
       await answer("已执行")
+      return
+    }
+    if (parts[0] === "mdl") {
+      // R2231 模型选择器按钮：set:<idx> 按下标切模型；refresh 重拉；pg:<n> 翻页；
+      // nop=页码占位；close=收掉选择器消息。（选择器由 /model 命令或根菜单 🤖 模型 打开。）
+      const sub = parts[1] ?? ""
+      const mid = Number(cq?.message?.message_id ?? 0)
+      if (sub === "close") {
+        await answer("已关闭")
+        if (mid) {
+          try {
+            const r = await tgFetch("deleteMessage", { chat_id: Number(cchat) || cchat, message_id: mid })
+            if (!r.ok) await editTextRaw(cchat, mid, modelMenuText("", []), [], false)
+          } catch {
+            try {
+              await editTextRaw(cchat, mid, modelMenuText("", []), [], false)
+            } catch {
+              /* best-effort */
+            }
+          }
+        }
+        return
+      }
+      if (sub === "nop") {
+        await answer("…")
+        return
+      }
+      const cached = modelMenuCache.get(cchat)
+      const list = cached && Date.now() - cached.ts < 90_000 ? cached.list : await modelHttpList()
+      if (list.length === 0) {
+        await answer("模型列表不可用")
+        if (mid) await editTextRaw(cchat, mid, "❌ 拉取模型列表失败（宿主 HttpApi GET /api/model 不可用）", [], false)
+        return
+      }
+      const target = fixedTarget ?? (await activeFront())
+      if (!target) {
+        await answer("无法解析目标会话")
+        return
+      }
+      const sesNow = await modelHttpSession(target)
+      const curKey = sesNow ? `${sesNow.providerID}/${sesNow.id}` : ""
+      if (sub === "set") {
+        const idx = Number(parts[2] ?? "-1")
+        const hit = list[idx]
+        if (!hit) {
+          await answer("模型不存在")
+          return
+        }
+        const res = await modelHttpSet(target, { id: hit.id, providerID: hit.providerID })
+        if (!res.ok) {
+          await answer(`切换失败 ${res.status}`)
+          const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
+          if (mid) await editTextRaw(cchat, mid, `❌ 切换失败（HTTP ${res.status}）：${clean(why, 120)}`, [], false)
+          return
+        }
+        await answer(`已切换 ${hit.display}`)
+        const ses2 = await modelHttpSession(target)
+        const cur2 = ses2 ? `${ses2.providerID}/${ses2.id}` : curKey
+        modelMenuCache.set(cchat, { list, ts: Date.now() })
+        const text2 = `${modelMenuText(cur2, list)}\n✅ 已切换 → <b>${htmlEsc(hit.display)}</b>（下次生成生效）`
+        if (mid) {
+          const r = await editTextRaw(cchat, mid, text2, buildModelKeyboard(list, 0, cur2), false)
+          if (r.r !== "sent") await sendTextRaw(cchat, text2, buildModelKeyboard(list, 0, cur2), false)
+        }
+        return
+      }
+      if (sub === "pg") {
+        const page = Math.max(0, Number(parts[2] ?? "0") || 0)
+        await answer("已翻页")
+        modelMenuCache.set(cchat, { list, ts: Date.now() })
+        if (mid) await editTextRaw(cchat, mid, modelMenuText(curKey, list), buildModelKeyboard(list, page, curKey), false)
+        return
+      }
+      if (sub === "refresh") {
+        await answer("已刷新")
+        const fresh = await modelHttpList()
+        const list2 = fresh.length > 0 ? fresh : list
+        const ses2 = await modelHttpSession(target)
+        const cur2 = ses2 ? `${ses2.providerID}/${ses2.id}` : curKey
+        modelMenuCache.set(cchat, { list: list2, ts: Date.now() })
+        if (mid) await editTextRaw(cchat, mid, modelMenuText(cur2, list2), buildModelKeyboard(list2, 0, cur2), false)
+        return
+      }
+      await answer("未知按钮")
       return
     }
     if (parts[0] === "flt") {
@@ -7739,6 +7985,41 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(chatID, await bgPromote(bgTarget, "手动按钮/命令"))
       return
     }
+    if (cmd === "model" || text === "/model" || text.startsWith("/model ")) {
+      // R2231 模型选择。无参 = 渲染选择器（mdl: 按钮驱动）；/model <名称|id|provider/id> = 直切。
+      const mTarget = fixedTarget ?? (await activeFront())
+      if (!mTarget) {
+        await reply(chatID, "[tg-bridge] 无法解析目标会话（没有任何已知会话）")
+        return
+      }
+      const list = await modelHttpList()
+      if (list.length === 0) {
+        await reply(chatID, "❌ 拉取模型列表失败（宿主 HttpApi GET /api/model 不可用）")
+        return
+      }
+      const sesNow = await modelHttpSession(mTarget)
+      const curKey = sesNow ? `${sesNow.providerID}/${sesNow.id}` : ""
+      const arg = commandArg(text).trim()
+      if (arg) {
+        const hit = resolveModelRef(arg, list, sesNow ?? undefined)
+        if (!hit) {
+          const sample = list.slice(0, 12).map((m) => m.key).join("、")
+          await reply(chatID, `❌ 未找到模型：${clean(arg, 40)}\n可用的（节选）：${sample}${list.length > 12 ? "…" : ""}\n发 /model 打开选择列表。`)
+          return
+        }
+        const res = await modelHttpSet(mTarget, { id: hit.id, providerID: hit.providerID })
+        if (!res.ok) {
+          const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
+          await reply(chatID, `❌ 切换失败（HTTP ${res.status}）：${clean(why, 140)}`)
+          return
+        }
+        await reply(chatID, `✅ ${sessionTag(mTarget)}（${mTarget.slice(0, 12)}）→ <b>${htmlEsc(hit.label)}</b>\n下次生成生效；随时 /model 查看或再切。`)
+        return
+      }
+      modelMenuCache.set(chatID, { list, ts: Date.now() })
+      await reply(chatID, modelMenuText(curKey, list), buildModelKeyboard(list, 0, curKey))
+      return
+    }
     if (text === "/autoguard" || text.startsWith("/autoguard ") || cmd === "autoguard") {
       // 自动停止守卫的开关/状态（用户 2026-09-28 新增，菜单「🔁 循环」里也有两枚按钮）。
       // 语义：problem = 助手宣告 [SIGNAL:PROBLEM] 或本轮 [STATUS: STOP] 时停循环；
@@ -8286,7 +8567,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await log("info", `healcards: checked=${checked} fixed=${fixed}`)
       return
     }
-    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "addbot", "botname", "botdesc", "autoguard", "background"])
+    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "addbot", "botname", "botdesc", "autoguard", "background", "model"])
     if (text.startsWith("/")) {
       if (!KNOWN_CMDS.has(cmd)) {
         await reply(chatID, `❓ 未知命令 /${clean(cmd || text.slice(1).split(/\s/)[0], 30)}（发送 /help 查看列表）`)
