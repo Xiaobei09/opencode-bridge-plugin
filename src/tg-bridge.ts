@@ -327,6 +327,25 @@ const ownsLoopSession = (sessionID: string): boolean => {
     return false
   }
 }
+// R2228 状态卡第三行「循环: ▶/⏸」的数据源。只读展示用：停闸的 by/reason 摘到卡上，
+// 用户抬头看置顶卡就能知道循环此刻是开着还是被谁按停的，不必再敲 /loop status。
+const loopGateInfo = (): { stopped: boolean; by: string; reason: string } => {
+  try {
+    const j = JSON.parse(readFileSync(LOOP_CTL_PATH, "utf8")) as any
+    const stopped = botLoopStopped(j, BOT_ID, persistedFront)
+    if (!stopped) return { stopped: false, by: "", reason: "" }
+    // 判据在 botLoopStopped（含 front 过滤）；展示取**触发停止的那一层**：
+    // 顶层停 → j 的 by/reason；单 Bot 停 → bots[BOT_ID] 的 by/reason。
+    const ge = j?.stopped === true ? j : j?.bots?.[BOT_ID]
+    return {
+      stopped: true,
+      by: typeof ge?.by === "string" && ge.by ? ge.by : "auto",
+      reason: typeof ge?.reason === "string" ? ge.reason : "",
+    }
+  } catch {
+    return { stopped: false, by: "", reason: "" }
+  }
+}
 
 const loopStopTimestamp = (): number => {
   // R1724：per-bot 闸的时间戳要取**该 Bot 条目**的 ts；混用顶层 ts 会让
@@ -2191,6 +2210,71 @@ const isHarnessNoise = (s: unknown): boolean => {
 }
 
 const htmlEsc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+// ---------------------------------------------------------------------------
+// R2228 循环注入状态卡（用户需求演进：逐条提醒刷屏 → 单张可编辑状态卡 + 置顶）。
+// 纯函数 + 状态文件读写放模块级：文案与落盘可单测，不必起桥。
+// 卡片 id 持久化到配置目录（/tmp 在进程重启会被清空，见 R1786 实录），热重载后
+// 仍编辑同一条消息，不会每次重启都新建一张卡。
+export type InjectCardState = { msgID?: number; count: number; lastAt: number; lastKind: string; lastSid: string; avgGapMs: number }
+const INJECT_CARD_KEY_RE = /^[A-Za-z0-9_-]+$/
+export const injectCardStatePath = (bot: string): string =>
+  `REDACTED_ROOT/.config/opencode/inject-card-${INJECT_CARD_KEY_RE.test(bot) ? bot : "x"}.json`
+export const readInjectCardState = (bot: string): InjectCardState => {
+  try {
+    const j = JSON.parse(readFileSync(injectCardStatePath(bot), "utf8")) as any
+    return {
+      msgID: Number.isInteger(j?.msgID) && j.msgID > 0 ? Number(j.msgID) : undefined,
+      count: Number.isInteger(j?.count) && j.count > 0 ? j.count : 0,
+      lastAt: Number(j?.lastAt) > 0 ? Number(j.lastAt) : 0,
+      lastKind: j?.lastKind === "recover" ? "recover" : "round",
+      lastSid: typeof j?.lastSid === "string" ? j.lastSid : "",
+      avgGapMs: Number(j?.avgGapMs) > 0 ? Number(j.avgGapMs) : 0,
+    }
+  } catch {
+    // 文件不存在/损坏都按空态处理：宁可从 0 重计，也不能让一张坏文件卡死注入提醒
+    return { count: 0, lastAt: 0, lastKind: "round", lastSid: "", avgGapMs: 0 }
+  }
+}
+export const writeInjectCardState = (bot: string, st: InjectCardState): void => {
+  if (!INJECT_CARD_KEY_RE.test(bot)) return
+  try {
+    writeFileSync(
+      injectCardStatePath(bot),
+      JSON.stringify({ msgID: st.msgID, count: st.count, lastAt: st.lastAt, lastKind: st.lastKind, lastSid: st.lastSid, avgGapMs: st.avgGapMs }),
+    )
+  } catch {
+    /* best-effort：落盘失败只影响重载后的卡 id 复用，下次创建会自愈 */
+  }
+}
+/** 状态卡文案（纯函数，统一 htmlEsc 动态字段；调用方传原始未转义文本）。 */
+export const injectCardText = (o: {
+  bot: string
+  lastAt: number
+  kind: string
+  sid: string
+  count: number
+  avgGapMs: number
+  gate: { stopped: boolean; by: string; reason: string }
+  now: number
+}): string => {
+  const d = new Date(o.lastAt > 0 ? o.lastAt : o.now)
+  const pad = (n: number): string => String(n).padStart(2, "0")
+  const stamp = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  const short = o.sid.replace(/^ses_/, "").slice(0, 10)
+  const gap = o.avgGapMs > 0 ? `${Math.floor(o.avgGapMs / 60000)}分${pad(Math.round((o.avgGapMs % 60000) / 1000))}秒` : "—"
+  const g = o.gate
+  const gateLine = g.stopped
+    ? `⏸ 循环已停${g.by ? `（by:${htmlEsc(g.by)}）` : ""}${g.reason ? ` · ${htmlEsc(g.reason).slice(0, 48)}` : ""}`
+    : "▶ 循环运行中"
+  return [
+    `🔁 循环注入状态卡 · ${htmlEsc(o.bot)}`,
+    `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
+    `累计: ${o.count} 次 · 平均间隔 ${gap}`,
+    gateLine,
+    `更新: 注入即自动编辑本卡（已置顶）`,
+  ].join("\n")
+}
 
 // 纯函数：HTML 消息卡片渲染（可单测，2026-09-29 抽出）。
 // 约定 = **调用方必须传未转义的原始文本**（title 与 body 都别预转义），本函数统一 htmlEsc 一次。
@@ -9603,23 +9687,109 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     }
   }
 
-  // ---- 循环注入提醒（用户需求：循环消息注入时发消息提醒我）------------------
-  // auto-continue 每次成功注入 round/recover 提示后 fire 到这里；只对本 Bot 拥有
-  // 的循环会话发提醒，并节流 1 条/60s，避免多会话快速轮次时刷屏。失败不阻断桥
-  //（通知是附赠，不是命脉）。注册表经 globalThis 跨模块实例共享（见 _v2compat）。
-  let lastInjectNoticeAt = 0
+  // ---- 循环注入状态卡（R2228 v3：用户「单张可编辑状态卡」+「置顶」）-----------
+  // 演进：v1 逐条提醒（每轮一条）→ 实测 23:02–02:11 刷了 125 条，且队列回灌在
+  // 02:05 于 8 秒内连发 18 条 → 用户改选「单张可编辑状态卡」并要求置顶。
+  // 现行为：全局只维护**一张**卡 —— 首次创建，之后每次注入 editTextRaw 原地编辑；
+  // 创建即静默置顶。聊天零新增、不响铃、不刷屏。
+  // 卡 id 落盘 inject-card-<bot>.json（配置目录，非 /tmp）：热重载后继续编辑同一条，
+  // 不会每次部署都多出一张卡。
+  // 直发 sendTextRaw / 直编辑 editTextRaw，**绝不进 outQueue**：旧版正是队列积压回灌
+  // 造成 8 秒 18 连发（02:05 实录），此路径从根上绕开回灌。
+  // 失败一律 best-effort 吞掉（通知是附赠，不阻断注入主路径）。
+  let lastCardEditAt = 0
+  let lastCardPinAt = 0
+  const pinInjectCard = async (chat: string, mid: number, tag: string): Promise<void> => {
+    try {
+      const r = await tgFetch("pinChatMessage", {
+        chat_id: Number(chat) || chat,
+        message_id: mid,
+        disable_notification: true,
+      })
+      await log(
+        r.ok ? "info" : "warn",
+        `inject card pin ${r.ok ? "ok" : "failed"} (bot=${BOT_ID}, ${tag}, msg=${mid}${r.desc ? `, desc=${sanitizeLog(r.desc).slice(0, 80)}` : ""})`,
+      )
+    } catch (err) {
+      await log("warn", `inject card pin error (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 100)}`)
+    }
+  }
+  const ensureInjectCardPin = async (chat: string, mid: number, now: number): Promise<void> => {
+    // 不与队列卡抢置顶（同一 chat 只有一条置顶；队列有卡时让位，避免两卡互相顶）。
+    // 否则每 10 分钟静默重申一次：自愈被别处置顶顶掉 / 重载后置顶丢失。
+    // 重复 pin 同一条 Telegram 幂等且静默，代价可忽略。
+    if (queuePin.get(chat) !== undefined) return
+    if (lastCardPinAt > 0 && now - lastCardPinAt < 600_000) return
+    lastCardPinAt = now
+    await pinInjectCard(chat, mid, "keep")
+  }
   try {
     registerInjectNotifier(BOT_ID, async (sessionID, kind) => {
       if (!ownsLoopSession(sessionID)) return
       const now = Date.now()
-      if (now - lastInjectNoticeAt < 60_000) return
-      lastInjectNoticeAt = now
+      if (now - lastCardEditAt < 30_000) return
+      lastCardEditAt = now
       const chat = pushChatResolve()
       if (!chat) return
-      const short = sessionID.replace(/^ses_/, "").slice(0, 10)
-      const t = new Date(now).toISOString().slice(11, 19)
-      await log("info", `inject notice fire (bot=${BOT_ID}, session=${sanitizeLog(sessionID).slice(0, 12)}, kind=${kind}, chat=${sanitizeLog(chat)})`)
-      await reply(chat, `⏱ 循环注入 ${kind === "round" ? "轮次" : "恢复"} · ${short} · ${t}`)
+      const st = readInjectCardState(BOT_ID)
+      const gap = st.lastAt > 0 ? now - st.lastAt : 0
+      // 5s 内的连发（重载/重试噪声）不计入间隔；>6h 视为跨时段，不污染均值
+      if (gap >= 5_000 && gap < 6 * 60 * 60 * 1000) {
+        st.avgGapMs = st.avgGapMs > 0 ? Math.round(st.avgGapMs * 0.7 + gap * 0.3) : gap
+      }
+      st.count += 1
+      st.lastAt = now
+      st.lastKind = kind
+      st.lastSid = sessionID
+      const text = injectCardText({
+        bot: BOT_ID,
+        lastAt: now,
+        kind,
+        sid: sessionID,
+        count: st.count,
+        avgGapMs: st.avgGapMs,
+        gate: loopGateInfo(),
+        now,
+      })
+      await log(
+        "info",
+        `inject card update (bot=${BOT_ID}, msg=${st.msgID ?? "new"}, kind=${kind}, count=${st.count}, session=${sanitizeLog(sessionID).slice(0, 12)})`,
+      )
+      if (st.msgID) {
+        const r = await editTextRaw(chat, st.msgID, text)
+        if (r.r === "sent") {
+          writeInjectCardState(BOT_ID, st)
+          await ensureInjectCardPin(chat, st.msgID, now)
+          return
+        }
+        if (r.r === "retry") {
+          // 网络/429/5xx：卡还在，别重发（越失败越发）；落盘计数，下轮注入继续编辑
+          writeInjectCardState(BOT_ID, st)
+          await log("info", `inject card edit deferred (bot=${BOT_ID}, msg=${st.msgID}, status=${r.status ?? 0})`)
+          return
+        }
+        // drop：消息已被删/不可编辑 → 清理卡 id 走重建
+        await log(
+          "warn",
+          `inject card edit failed (bot=${BOT_ID}, msg=${st.msgID}, r=${r.r}${r.desc ? `, desc=${sanitizeLog(r.desc).slice(0, 80)}` : ""}) → recreate`,
+        )
+        st.msgID = undefined
+      }
+      const s = await sendTextRaw(chat, text, undefined, true)
+      if (s.r === "sent" && typeof s.id === "number" && s.id > 0) {
+        st.msgID = s.id
+        writeInjectCardState(BOT_ID, st)
+        await log("info", `inject card created (bot=${BOT_ID}, msg=${s.id}, count=${st.count})`)
+        lastCardPinAt = now
+        await pinInjectCard(chat, s.id, "create")
+      } else {
+        // retry/drop 或 sent 但拿不到 id（R1806）：落盘计数，下轮注入重试建卡
+        writeInjectCardState(BOT_ID, st)
+        await log(
+          "warn",
+          `inject card create failed (bot=${BOT_ID}, r=${s.r}${s.desc ? `, desc=${sanitizeLog(s.desc).slice(0, 80)}` : ""})`,
+        )
+      }
     })
   } catch (err) {
     await log("warn", `inject-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
