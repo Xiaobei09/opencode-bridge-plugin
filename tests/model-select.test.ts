@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { buildMenuKeyboard, MENU_ACTION_TEXT, modelListEntries, resolveModelRef, buildModelKeyboard, MODEL_PAGE_SIZE } from "../src/tg-bridge"
+import { buildMenuKeyboard, MENU_ACTION_TEXT, modelListEntries, resolveModelRef, buildModelKeyboard, MODEL_PAGE_SIZE, modelMenuText } from "../src/tg-bridge"
 import type { ModelEntry } from "../src/tg-bridge"
 
 const mk = (over: Partial<ModelEntry> & { key?: string }): ModelEntry => ({
@@ -125,5 +125,38 @@ describe("根菜单接入（R2231）", () => {
     const btn = all.find((b) => b.callback_data === "ma:model")
     expect(btn?.text).toContain("模型")
     expect(MENU_ACTION_TEXT["model"]).toBe("/model")
+  })
+})
+
+// R2231.1：用户实报「列表不能翻页」——真因是文案里写了裸 `/model <名称或 id>`，
+// 被 Telegram HTML 解析器当成起始标签 → 每次 editMessageText 都 400，
+// 页面永远停在第 1 页。此组测试钉死「选择器文案 HTML 安全」。
+const WHITELIST_TAG =
+  /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|span|tg-spoiler|blockquote)(?:\s[^<>]*)?\/?>/g
+/** 去掉白名单标签后，若仍残留裸 `<`/`>`，说明文案会被 Telegram 判为非法实体。 */
+const hasRawAngleAfterAllowedTags = (s: string): boolean => /[<>]/.test(s.replace(WHITELIST_TAG, ""))
+
+describe("modelMenuText HTML 安全（R2231.1）", () => {
+  it("文案无裸角括号（翻页/刷新编辑 400 的根因）", () => {
+    const t = modelMenuText("opencode/big-pickle", sampleList)
+    expect(hasRawAngleAfterAllowedTags(t)).toBe(false)
+    // 明确回归：不得再出现字面量 `<名称或` 之类的伪标签
+    expect(t).not.toContain("<名称")
+    expect(t).toContain("&lt;名称或 id&gt;")
+  })
+
+  it("模型名里的 HTML 元字符被转义（当前模型名不可注入标签）", () => {
+    const evil = modelListEntries({
+      data: [{ providerID: "opencode", id: "x", name: "<img src=x onerror=alert(1)>", status: "active", limit: { context: 1 } }],
+    })
+    const t = modelMenuText("opencode/x", evil)
+    expect(hasRawAngleAfterAllowedTags(t)).toBe(false)
+    expect(t).toContain("&lt;img")
+    expect(t).not.toContain("<img")
+  })
+
+  it("未找到当前模型时也安全（curKey 空/不匹配）", () => {
+    expect(hasRawAngleAfterAllowedTags(modelMenuText("", sampleList))).toBe(false)
+    expect(hasRawAngleAfterAllowedTags(modelMenuText("nope/none", sampleList))).toBe(false)
   })
 })

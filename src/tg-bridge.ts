@@ -191,6 +191,22 @@ export const buildModelKeyboard = (list: ModelEntry[], page: number, curKey: str
   return rows
 }
 
+/**
+ * 选择器卡片文本（纯函数，**必须 HTML 安全**）。宿主以 `parse_mode=HTML` 发送/编辑，
+ * 故除白名单标签（<b> 等）外，一切字面量角括号都要转义。
+ *
+ * 背景（2026-10-10 用户实报「模型选择列表不能翻页」）：原文案里直接写了
+ * `/model <名称或 id>`，`<名称或` 被 Telegram 当成起始标签 → 400
+ * `can't parse entities: Unsupported start tag "名称或" at byte offset 119`。
+ * 翻页/刷新走的都是 editMessageText（同一条消息），所以**每次编辑都 400**、
+ * 页面永远停在第一页 —— 症状被误读成"不能翻页"，真因是文案里的裸角括号。
+ */
+export const modelMenuText = (curKey: string, list: ModelEntry[]): string => {
+  const curName = list.find((m) => m.key === curKey)
+  const curLine = curKey ? `当前：<b>${htmlEsc(curName?.display ?? curKey)}</b>` : "当前：未知"
+  return ["<b>🤖 选择模型</b>", curLine, `共 ${list.length} 个模型。点名称切换（下次生成生效）；也可发 /model &lt;名称或 id&gt;。`].join("\n")
+}
+
 // ctx 骤降是否算"宿主自动压缩" —— 纯函数，好处是四条否决线都能用行为测试钉死
 // （写成 if 链就只能靠静态断言，那玩意儿今天已经假阳性 4 次）。
 // 背景：2026-09-26T15:36 实测主会话 498.1k → 42.7k（48%→4%，rea=23 条被回收）= 真压缩；
@@ -6265,7 +6281,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(
         chatID,
         [
-          "用法：/addbot <token> [chatId] [标签]",
+          "用法：/addbot &lt;token&gt; [chatId] [标签]",
           "",
           "· token —— BotFather 给的 token（形如 123456:ABC…）",
           "· chatId —— 允许对话的 chat；省略就用当前会话",
@@ -6424,7 +6440,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /help — 显示本列表",
     "· /loop on — 本会话（当前目标）加入自动循环",
     "· /loop off — 本会话退出自动循环（其它会话不受影响）",
-    "· /addbot <token> [chatId] [标签] — 登记一个新机器人（登记后需你手动把它拉进会话）",
+    "· /addbot &lt;token&gt; [chatId] [标签] — 登记一个新机器人（登记后需你手动把它拉进会话）",
     "· /sessions — 列出会话，带 [切换] 按钮（别名 /s；之后直接回序号也可选）",
     "  (⭐前台=GUI当前 · ◎活跃=10分钟内有输出 · 📌钉选)",
     "· /use [序号|名称|前缀|ID] — 钉选会话（如：/use 3；别名 /u；空参看当前）",
@@ -6455,7 +6471,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /loop [start|stop|status] — 自动循环开关（默认一直跑，用户 /loop stop 才停）",
     "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
     "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
-    "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model <名称> 切换当前会话模型，下次生成生效）",
+    "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model &lt;名称&gt; 切换当前会话模型，下次生成生效）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
     "· /compact — 手动触发压缩（本宿主构建不可用时改用 /migrate）",
@@ -6720,11 +6736,6 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     })
   /** 选择器缩略缓存（每个 chat 一份，90s TTL）：按钮回调按下标解析模型，无需把长 id 塞进 64B 的 callback_data。 */
   const modelMenuCache = new Map<string, { list: ModelEntry[]; ts: number }>()
-  const modelMenuText = (curKey: string, list: ModelEntry[]): string => {
-    const curName = list.find((m) => m.key === curKey)
-    const curLine = curKey ? `当前：<b>${htmlEsc(curName?.display ?? curKey)}</b>` : "当前：未知"
-    return ["<b>🤖 选择模型</b>", curLine, `共 ${list.length} 个模型。点名称切换（下次生成生效）；也可发 /model <名称或 id>。`].join("\n")
-  }
   const handleCallback = async (cq: any): Promise<void> => {
     try {
     const data = String(cq?.data ?? "")
@@ -6882,7 +6893,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (!res.ok) {
           await answer(`切换失败 ${res.status}`)
           const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
-          if (mid) await editTextRaw(cchat, mid, `❌ 切换失败（HTTP ${res.status}）：${clean(why, 120)}`, [], false)
+          if (mid) await editTextRaw(cchat, mid, `❌ 切换失败（HTTP ${res.status}）：${htmlEsc(clean(why, 120))}`, [], false)
           return
         }
         await answer(`已切换 ${hit.display}`)
@@ -6900,7 +6911,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const page = Math.max(0, Number(parts[2] ?? "0") || 0)
         await answer("已翻页")
         modelMenuCache.set(cchat, { list, ts: Date.now() })
-        if (mid) await editTextRaw(cchat, mid, modelMenuText(curKey, list), buildModelKeyboard(list, page, curKey), false)
+        const t = modelMenuText(curKey, list)
+        const kb = buildModelKeyboard(list, page, curKey)
+        // 编辑失败（如文案被 TG 判非法）不能静默不动 —— 退化为新发一条，保证翻页可见。
+        const r = mid ? await editTextRaw(cchat, mid, t, kb, false) : { r: "retry" as const }
+        if (r.r !== "sent") await sendTextRaw(cchat, t, kb, false)
         return
       }
       if (sub === "refresh") {
@@ -6910,7 +6925,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const ses2 = await modelHttpSession(target)
         const cur2 = ses2 ? `${ses2.providerID}/${ses2.id}` : curKey
         modelMenuCache.set(cchat, { list: list2, ts: Date.now() })
-        if (mid) await editTextRaw(cchat, mid, modelMenuText(cur2, list2), buildModelKeyboard(list2, 0, cur2), false)
+        const t = modelMenuText(cur2, list2)
+        const kb = buildModelKeyboard(list2, 0, cur2)
+        const r = mid ? await editTextRaw(cchat, mid, t, kb, false) : { r: "retry" as const }
+        if (r.r !== "sent") await sendTextRaw(cchat, t, kb, false)
         return
       }
       await answer("未知按钮")
@@ -7930,7 +7948,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const bgStatus = (extra = ""): string =>
         `[tg-bridge] 后台能力：${capLabel}｜实验开关 ${BG_ENV_VAR}=${envOn ? "开" : "未开"}｜自动转后台=${curBg.enabled ? "开" : "关"}（冷却 ${Math.round(curBg.cooldownMs / 1000)}s）｜shell 自动后台=${curBg.shellPromo !== false ? "开" : "关"}｜超时阈值=${Math.round(curBg.promoteMs / 1000)}s${extra}\n` +
         "· 提升：把**正在阻塞**的同步子代理转后台（无端点时走宿主 HTTP 直连）\n" +
-        "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜/background th <秒>（超时阈值）｜状态：/background status"
+        "· 开关：/background auto on|off（整体配置）｜/background shell on|off（shell 自动后台）｜/background th &lt;秒&gt;（超时阈值）｜状态：/background status"
       const bgPromote = async (sid: string, why: string): Promise<string> => {
         const sessAny = (client as any)?.session
         const expSess = (client as any)?.experimental?.session
@@ -7954,7 +7972,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // 用户反馈「菜单里的转后台按钮不能实际控制是否自动转后台」。
       const bgAct = parseBgArg(bgArg, { ...curBg, shellAuto: curBg.shellPromo !== false })
       if (bgAct.kind === "help") {
-        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background th <秒> | /background status\n${bgStatus()}`)
+        await reply(chatID, `[tg-bridge] 用法：/background（立刻转后台）| /background auto on|off|toggle | /background shell on|off|toggle | /background th &lt;秒&gt; | /background status\n${bgStatus()}`)
         return
       }
       if (bgAct.kind === "status") {
@@ -7973,7 +7991,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       if (bgAct.kind === "setth") {
         writeBg({ ...curBg, promoteMs: bgAct.ms })
-        await reply(chatID, `[tg-bridge] 插件层超时阈值 → ${Math.round(bgAct.ms / 1000)}s（shell 跑超自动转后台；可再 /background th <秒> 调整）\n${bgTable()}`)
+        await reply(chatID, `[tg-bridge] 插件层超时阈值 → ${Math.round(bgAct.ms / 1000)}s（shell 跑超自动转后台；可再 /background th &lt;秒&gt; 调整）\n${bgTable()}`)
         return
       }
       const bgTarget = fixedTarget ?? (await activeFront())
@@ -8004,16 +8022,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const hit = resolveModelRef(arg, list, sesNow ?? undefined)
         if (!hit) {
           const sample = list.slice(0, 12).map((m) => m.key).join("、")
-          await reply(chatID, `❌ 未找到模型：${clean(arg, 40)}\n可用的（节选）：${sample}${list.length > 12 ? "…" : ""}\n发 /model 打开选择列表。`)
+          await reply(chatID, `❌ 未找到模型：${htmlEsc(clean(arg, 40))}\n可用的（节选）：${htmlEsc(sample)}${list.length > 12 ? "…" : ""}\n发 /model 打开选择列表。`)
           return
         }
         const res = await modelHttpSet(mTarget, { id: hit.id, providerID: hit.providerID })
         if (!res.ok) {
           const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
-          await reply(chatID, `❌ 切换失败（HTTP ${res.status}）：${clean(why, 140)}`)
+          await reply(chatID, `❌ 切换失败（HTTP ${res.status}）：${htmlEsc(clean(why, 140))}`)
           return
         }
-        await reply(chatID, `✅ ${sessionTag(mTarget)}（${mTarget.slice(0, 12)}）→ <b>${htmlEsc(hit.label)}</b>\n下次生成生效；随时 /model 查看或再切。`)
+        await reply(chatID, `✅ ${htmlEsc(sessionTag(mTarget))}（${htmlEsc(mTarget.slice(0, 12))}）→ <b>${htmlEsc(hit.label)}</b>\n下次生成生效；随时 /model 查看或再切。`)
         return
       }
       modelMenuCache.set(chatID, { list, ts: Date.now() })
