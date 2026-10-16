@@ -272,6 +272,40 @@ export const fireProxyNotice = (e: ProxySwitchEvent): void => {
   }
 }
 
+/**
+ * R887（R885–886 审计：19 时 12 次切换 / 同秒双切+双通知 / state≠now 残留）：
+ * **跨实例切换许可落盘闸** —— 把「在途占位 + 全局小时配额」收敛到 STATE_PATH：
+ *  · tg-bridge（快照加载）与 auto-continue（活文件加载）是**两个模块实例**，内存 switchTimes
+ *    互不可见 → 此前 maxPerHour 实为"每实例 6、合计可达 12"；且闸检查→切换落盘之间窗口长达
+ *    ~16s（now 跟随等待），并发触发可双双通过 → 同秒双切/双通知/状态错位（19:20、19:57 现场）。
+ *  · claim：读-查-写在同一**同步块**（无 await；atomicWrite 同步）内完成 —— 同进程内与另一
+ *    实例的同步段互斥；在途占位 autoMark 覆盖整段切换窗口（含失败快速返回）。
+ *  · 通过则占位（history 追加本次 + autoMark=now）；失败调用方放弃本次（单波单切）。
+ *  · 落盘失败放行（宁可行开朗），内存闸仍兜底。
+ */
+const AUTO_MARK_MS = 90_000
+const claimAutoSwitchSlot = (cfg: ProxySwitchCfg): boolean => {
+  try {
+    const now = Date.now()
+    let raw: Record<string, unknown> = {}
+    try {
+      raw = JSON.parse(readFileSync(STATE_PATH, "utf8")) as Record<string, unknown>
+    } catch {
+      raw = {}
+    }
+    const hist = (Array.isArray(raw.history) ? (raw.history as unknown[]) : [])
+      .map((t) => Number(t))
+      .filter((t) => Number.isFinite(t) && t > 0 && now - t < 3_600_000)
+    const mark = Number(raw.autoMark ?? 0)
+    if (Number.isFinite(mark) && mark > 0 && now - mark < AUTO_MARK_MS) return false
+    if (hist.length >= cfg.maxPerHour) return false
+    atomicWrite(STATE_PATH, JSON.stringify({ ...raw, history: [...hist, now], autoMark: now }))
+    return true
+  } catch {
+    return true
+  }
+}
+
 const recordSwitch = (s: {
   from: string
   to: string
@@ -281,7 +315,18 @@ const recordSwitch = (s: {
   /** R722：锁定/生效旗标（;lock-ok;now-ok@Ns …），供通知文案如实描述。 */
   detail?: string
 }): void => {
-  const rec: ProxyLastSwitch = { at: Date.now(), from: s.from, to: s.to, reason: s.reason, via: s.via }
+  // R887：保留 claim 写入的 history（全局小时配额账本，跨实例共享），并清在途占位。
+  let hist: number[] = []
+  try {
+    const raw = JSON.parse(readFileSync(STATE_PATH, "utf8")) as Record<string, unknown>
+    hist = (Array.isArray(raw.history) ? (raw.history as unknown[]) : [])
+      .map((t) => Number(t))
+      .filter((t) => Number.isFinite(t) && t > 0)
+      .slice(-48)
+  } catch {
+    /* 无历史 */
+  }
+  const rec = { at: Date.now(), from: s.from, to: s.to, reason: s.reason, via: s.via, history: hist, autoMark: 0 }
   try {
     atomicWrite(STATE_PATH, JSON.stringify(rec))
   } catch {
@@ -789,6 +834,11 @@ export const maybeSwitchProxyNode = async (args: {
       if (cfg.log) await args.log("info", `proxy-switch: race-skip:${(raced.to ?? "").slice(0, 44)} (并发实例刚落盘，放弃本次) err=${args.name ?? ""}`)
       return
     }
+    if (!claimAutoSwitchSlot(cfg)) {
+      lastSwitchAt = now
+      if (cfg.log) await args.log("info", `proxy-switch: slot-busy (跨实例在途/全局配额满，放弃本次) err=${args.name ?? ""}`)
+      return
+    }
     lastSwitchAt = now
     switchTimes.push(now)
     const res = await switchProxyNode(cfg, "auto", args.sessionID ?? "", args.name ?? "")
@@ -879,6 +929,7 @@ export const watchLockedQuality = async (): Promise<string> => {
     // 锁定节点掉质量（失活/延迟超阈/锁定长时未生效）→ 与错误自动切换同一路径（内部另有 maxPerHour 闸）
     switchTimes = switchTimes.filter((t) => now - t < 3_600_000)
     if (switchTimes.length >= cfg.maxPerHour) return "max-per-hour"
+    if (!claimAutoSwitchSlot(cfg)) return "slot-busy"
     lastSwitchAt = now
     switchTimes.push(now)
     const res = await switchProxyNode(cfg, "auto", "", "lock-quality")
