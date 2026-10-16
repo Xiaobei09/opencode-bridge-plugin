@@ -23,7 +23,7 @@
  * 「在 tui 使用 esc 导致的应该是仅本轮暂停，不是永久」「不同会话分开」→ 改 pause。
  */
 
-import { readFileSync, writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs"
 
 export type AbortVerdict = "pause" | "skip" | "recover"
 
@@ -103,11 +103,23 @@ export const noteAbortEvent = (ev: AbortEvent): void => {
       /* first write */
     }
     events = [...events, ev].slice(-ABORT_EVENTS_CAP)
-    writeFileSync(
-      abortEventsPath(),
-      JSON.stringify({ events, updatedAt: Date.now() }),
-      { encoding: "utf8", mode: 0o600 },
-    )
+    // R2502：本文件可能被 TUI 进程与 serve 进程**同时**写（本模块注释所述），裸 writeFileSync
+    // 先 O_TRUNC 再写 → 并发读者落在窗口内会 parse 失败（被 catch 当"无历史"→ 下次写把旧记录
+    // 整体丢弃）。改 tmp(带 pid)+rename 原子写，与 R1841/R1847/R1849 同一族修法。注释本已写
+    // 「原子写」，此处让实现与注释一致。
+    const path = abortEventsPath()
+    const tmp = `${path}.tmp-${process.pid}`
+    try {
+      writeFileSync(tmp, JSON.stringify({ events, updatedAt: Date.now() }), { encoding: "utf8", mode: 0o600 })
+      renameSync(tmp, path)
+    } catch (e) {
+      try {
+        unlinkSync(tmp)
+      } catch {
+        /* best-effort */
+      }
+      throw e
+    }
   } catch {
     /* best-effort */
   }

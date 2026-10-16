@@ -141,13 +141,22 @@ export const rollbackVerdict = (hadArchive: boolean, orphanPath: string): string
  *   ④ 最新一条**非压缩**消息的 `created` 不晚于该 `completed`（否则回合已续到下一步）。
  *   ⑤ 尾段（末 6 条）没有 `running`/`pending` 的工具。
  *   ⑥ 该 `completed` 已过去 ≥ `settleMs`（消息级落定窗口，给"下一步即将落盘"留时间）。
+ *
+ * R2376 死回合逃生（stuck-turn）：③/④ 原本**没有超时**。一旦一轮被 provider ECONNRESET /
+ * 宿主中断打断——最后一步以 `finish=tool-calls`（宿主本应续跑下一步，但不会了）或一条
+ * 更晚的 synthetic/更新行收尾——旧判据就**永久**判"回合未结束"，`injectAllowed` 永不放行、
+ * 循环空转（实证：primary 卡 ~40 分钟，直到用户发新消息；bot3 同理）。修法：③/④ 在
+ * 「已静置 > STUCK_TURN_MS」**且**「尾段确无 running/pending 工具」双条件下判死回合。
+ * 阈值可用环境变量 `AC_STUCK_TURN_MS` 调整，设 0 关闭（退回旧行为）。
  */
+const STUCK_TURN_MS = Number(process.env.AC_STUCK_TURN_MS ?? 300_000)
 export const idleVerdict = (o: {
   rows: unknown
   now: number
   eventSettleMs?: number
   lastEventTs?: number
   settleMs?: number
+  stuckTurnMs?: number
 }): { idle: boolean; why: string } => {
   const now = Number(o.now) || Date.now()
   const lastEvent = Number(o.lastEventTs ?? 0)
@@ -156,6 +165,20 @@ export const idleVerdict = (o: {
     return { idle: false, why: `event-${Math.round((now - lastEvent) / 1000)}s-ago` }
   }
   const arr = Array.isArray(o.rows) ? (o.rows as any[]) : []
+  // R2376 逃生前置检查：尾段（末 6 行）是否存在仍在执行/待执行的工具。
+  // 有活工具 = 回合真的在跑，绝不能被"年龄逃生"判死；返回该状态名便于记 why。
+  const tailHasLiveTool = (): string => {
+    for (let i = arr.length - 1, seen = 0; i >= 0 && seen < 6; i--, seen++) {
+      const row: any = arr[i]
+      const parts = Array.isArray(row?.parts) ? row.parts : Array.isArray(row?.info?.parts) ? row.info.parts : []
+      for (const pp of parts) {
+        if (String(pp?.type ?? "") !== "tool") continue
+        const stt = String(pp?.state?.status ?? "")
+        if (stt === "running" || stt === "pending") return stt
+      }
+    }
+    return ""
+  }
   // ③b 压缩（compaction）判据。
   // 为什么单列：rowToV1 把压缩行渲染成 role=assistant、completed=created、**无 finish** 的
   // "假完成消息"。若当作最后一条 assistant，`laFinish=""`（不是 tool-calls）→ 误判回合已停 →
@@ -166,7 +189,14 @@ export const idleVerdict = (o: {
   for (let i = arr.length - 1; i >= 0; i--) {
     const info = arr[i]?.info ?? arr[i]
     if (!info?.compaction) continue
-    if (String(info?.compactionStatus ?? "completed") !== "completed") {
+    // R2235-fix：只有"真正进行中"的压缩才持闸。宿主压缩行 data.status 的**终态**是
+    // completed（成功）或 failed（失败）。旧判据 `status!=="completed"` 把**失败的压缩**
+    // （终态，宿主不会把它改回 completed）也当成进行中 → 循环被**永久**持有。
+    // 实证：主会话 2026-10-10T14:00:21 一次 failed 压缩（msg_1261d5d4c001wQMu）后，
+    // 从 14:00 到 10-11T07:34 约 **17.5 小时零注入**（日志 58 次 compaction-in-flight），
+    // 直到用户发消息才打破。故：completed / failed 均视为"已结束、可注入"。
+    const cst = String(info?.compactionStatus ?? "completed")
+    if (cst !== "completed" && cst !== "failed") {
       return { idle: false, why: "compaction-in-flight" }
     }
     break
@@ -189,6 +219,14 @@ export const idleVerdict = (o: {
   }
   // ③ 停步原因：tool-calls = 宿主马上还会跑下一步，回合没结束。
   if (laFinish === "tool-calls" || laFinish === "tool_calls") {
+    // R2376 死回合逃生：tool-calls 通常只是中间态（宿主一两步内续跑下一步），
+    // 但被打断时**没有下一步**。静置超时 + 无活工具 → 判死，交上层注入 recover/round。
+    const stuckMs = Number(o.stuckTurnMs ?? STUCK_TURN_MS)
+    if (stuckMs > 0 && laCompleted > 0 && now - laCompleted > stuckMs) {
+      const live = tailHasLiveTool()
+      if (!live) return { idle: true, why: `stuck-turn(tool-calls ${Math.round((now - laCompleted) / 1000)}s)` }
+      return { idle: false, why: `turn-continues(tool-calls, tool-${live})` }
+    }
     return { idle: false, why: "turn-continues(tool-calls)" }
   }
   // ④ 最新一条**非压缩**消息的 created 不晚于该 completed（否则回合已续到下一步）。
@@ -201,7 +239,17 @@ export const idleVerdict = (o: {
   }
   const nInfo = newest?.info ?? newest
   const nCreated = Number(nInfo?.time?.created ?? newest?.time?.created ?? 0)
-  if (nCreated > laCompleted) return { idle: false, why: "newer-message" }
+  if (nCreated > laCompleted) {
+    // R2376 死回合逃生（同 ③）：更晚的"更新消息"（常是我们自己注入的 synthetic 循环提示）
+    // 之后宿主再没产出 → 静置超时 + 无活工具即判死，否则 bot3 会**永久**卡在 newer-message。
+    const stuckMs = Number(o.stuckTurnMs ?? STUCK_TURN_MS)
+    if (stuckMs > 0 && nCreated > 0 && now - nCreated > stuckMs) {
+      const live = tailHasLiveTool()
+      if (!live) return { idle: true, why: `stuck-turn(newer-message ${Math.round((now - nCreated) / 1000)}s)` }
+      return { idle: false, why: `newer-message, tool-${live}` }
+    }
+    return { idle: false, why: "newer-message" }
+  }
   for (let i = arr.length - 1, seen = 0; i >= 0 && seen < 6; i--, seen++) {
     const row: any = arr[i]
     const parts = Array.isArray(row?.parts) ? row.parts : Array.isArray(row?.info?.parts) ? row.info.parts : []
@@ -1390,6 +1438,18 @@ const toV1Event = async (ev: any): Promise<any> => {
     const t = data?.tokens ?? {}
     return { type: "message.updated", properties: { sessionID: sid, info: { id: amid, role: "assistant", sessionID: sid, tokens: { input: numOrZero(t.input) } } } }
   }
+  if (type === "session.step.failed") {
+    // R2451（用户实报「部分错误❌不发送，比如速率限制」）：致命 provider 错误（quota/限流）
+    // 落在 `session.step.failed` 上，携带 `assistantMessageID` + `error`，但**不产生 retry
+    // part** —— 而 transport 类错误会重试、产生 retry part，从而附带 `message.updated`
+    // 让事件路径命中。于是**致命错误**这条 assistant 消息在事件路径里**彻底收不到**
+    // （宿主另发的 `session.error`/`session.execution.failed` 均不带 messageID，见 toV1Event
+    //  末尾的丢弃逻辑）。这里与紧邻的 `session.step.ended` 同款映射成 message.updated：
+    // tg-bridge 重读该消息 → 由既有「❌ 生成失败」卡（R2369）投递。
+    const amid = String(data.assistantMessageID ?? "")
+    if (!sid || !amid) return null
+    return { type: "message.updated", properties: { sessionID: sid, info: { id: amid, role: "assistant", sessionID: sid } } }
+  }
   if (type === "session.tool.success" || type === "session.tool.failed") {
     const amid = String(data.assistantMessageID ?? "")
     if (!sid || !amid) return null
@@ -1397,18 +1457,17 @@ const toV1Event = async (ev: any): Promise<any> => {
   }
   if (type === "session.compaction.ended" || type === "session.compaction.failed" || type === "session.compacted") {
     if (!sid) return null
-    // 压缩即清零信号（tg-bridge 侧 takeCompacted 认领后清 ctxUsage）
-    if (type !== "session.compaction.failed") {
-      compactedFlag.add(sid)
-      if (compactedFlag.size > 200) {
-        const fk = compactedFlag.values().next()
-        if (!fk.done) compactedFlag.delete(fk.value)
-      }
-    }
+    // R2369：压缩标记不再写进**模块级共享**的 compactedFlag。
+    // `_v2compat` 被三个 Bot 共用（入口不带 query 导入），而每次压缩事件都会在
+    // 每个实例的事件循环里各调一次 toV1Event → add 三次；旧语义"谁先 take 谁处理"
+    // 于是大概率落到**非拥有者**头上：它清掉自己那份（无意义）ctxUsage、并把
+    // 「已压缩」卡发到**自己的**聊天（用户实报「压缩的会话不对」），而真正的拥有者
+    // 拿不到标志 → 水位不清、通知漏发。改法：标记随事件走，归属判定交给 tg-bridge。
+    const compacted = type !== "session.compaction.failed"
     const mid =
       String((data as any)?.messageID ?? (data as any)?.messageId ?? (data as any)?.id ?? "") ||
       (await latestCompactionId(sid))
-    return { type: "message.updated", properties: { sessionID: sid, info: { id: mid, role: "assistant", sessionID: sid } } }
+    return { type: "message.updated", properties: { sessionID: sid, compacted, info: { id: mid, role: "assistant", sessionID: sid } } }
   }
   if (
     type === "session.message.completed" ||
@@ -1948,27 +2007,31 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
         })
         if (reg.active && typeof reg.active.dispose === "function") reg.active.dispose()
         reg.active = watcher
-        // 转发器只挂一次（同一进程内多实例/多代共享；闭包引用 reg，永不失效）。
-        if (!reg.attached) {
-          reg.attached = true
-          tctx.hook("execute.before", (ev: any) => {
-            try {
-              reg.active?.onBefore?.(ev ?? {})
-            } catch (err) {
-              logLine(id, "error", `[bg-watch] before err: ${String(err).slice(0, 140)}`)
-            }
-          })
-          tctx.hook("execute.after", (ev: any) => {
-            try {
-              reg.active?.onAfter?.(ev ?? {})
-            } catch (err) {
-              logLine(id, "error", `[bg-watch] after err: ${String(err).slice(0, 140)}`)
-            }
-          })
-          logLine(id, "info", "[bg-watch] persistent forwarders attached (forward-to-active)")
-        } else {
-          logLine(id, "info", "[bg-watch] active watcher replaced (forwarders already attached)")
-        }
+        // R2609：**每代都重挂**转发器（兑现 R2568 语义；其改动当年未落地到本处）。
+        // 实测机制：宿主热重载会清掉旧代监听器，而旧实现「每进程只挂一次」（reg.attached
+        // 守卫）让新代跳过挂载 → 重载后无人监听、`watch start` 从日志消失、插件层强制
+        // 转后台静默失效（2026-10-15 17:12 重载后全局零 `watch start`，本轮受控探针复现）。
+        // 修复=两条不变式同时成立，缺一不可：
+        //  · 每代挂载（本段）：宿主重载后**当前代**总有监听器（旧实现缺这条）；
+        //  · 闭包引用全局 reg（R2230 保留）：无论事件投给哪一代监听器，都转发到当前
+        //    active；watcher 按 key 幂等（重复投递只重置计时器，不会双发 promote）。
+        reg.attached = true
+        const attachN = (reg.attachN = (reg.attachN ?? 0) + 1)
+        tctx.hook("execute.before", (ev: any) => {
+          try {
+            reg.active?.onBefore?.(ev ?? {})
+          } catch (err) {
+            logLine(id, "error", `[bg-watch] before err: ${String(err).slice(0, 140)}`)
+          }
+        })
+        tctx.hook("execute.after", (ev: any) => {
+          try {
+            reg.active?.onAfter?.(ev ?? {})
+          } catch (err) {
+            logLine(id, "error", `[bg-watch] after err: ${String(err).slice(0, 140)}`)
+          }
+        })
+        logLine(id, "info", `[bg-watch] forwarders attached per-generation (#${attachN}, forward-to-active)`)
       } else {
         if (!reg.attached) logLine(id, "error", "[bg-watch] ctx.tool.hook 不可用，插件层转后台未注册（不影响其他功能）")
       }
@@ -1980,3 +2043,4 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
     }
   },
 })
+

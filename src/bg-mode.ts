@@ -56,6 +56,21 @@ export const BG_TH_STEPS: number[] = [30_000, 60_000, 90_000, 120_000, 180_000]
 export const BG_TH_MIN = 5_000
 export const BG_TH_MAX = 600_000
 
+/**
+ * R2380：阈值「轮切到下一档」的**唯一**定义（单一真源）。
+ * 此前桥内有本地 `bgThNext`、本模块 `parseBgArg` 各写一份，且**离档分支不一致**：
+ *   本地版 `indexOf` 得 -1 → `(-1+1)%len=0` → 返回 BG_TH_STEPS[0]=30s；
+ *   本模块版离档 → DEFAULT_BG.promoteMs=60s。
+ * 于是用户 `/background th 45`（离档 45s）后，菜单按钮文案显示「45s › 30s」，
+ * 但按下（裸 `th`）实际设成 60s —— 文案与动作不符。
+ * 统一按**文档化意图**（parseBgArg 注释）：档内 → 轮切下一档；离档 → 回默认 60s。
+ */
+export const bgThNext = (ms: number): number => {
+  const i = BG_TH_STEPS.indexOf(ms)
+  if (i >= 0) return BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] ?? DEFAULT_BG.promoteMs
+  return DEFAULT_BG.promoteMs
+}
+
 export const normalizeBg = (j: any): BgCfg => ({
   enabled: typeof j?.enabled === "boolean" ? j.enabled : DEFAULT_BG.enabled,
   cooldownMs:
@@ -77,7 +92,7 @@ export const readBg = (path: string = BG_PATH): BgCfg => {
 }
 
 export const writeBg = (cfg: BgCfg, extra?: Record<string, unknown>, path: string = BG_PATH): void => {
-  const tmp = `${path}.tmp`
+  const tmp = `${path}.tmp-${process.pid}`
   writeFileSync(tmp, JSON.stringify({ ...cfg, ...(extra ?? {}), ts: Date.now() }), {
     encoding: "utf8",
     mode: PRIVATE_FILE_MODE,
@@ -186,10 +201,8 @@ export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
   if (head === "th" || head === "threshold" || head === "time" || head === "阈值") {
     // 插件层 shell>N 秒转后台阈值。裸 `th` = 轮切到下一档；`th <秒>` = 直接设（范围钳制）。
     if (val === "") {
-      const i = BG_TH_STEPS.indexOf(cur.promoteMs)
-      // 在档位表内 → 轮切下一档；不在（命令直设的任意秒数）→ 回到默认 60s 档。
-      if (i >= 0) return { kind: "setth", ms: BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] }
-      return { kind: "setth", ms: DEFAULT_BG.promoteMs }
+      // R2380：轮切逻辑收敛到 bgThNext（单一真源，与菜单按钮文案同源，离档一律回默认 60s）。
+      return { kind: "setth", ms: bgThNext(cur.promoteMs) }
     }
     const n = Number(val)
     if (Number.isFinite(n) && n >= BG_TH_MIN / 1000 && n <= BG_TH_MAX / 1000) {

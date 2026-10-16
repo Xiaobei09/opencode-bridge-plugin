@@ -48,10 +48,25 @@ export const readGuard = (path: string = GUARD_PATH): GuardCfg => {
  * 写守卫配置。tmp + rename 原子写：auto-continue 与 tg-bridge 是两个进程/两个热重载实例，
  * 各自都在写同一个文件；非原子写中途被读会得到半截 JSON → 守卫瞬间退化成默认（或读失败）。
  * lastTrip 一并落盘，菜单里的「详情」才有东西可显示。
+ *
+ * R711：切换开关**不得抹掉 lastTrip**（R690 决策：它是跨重启判重锚点，R1902 事故的防线）。
+ * readGuard→normalizeGuard 归一化只输出两个布尔，调用方（/autoguard 切换）回写时不带
+ * extra 就会把 lastTrip 删掉——「开/关一次守卫」= 清判重锚点，重启或重判可再把循环拉闸。
+ * 兜底策略：未显式传 lastTrip 时从原文件**原样携带**；显式传 null/其他值仍以调用方为准
+ * （可覆盖、可清除），保证语义不丢。
  */
 export const writeGuard = (cfg: GuardCfg, extra?: { lastTrip?: unknown }, path: string = GUARD_PATH): void => {
-  const payload = JSON.stringify({ ...cfg, ...(extra ?? {}), ts: Date.now() })
-  const tmp = `${path}.tmp`
+  let carry: { lastTrip?: unknown } | undefined
+  if (extra?.lastTrip === undefined) {
+    try {
+      const prev = JSON.parse(readFileSync(path, "utf8"))
+      if (prev && typeof prev === "object" && prev.lastTrip) carry = { lastTrip: prev.lastTrip }
+    } catch {
+      /* 原文件缺失/半截：没有可携带的锚点，按无锚点写 */
+    }
+  }
+  const payload = JSON.stringify({ ...cfg, ...(carry ?? {}), ...(extra ?? {}), ts: Date.now() })
+  const tmp = `${path}.tmp-${process.pid}`
   writeFileSync(tmp, payload, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
   renameSync(tmp, path)
 }
@@ -119,7 +134,12 @@ export const alreadyTripped = (
  * 循环立刻变成死循环。既有 [LOOP:PAUSE] 的注释已经记过同类坑（原文出现即触发），
  * 这里从判据上根除：只认独占行 + 允许 markdown 标题/粗体包裹。
  */
-const FENCE_RE = /```[\s\S]*?```/g
+// R2391：必须同时吃下**未闭合**的围栏（`(?:```|$)`）——旧式 `/```[\s\S]*?```/g` 只处理成对围栏，
+// 于是**被截断的输出**（围栏只有开头没有结尾，markdown 语义上"其后全部是代码"）里的
+// `[STATUS: STOP]`/`[SIGNAL: PROBLEM]`/`[LOOP: PAUSE]` 行**不会被挖空** → 守卫/暂停被**误触发**。
+// `[LOOP: PAUSE]` 尤其危险：它**不受守卫开关管辖**（始终生效），一次截断就能凭空暂停循环。
+// 与同代码库 `mdBoldToHtml`（tg-bridge L2463）采用同一 `(```|$)` 约定，避免两处正则漂移。
+const FENCE_RE = /```[\s\S]*?(?:```|$)/g
 const SPAN_RE = /`[^`\n]*`/g
 /** 围栏代码块整体挖空成等量空行：保留行结构（`^$` 锚点仍成立），只去掉内容。 */
 const stripFenced = (t: string): string => String(t ?? "").replace(FENCE_RE, (m) => m.replace(/[^\n]/g, " "))

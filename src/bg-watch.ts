@@ -96,7 +96,14 @@ export function makeBgWatch(deps: BgWatchDeps) {
       if (ev.tool !== "shell") return
       const key = keyOf(ev)
       const old = entries.get(key)
-      if (old) clearTimer(old.timer)
+      if (old) {
+        // R2609：宿主向**所有**监听器广播同一事件（每代转发器各收到一次），每个转发器
+        // 都调到这里 → 同一执行事件被重复投递 N 次。1s 窗口内的重复投递视为同一事件：
+        // 不重置计时器（首个投递已正确起表）、不重复记日志（否则日志被 N 倍噪声淹没，
+        // 干扰 loop 诊断 grep）。>1s 的再次投递（如宿主重试同一步）仍按新事件重起表。
+        if (!old.fired && now() - old.startedAt < 1000) return
+        clearTimer(old.timer)
+      }
       const ms = th()
       const entry: WatchEntry = { timer: null as unknown, startedAt: now(), thresholdMs: ms, fired: false }
       entry.timer = setTimer(() => fire(key, String(ev.sessionID ?? "")), ms)
@@ -125,3 +132,4 @@ export function makeBgWatch(deps: BgWatchDeps) {
     },
   }
 }
+

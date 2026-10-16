@@ -84,8 +84,14 @@ export const turnEndLine = (c: TurnEndCtx): string => {
   return parts.join(" · ")
 }
 
-/** 会话别名再收紧：去掉换行/控制字符，长度 ≤ 20（Telegram 短消息不显示超长名） */
+/** 会话别名再收紧：去掉换行/控制字符，长度 ≤ 20（Telegram 短消息不显示超长名）。
+ *  R2424：turnEndLine 的产物由 tg-bridge 以 `parse_mode=HTML` 发送（sendTextRaw），
+ *  而会话别名来自宿主会话标题（可含 `&`/`<`/`>`）。旧实现不转义 → 标题含 `&`（如
+ *  "A & B"，很常见）或 `<...>` 时整条 note 变成非法 HTML → Telegram 400 → 降级重发
+ *  （每次回合结束多一次 400 与一次 API 调用）。故**先按可见长度截断、再转义**：
+ *  实体不切断，普通标题显示不变，异常标题按字面显示。 */
 const cleanName = (s: string): string => {
   const t = s.replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim()
-  return t.length > 20 ? `${t.slice(0, 20)}…` : t
+  const cut = t.length > 20 ? `${t.slice(0, 20)}…` : t
+  return cut.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }

@@ -60,9 +60,13 @@ const truncateTo = (s: string, max: number): string => {
   if (cellWidth(src) <= max) return src
   let cut = ""
   let w = 0
+  // R2392：预算必须取 `max(0, max-1)`，**不能**是 `max(1, max-1)` —— 后者在 max===1 时
+  // 仍允许放 1 个字符，再加 `…` 就是**宽 2**，而列宽只有 1 → 该行比边框宽 1 cell、**整表错位**。
+  // 触发场景：列被收窄到硬下限 1（列多 + maxTotal 小）。max≥2 时两式等价，行为不变。
+  const budget = Math.max(0, max - 1)
   for (const ch of src) {
     const cw = cellWidth(ch)
-    if (w + cw > Math.max(1, max - 1)) break
+    if (w + cw > budget) break
     cut += ch
     w += cw
   }
@@ -88,7 +92,12 @@ export const renderTgTable = (headers: string[], rows: string[][], opts: TableOp
   // 宽度贡献：wrap 模式下长内容也最多贡献 maxCell（过宽会让表格撑爆，交给换行消化）。
   const widthContribution = (s: string): number => (wrap ? Math.min(cellWidth(s), Math.max(1, maxCell)) : cellWidth(s))
   const header = (headers ?? []).slice(0, colCount)
-  const cols: string[] = header.map((h) => norm(h))
+  // R2392：表头**必须补齐到 colCount**。colCount 由"最宽的（数据）行"决定，
+  // 而数据行在下方已用 `new Array(colCount)` 补齐；表头此前却是 `header.map(...)`
+  // → 当某数据行比表头多列时（markdown 单元格里有未转义的 `|` 就会出现），
+  // 表头行只渲染 header.length 个格子，而 sep/数据行渲染 colCount 个 → **整表错位**
+  // （实测 `renderTgTable(["A"],[["1","2"]])` 表头行宽 5、其余 9）。
+  const cols: string[] = new Array(colCount).fill(undefined).map((_, i) => norm(header[i]))
   const rawLines: string[][] = [
     ...(header.length > 0 ? [cols] : []),
     ...(rows ?? []).map((r) => new Array(colCount).fill(undefined).map((_, i) => norm(r[i]))),
@@ -212,6 +221,17 @@ export const renderTgTable = (headers: string[], rows: string[][], opts: TableOp
         // 单 token 超宽（超长 URL/长串）：逐字符硬切，至少保证列宽不被突破。
         for (const ch of tok) {
           const wch = cellWidth(ch)
+          if (wch > limit) {
+            // R2392：单字符本身宽于列宽（列被压到 1，而字符是全角/假名/汉字，宽 2）——放不下。
+            // 旧实现强行塞入 → 该行比边框宽 1 cell → **整表错位**。改为补 `…` 占位。
+            // 同一 token 内字符**同类同宽**（tokenize 按 kind 聚合：全宽字只会聚进 cjk token），
+            // 所以这里 `break` —— 一个 `…` 已代表整段放不下的内容。
+            if (cw > 0) pushLine()
+            chunks.push("…")
+            cur = ""
+            cw = 0
+            break
+          }
           if (cw > 0 && cw + wch > limit) pushLine()
           cur += ch
           cw += wch

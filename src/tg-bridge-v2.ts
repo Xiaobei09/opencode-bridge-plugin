@@ -75,13 +75,24 @@ const snapshotV2lib = (tag: string): string => {
   try {
     // 只确保根目录存在，**绝不能 rm 整个根**：两个插件可能同一拍重载，会互删快照。
     mkdirSync(LIVE_ROOT, { recursive: true })
+    let clean = false
     for (let attempt = 0; attempt < 2; attempt++) {
       const probe = `${V2LIB_DIR}/tg-bridge.ts`
       const before = statSync(probe).mtimeMs
       cpSync(V2LIB_DIR, dir, { recursive: true })
       // 撕裂快照检查：复制期间源文件被改 → 这份快照半新半旧，删掉重来
-      if (before === statSync(probe).mtimeMs) break
+      if (before === statSync(probe).mtimeMs) {
+        clean = true
+        break
+      }
       rmSync(dir, { recursive: true, force: true })
+    }
+    // R2433：连续两次都撕裂时，上一轮已把 dir 删掉 —— 旧代码直接 `return dir` 会返回一个
+    // **不存在的路径**（L229 的 `await import(live/...)` 不在 try/catch 内 → setup 抛错 →
+    // 三个 Bot 全部起不来）。与"复制失败"同策略：退回真实目录。
+    if (!clean) {
+      diag(`[tg-bridge] snapshot torn twice, fallback to live tree`)
+      return V2LIB_DIR
     }
     gcLive(tag, name)
     return dir
@@ -234,8 +245,8 @@ export default {
     // → 重启前的日志既没归档也不轮转，直接消失（实际损失 04:00–08:07 全部诊断证据）。
     //
     // 为什么放**入口装载器**而不是 _v2compat 顶层：顶层会被 tests/*.test.ts 的 import 触发
-    // （menu-root / proto-silent-baseline / tap-isolation 等测试文件会 import tg-bridge），
-    // 那就会在**跑测试时轮转生产日志**。入口是生产专用路径，且每次 setup 只执行一次。
+    // （log-rotate / scope-guard 等 10 个测试文件都 import tg-bridge），那就会在**跑测试时
+    // 轮转生产日志**。入口是生产专用路径，且每次 setup 只执行一次。
     try {
       const r = compat?.archiveOnStartup?.({ path: compat.TAP_PATH, archiveDir: compat.LOG_ARCHIVE_DIR })
       if (r?.rotated) diag(`[tg-bridge-v2] 启动前日志已归档 ${r.archive} (归档 ${r.archivedBytes}B / 留尾 ${r.keptBytes}B)`)
@@ -927,3 +938,66 @@ export default {
 // reload(content) 20261004T075520Z [tg-bridge-v2.ts]
 
 // reload(content) 20261005T001133Z [tg-bridge-v2.ts]
+// R1912 桥重载诊断 09:56:20Z
+// R1912 deploy 10:31:57Z
+
+// reload(content) 1791704862 R2235 failed-compaction-unhold
+
+// reload(content) 1791773270 R2369 model-display+error-reason
+
+// reload(content) 1791773444 R2369 compaction-owner-gate
+
+// reload(content) 1791775100 R2372 healcards-checked-counter
+
+// reload(R2376 stuck-turn escape) 1791778321
+
+// reload(R2377 table double-escape+pre-strip) 1791778761
+
+// reload(R2380 bgThNext unify) 1791779800
+
+// reload(R2384 outbound queue-full drop-oldest priority fix) 1791783890
+
+// reload(R2386 flood jitter pass rand) 1791784272
+
+// reload(R2389 revivePairedEntities global-nesting pairing) 1791784858
+
+// reload(R2391 guard FENCE_RE unterminated-fence) 1791785285
+
+// reload(R2392 tabular align header+ellipsis+widechar) 1791785582
+
+// reload(R2423 injectCardText reason slice-before-escape) 1791803143
+
+// reload(R2424 turnEndLine cleanName html-escape) 1791803553
+
+// reload(R2426 INTERNAL_LOG_LINE_RE tap-label suffix) 1791804194
+
+// reload(R2433 snapshotV2lib double-tear returns V2LIB_DIR) 1791805924
+
+// reload(R2439 sendTextRaw non-chunked 400-fallback keeps silent/replyTo) 1791810810
+
+// reload(R2451 session.step.failed map + catchup error passthrough) 1791814099
+
+// reload(R2492 healcards fixed counter) 1791855649
+
+// reload(R2496 network-error auto node switch) 1791886043
+
+// reload(R2497 /loop start clears agent global pause) 1791886868
+
+// reload(R2498 proxy + config TG integration menu buttons) 1791887817
+
+// reload(R2499 command-mode guard for /proxy switch/list) 1791888106
+
+// reload(R2501 auto-switch trigger in tg-bridge failure card + cross-instance cooldown) 1791888818
+
+// reload(R2502 abort-events atomic write) 1791888998
+
+// reload(proxy-probe-a+b) 1791901792
+
+// reload(content) R713 undo-copy-fix 1792066417
+// reload(content) 1792068485 loop-R718-ctx-backfill-walk-dir
+// reload(content) 1792073215 R719 ctx-lifetime-skip+compaction-notice-toggle
+// reload(content) 1792074519 R719b proxy-lock+ctx-fixes
+// reload(content) 1792075471 R720 lock-quality-watch
+// reload(content) 1792075941 R720 toctou-cooldown-recheck
+// reload(content) 1792076685 R721 lock-watch gen-guard
+// reload(content) 1792079432 R722 lock-effective-confirm

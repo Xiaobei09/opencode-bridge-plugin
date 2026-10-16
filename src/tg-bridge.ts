@@ -5,7 +5,7 @@ import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailabl
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
 // 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
-import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, DEFAULT_BG, BG_TH_STEPS } from "./bg-mode"
+import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, bgThNext } from "./bg-mode"
 // TG 等宽表格绘制（纯函数 + 单测）：状态/诊断类消息用表格对齐（代码块强制等宽）。
 import { renderTgTable, renderKvList } from "./tabular"
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
@@ -13,6 +13,9 @@ import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from 
 // R1565：「AI 主动结束输出」短提示文案（纯函数 + 单测），见 turn-end-note.ts 头注。
 import { turnEndLine, extractRound, noteSkipped, SYNTHETIC_LOOP_MARKERS, noteOwnerOnlySkipped } from "./turn-end-note"
 import { appendShellBgHint, hasShellBgHint, isFreshRunningCard, HINT_FRESH_MS_DEFAULT } from "./bg-hint"
+// R2498：可选功能「网络错误自动切节点」的 TG 集成（/proxy）。配置在 proxy-switch.json，
+// 默认关闭不影响行为；本模块读取/切换/开关/通知都走这里，避免与 auto-continue 侧判据漂移。
+import { readProxySwitchCfg, readStatus as readProxyStatus, readLastSwitch, switchProxyNode, switchToNode, setEnabled as setProxyEnabled, setNodeLock, registerProxyNotifier, maybeSwitchProxyNode, watchLockedQuality } from "./proxy-switch"
 
 // ── R1399：插件 client 白名单无 background 端点时的直连宿主 HttpApi 兜底 ────────
 // 背景：R1398 实证 v2.0.10 的插件 client 只含白名单子集（session 键无 background/），
@@ -74,6 +77,23 @@ export const windowFor = (modelID: string, providerID: string): number =>
 // 的真实窗口是 **200000** → 显示值错 5 倍，连带自动压缩阈值也算松 5 倍。
 export const windowKnown = (modelID: string, providerID: string): boolean =>
   modelWindows.has(`${providerID}/${modelID}`)
+
+// R2607（用户指令：纠正会话长度计算与自动压缩）：窗口表共享给 auto-continue
+// （同进程不同模块实例 + 独立服务场景，不能直接 import）：globalThis + 文件双通道。
+// auto-continue 的压缩阈值/口径守卫需要每模型**真实窗口**（此前硬编码 1M，200k 模型算松 5 倍）。
+const MODEL_WINDOWS_PATH = "REDACTED_ROOT/.config/opencode/model-windows.json"
+const publishModelWindows = (): void => {
+  try {
+    if (!modelWindows.size) return
+    const windows: Record<string, number> = {}
+    for (const [k, v] of modelWindows) windows[k] = v
+    const payload = { ts: Date.now(), windows }
+    ;(globalThis as Record<string, unknown>).__oc_model_windows__ = payload
+    atomicWrite(MODEL_WINDOWS_PATH, JSON.stringify(payload), 0o600)
+  } catch {
+    /* best-effort：共享失败不阻断主链路 */
+  }
+}
 // R1881：宿主 `GET /api/model` 响应 → 「模型键 → 真实窗口」。**纯函数**（提到模块作用域），
 // 这样"默认模型到底是 200k 还是 1M"能用行为测试钉死，而不是只能靠源码断言。
 // 实测真实形状：{ data: [ { providerID, id, limit: { context, output } } ] }（67 个模型）。
@@ -237,7 +257,23 @@ const fmtK = (n: number): string => {
 // 被判定为"累计口径"而丢弃的次数（诊断用）：宿主偶尔把 tokens.input 报成**会话累计**
 // （实测 f339 出现 in=16.8m 而 out/rea/cr/cw 全 0），拿它除窗口必然显示 100%。
 let ctxLifetimeRejected = 0
-const noteUsage = (sid: string, info: any): void => {
+/**
+ * R719：这个 tokens 形状是「会话生命周期累计」而不是「本次请求窗口用量」吗？
+ *
+ * 活证据（2026-10-15 12:33–13:18，tg-bridge-restore.log）：活跃回合里，尚无真实步
+ * tokens 的消息会被上层填充成 `{input: 会话累计(49.9m/13.3m), output/reasoning/cache 全 0}`。
+ * 它同时是回填扫描的头号毒药：选中 → noteUsage 拒绝 → return，显示值与采样时刻永远停在
+ * 上一份**真实样本**上（用户两次报「（N 分钟前）」的机制性根因）。判据与 noteUsage 的
+ * 拒绝闸同源，避免两处漂移。
+ */
+const looksLikeLifetimeUsage = (input: number, others: number, win: number): boolean =>
+  input > 0 && (input > win || (input > 4 * 1024 * 1024 && others === 0))
+/**
+ * 记录一次 ctx 用量样本。**返回是否真的写入了 ctxUsage**——调用方（回填扫描）必须依赖
+ * 这个返回值：旧实现不看返回值，把「被拒绝的样本」也当成功打印（打印的是旧值），
+ * 日志看起来在刷新、实际显示值纹丝不动，正是本 bug 至今才被识破的原因。
+ */
+const noteUsage = (sid: string, info: any): boolean => {
   try {
     const t = info?.tokens
     const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0)
@@ -248,7 +284,7 @@ const noteUsage = (sid: string, info: any): void => {
     // cache 而把 input 报 0。旧实现在这里整个早退 → ctxUsage 不更新 → 卡片上的 ctx 会
     // **长期停在旧值**（只靠"（N 分钟前）"标注兜底）。实测采样间隔 3-12 分钟、远大于 5 分钟
     // 节流，正是这个原因：多数轮次只带 cache 不带 input。
-    if (inp <= 0 && cacheR + cacheW <= 0) return
+    if (inp <= 0 && cacheR + cacheW <= 0) return false
     // 口径守卫：一次调用的 prompt 不可能超过模型窗口。超过 = 一定是累计值，丢弃。
     // 附加特征：output/reasoning/cache 全 0 而 input 巨大 —— 真实调用不会没有输出。
     {
@@ -256,14 +292,14 @@ const noteUsage = (sid: string, info: any): void => {
       const providerID = String(info?.model?.providerID ?? "")
       const win = windowFor(modelID, providerID)
       const others = num(t?.output) + num(t?.reasoning) + num(t?.cache?.read) + num(t?.cache?.write)
-      if (inp > win || (inp > 4 * 1024 * 1024 && others === 0)) {
+      if (looksLikeLifetimeUsage(inp, others, win)) {
         ctxLifetimeRejected++
         if (ctxLifetimeRejected <= 5 || ctxLifetimeRejected % 50 === 0) {
           diag(
             `ctx usage rejected (looks like session-lifetime counter, not context size): sid=${sanitizeLog(sid).slice(0, 12)} in=${fmtK(inp)} win=${fmtK(win)} others=${fmtK(others)} (rejected x${ctxLifetimeRejected})`,
           )
         }
-        return
+        return false
       }
     }
     // 无缓存计数时，这个数字是**下界**：TUI 会把命中的缓存前缀算进窗口，事件里若没有
@@ -294,8 +330,9 @@ const noteUsage = (sid: string, info: any): void => {
       const fk = ctxUsage.keys().next()
       if (!fk.done) ctxUsage.delete(fk.value)
     }
+    return true
   } catch {
-    /* ignore */
+    return false
   }
 }
 let ctxBackfillRequest: ((sid: string) => void) | null = null
@@ -1067,7 +1104,8 @@ const setFilt = (k: "reply" | "think" | "tool" | "status", v: number): void => {
   savePersistedState()
 }
 // 压缩设置（/quiet 菜单可调，auto-continue 侧实时读取）：auto=false 停掉一切自动压缩尝试；threshold 为 ctx 水位门控
-const compactPrefs: { auto: boolean; threshold: number } = { auto: true, threshold: 0.7 }
+// R719：notice = 「🗜 上下文已压缩」通知卡片是否发送（用户点名要的选项；默认开=保持原行为）。
+const compactPrefs: { auto: boolean; threshold: number; notice: boolean } = { auto: true, threshold: 0.7, notice: true }
 const COMPACT_TH_STEPS = [0.6, 0.7, 0.8, 0.9] as const
 const errorRing: Array<{ ts: number; msg: string }> = []
 const dropRing: Array<{ ts: number; kind: string; detail: string }> = []
@@ -1952,6 +1990,8 @@ const loadPersistedState = (): void => {
     const cp = j?.compact
     if (cp && typeof cp === "object") {
       if ((cp as any).auto === false) compactPrefs.auto = false
+      // R719：压缩通知开关（false 才覆盖默认 true；缺省字段=旧状态文件 → 保持开）
+      if ((cp as any).notice === false) compactPrefs.notice = false
       const th = Number((cp as any).threshold)
       if (th >= 0.5 && th <= 0.95) compactPrefs.threshold = th
     }
@@ -2382,7 +2422,7 @@ export const injectCardText = (o: {
   const gap = o.avgGapMs > 0 ? `${Math.floor(o.avgGapMs / 60000)}分${pad(Math.round((o.avgGapMs % 60000) / 1000))}秒` : "—"
   const g = o.gate
   const gateLine = g.stopped
-    ? `⏸ 循环已停${g.by ? `（by:${htmlEsc(g.by)}）` : ""}${g.reason ? ` · ${htmlEsc(g.reason).slice(0, 48)}` : ""}`
+    ? `⏸ 循环已停${g.by ? `（by:${htmlEsc(g.by)}）` : ""}${g.reason ? ` · ${htmlEsc(g.reason.slice(0, 48))}` : ""}`
     : "▶ 循环运行中"
   return [
     `🔁 循环注入状态卡 · ${htmlEsc(o.bot)}`,
@@ -2412,36 +2452,43 @@ export const injectCardText = (o: {
 export const revivePairedEntities = (s: string, tags: readonly string[]): string => {
   let out = String(s ?? "")
   if (!out.includes("&lt;")) return out
-  for (const tag of tags) {
-    // 转义态的标签形如 &lt;b&gt; / &lt;/b&gt; / &lt;pre class="language-x"&gt;
-    const re = new RegExp(`&lt;/?${tag}(?:&gt;|\\s[^&]*?&gt;)`, "g")
-    const toks: Array<{ start: number; end: number; close: boolean }> = []
-    let m: RegExpExecArray | null
-    while ((m = re.exec(out)) !== null) toks.push({ start: m.index, end: m.index + m[0].length, close: m[0].startsWith("&lt;/") })
-    if (toks.length === 0) continue
-    const stack: number[] = []
-    const paired: boolean[] = new Array(toks.length).fill(false)
-    for (let i = 0; i < toks.length; i++) {
-      if (!toks[i].close) stack.push(i)
-      else if (stack.length > 0) {
-        const open = stack.pop() as number
-        paired[open] = true
-        paired[i] = true
-      }
+  // R2389：**必须把全部标签放在同一个栈里配对**。
+  // 旧实现是「每个 tag 各自跑一遍栈」，于是每个标签都"有开有关"但**整体交叉**的转义集合
+  // 会被全部复活成非法 HTML：`&lt;b&gt;&lt;pre&gt;&lt;/b&gt;&lt;/pre&gt;`（字面 `&lt;b&gt;&lt;pre&gt;&lt;/b&gt;&lt;/pre&gt;`）
+  // → 复活成 `<b><pre></b></pre>`（交叉）→ `validateHtmlText` 报「标签错位: </b> 对应的是 <pre>」
+  // → 走剥标签纯文本降级（格式丢失、消息可能重复）—— 与本函数"只复活**配对正确**的标签"
+  // 的契约直接矛盾（模糊测试 3000 例可稳定命中）。改单遍栈式配对，且**名称不匹配的闭标签
+  // 不消费栈**（该开标签仍可能被稍后正确闭合）→ 只有全局正确嵌套的才还原。
+  const names = [...tags].sort((a, b) => b.length - a.length) // 长名优先，避免 b 抢 blockquote
+  if (names.length === 0) return out
+  // 转义态的标签形如 &lt;b&gt; / &lt;/b&gt; / &lt;pre class="language-x"&gt;
+  const re = new RegExp(`&lt;(/?)(${names.join("|")})(?:&gt;|\\s[^&]*?&gt;)`, "g")
+  const toks: Array<{ start: number; end: number; close: boolean; name: string }> = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(out)) !== null) toks.push({ start: m.index, end: m.index + m[0].length, close: m[1] === "/", name: m[2] ?? "" })
+  if (toks.length === 0) return out
+  const stack: number[] = []
+  const paired: boolean[] = new Array(toks.length).fill(false)
+  for (let i = 0; i < toks.length; i++) {
+    if (!toks[i].close) stack.push(i)
+    else if (stack.length > 0 && toks[stack[stack.length - 1]].name === toks[i].name) {
+      const open = stack.pop() as number
+      paired[open] = true
+      paired[i] = true
     }
-    if (!paired.some(Boolean)) continue // 全是落单标签 → 一律保持转义
-    let res = ""
-    let last = 0
-    for (let i = 0; i < toks.length; i++) {
-      const t = toks[i]
-      res += out.slice(last, t.start)
-      const raw = out.slice(t.start, t.end)
-      res += paired[i] ? raw.replace(/&lt;/g, "<").replace(/&gt;/g, ">") : raw
-      last = t.end
-    }
-    out = res + out.slice(last)
+    // 名称不匹配的闭标签：不消费栈，保持转义
   }
-  return out
+  if (!paired.some(Boolean)) return out // 全是落单标签 → 一律保持转义
+  let res = ""
+  let last = 0
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]
+    res += out.slice(last, t.start)
+    const raw = out.slice(t.start, t.end)
+    res += paired[i] ? raw.replace(/&lt;/g, "<").replace(/&gt;/g, ">") : raw
+    last = t.end
+  }
+  return res + out.slice(last)
 }
 
 export const renderProtoBlock = (title: string, body: string): string => {
@@ -2499,7 +2546,10 @@ export const mdTableToHtml = (s: string): string => {
       // R1838：只去 mdBoldToHtml 产生的 `<b>`/`</b>`（原用 `/<[^>]*>/g` 会把单元格里任何
       // `<...>` 内容（如 `p <b>q` 之外的 `<div>`、比较式 `x < y > z`）**整段吞掉**）。
       // 其余尖括号内容保留，交给外层 htmlEsc 安全转义后原样显示。
-      .map((c) => c.replace(/<\/?b\s*>/g, "").replace(/\*\*/g, "").trim())
+      // R2377：额外剥 `<pre>`/`</pre>`——单元格里若残留裸 `<pre>`，会与表格外层的真 `<pre>`
+      // 在 revivePairedEntities 里**错配**（抢占外层闭合）→ 外层开头被转义成字面 `&lt;pre&gt;`。
+      // 与剥 `<b>` 同理：这是我们的包装标签，不该出现在单元格文本里。
+      .map((c) => c.replace(/<\/?b\s*>/g, "").replace(/<\/?pre\s*>/g, "").replace(/\*\*/g, "").trim())
   // 把 run（连续管道行）解析成「表头+分隔行+数据行」的表序列；无法配对成表的行归入 rest。
   const parseRunTables = (run: string[]): { tables: Array<{ h: string[]; rows: string[][] }>; rest: string[] } => {
     const tables: Array<{ h: string[]; rows: string[][] }> = []
@@ -2543,11 +2593,14 @@ export const mdTableToHtml = (s: string): string => {
       if (tables.length > 0 || rest.length > 0) {
         for (const tb of tables) {
           const body = renderTgTable(tb.h, tb.rows, { wrap: true, fence: false })
-          // R1838：表格正文是**派生纯文本**（renderTgTable 只画框线+单元格文字），必须 htmlEsc
-          // 后才能塞进 <pre>。此前直发：单元格里的 `a < b` 会留下裸 `<`、`x & y` 留下裸 `&`，
-          // 在 HTML parse_mode 下要么被 TG 判非法整条降级为纯文本（表格破相），要么把后续
-          // 文本当标签吞掉。与 renderProtoBlock（L2035 已 htmlEsc）保持一致。
-          out.push(`<pre>${htmlEsc(body)}</pre>`)
+          // R2377：**不再**在此对表格正文做 htmlEsc（那是 R1838 的旧改动，已被证明会双重转义）。
+          // 本函数的两处调用方（L5280 正链 / L9652 补发链）都会把返回值再喂给 `renderProtoBlock`，
+          // 后者对每行 htmlEsc 一次**并** revivePairedEntities 复活配对的 `<pre>`/`<b>`。
+          // 若这里先转义一次，单元格里的 `&`/`<`/`>` 会被**二次转义**——实测表格 `a & b`
+          // 显示成字面 `a &amp; b`（revivePairedEntities 只复活外层 `<pre>` 包装，还原不了内层
+          // 双重转义）。故这里只发真实 `<pre>` 标签 + **原始**单元格文本，转义统一交给
+          // renderProtoBlock 的"转义一次 + 配对复活"（与 mdBoldToHtml 产出的真实 `<b>` 同一条路）。
+          out.push(`<pre>${body}</pre>`)
         }
         if (rest.length > 0) out.push(...rest)
       } else out.push(`<pre>${run.join("\n")}</pre>`)
@@ -2566,7 +2619,12 @@ export const mdTableToHtml = (s: string): string => {
   return out.join("\n")
 }
 
-const INTERNAL_LOG_LINE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\S*\s+\[(tg-bridge|auto-continue)\]|auto-continue: eval|getUpdates failed|proto (send|edit) (ok|failed|drop)|answerCallback|cb (recv|refresh|full)|^\[(tg-bridge|auto-continue)\]/
+// R2426：trap-log 的**服务标签**是 `[tg-bridge/<bot>]` / `[tg-bridge/primary]`（斜杠，
+// 见 /tmp/opencode/v2plugin.log），而非裸 `[tg-bridge]`。旧正则的两条**行首锚定**分支
+// 写死 `\[(tg-bridge|auto-continue)\]`，对真实格式**永不命中** → 用户 `tail` 桥日志时
+// 约 56% 的内部行（demote/ctx/watch 等无内容子串可命中的）原样泄漏进 TG 预览。
+// 放宽为「标签名后可跟 `/标签` 或 `:标签`」（不匹配 `tg-bridge-v2`，其首字符为 `-`）。
+const INTERNAL_LOG_LINE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\S*\s+\[(tg-bridge|auto-continue)(?:[/:][^\]]*)?\]|auto-continue: eval|getUpdates failed|proto (send|edit) (ok|failed|drop)|answerCallback|cb (recv|refresh|full)|^\[(tg-bridge|auto-continue)(?:[/:][^\]]*)?\]/
 export const stripInternalLogs = (text: string): { text: string; stripped: number } => {
   const lines = String(text ?? "").split("\n")
   const keep = lines.filter((l) => !INTERNAL_LOG_LINE_RE.test(l))
@@ -3148,6 +3206,8 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   help: "/help",
   selfmute: "/selfmute",
   healcards: "/healcards",
+  // R719：压缩通知发送开关（默认开）。放在推送页与 /quiet 菜单双入口。
+  cnotice: "/cnotice",
   // 自动停止守卫：两个开关分列（一个只管问题、一个只管搜索），详情单独一条。
   guardprob: "/autoguard problem toggle",
   guardweb: "/autoguard web toggle",
@@ -3160,13 +3220,22 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   bgstatus: "/background status",
   // R2231 模型选择：菜单按钮等价 /model（选择器独立消息，mdl: 回调驱动）。
   model: "/model",
+  // R2498 代理切节点：面板 + 切下一节点 / 开-关自动切 / 列候选 / 配置清单。
+  proxy: "/proxy",
+  proxynext: "/proxy next",
+  proxylock: "/proxy lock",
+  proxyunlock: "/proxy unlock",
+  proxyon: "/proxy on",
+  proxyoff: "/proxy off",
+  proxylist: "/proxy list",
+  config: "/config",
   loud: "/loud",
   quiet: "/quiet",
 }
 
 export const buildMenuKeyboard = (
   view: string,
-  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number } = {},
+  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number; proxyEnabled?: boolean; cnotice?: boolean } = {},
 ): unknown[][] => {
   const paused = Boolean(opts.paused)
   const stopped = Boolean(opts.stopped)
@@ -3181,11 +3250,14 @@ export const buildMenuKeyboard = (
   const bgShellAuto = Boolean(opts.bgShellAuto)
   // 插件层 shell>N 秒转后台阈值（R1505 起可调；缺省 60s）。
   const bgMs = Number.isFinite(Number(opts.bgPromoteMs)) ? Number(opts.bgPromoteMs) : 60_000
+  // R2498 自动切节点开关（运行期状态，由调用方现读传入；缺省按关显示）。
+  const pOn = Boolean(opts.proxyEnabled)
+  // R719：压缩通知开关（缺省按开显示——默认行为就是发）。
+  const cnoticeOn = opts.cnotice !== false
   // 菜单阈值按钮：轮切到下一档，按钮文案带目标档，回调把目标秒数带给命令。
-  const bgThNext = (ms: number): number => {
-    const i = BG_TH_STEPS.indexOf(ms)
-    return BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] ?? BG_TH_STEPS[0] ?? 60_000
-  }
+  // R2380：定义收敛到 bg-mode.bgThNext（单一真源）——此前本地一份、parseBgArg 一份，
+  // 离档分支不一致（本地 30s vs 命令 60s）→ 按钮文案与按下结果不符。现与命令同源。
+
   // 注意：inline_keyboard 的一"行"必须是**扁平的按钮数组**。
   // 之前写成 [[btn],[btn]]（行里再套数组）→ Telegram 直接 400，菜单发不出去。
   const b = (label: string, data: string): unknown => ({ text: label, callback_data: data })
@@ -3199,9 +3271,11 @@ export const buildMenuKeyboard = (
     return rows
   }
   if (view === "push") {
+    // R719 整合：压缩通知开关并入本页（与「暂停推送」同排，不新增孤行）；
+    // 「压缩是否发送」= 这个开关 + /quiet 菜单里的同款按钮（flt:compact:notice）。
     return [
       [b("🔊 全部推送", "ma:loud"), b("🔇 推送设置", "ma:quiet")],
-      [b(paused ? "▶️ 恢复推送" : "⏸ 暂停推送", paused ? "ma:resume" : "ma:pause")],
+      [b(paused ? "▶️ 恢复推送" : "⏸ 暂停推送", paused ? "ma:resume" : "ma:pause"), b(cnoticeOn ? "🗜 压缩通知：发" : "🗜 压缩通知：不发", "ma:cnotice")],
       [b("注入:立即", "ma:inject_now"), b("注入:回合后", "ma:inject_idle")],
       [b("附加镜像列表", "ma:watch"), b("清空镜像", "ma:unwatch")],
       [b("⬅️ 返回", "m:root")],
@@ -3230,6 +3304,17 @@ export const buildMenuKeyboard = (
       [b("⬅️ 返回", "m:root")],
     ]
   }
+  // R2498 代理/切节点页：状态/动作为主（查看状态、切下一节点、开关自动切、列候选）。
+  // R719b：新增「🔐 锁定当前节点 / 🔓 解锁回自动」（mihomo 内置锁定；PUT=锁、DELETE=解锁）。
+  if (view === "proxy") {
+    return [
+      [b("🔄 刷新状态", "ma:proxy"), b("📋 候选节点", "ma:proxylist")],
+      [b("⏭ 切下一节点", "ma:proxynext"), b("🔐 锁定当前节点", "ma:proxylock")],
+      [b("🔓 解锁回自动", "ma:proxyunlock"), b(pOn ? "🔄 自动切节点：开（点此关）" : "⭕ 自动切节点：关（点此开）", pOn ? "ma:proxyoff" : "ma:proxyon")],
+      [b("🧾 配置清单", "ma:config")],
+      [b("⬅️ 返回", "m:root")],
+    ]
+  }
   // R234 sys 页分组重排（菜单整理小步2）：
   //  · 分区顺序 = 使用频率与风险：只读诊断置顶 → 队列操作 → 修整 → 危险动作（两个 🗑 丢弃
   //    成对集中在一行，便于一眼识别、也避免与查看类动作穿插误点）→ 会话与身份 → 元信息 → 设置。
@@ -3252,10 +3337,12 @@ export const buildMenuKeyboard = (
   // R231 根菜单整理：5 个入口排成 3×2（末行不再孤悬一个「系统」）；
   // 「后台」与「系统」原先共用 🛠 图标易混 —— 后台改 ⚙（与其页内「线程/阈值」语义一致）；
   // R2231 「模型」入驻根菜单（等价 /model），帮助移入系统页（ma:help 仍在）。
+  // R2498 根菜单：新增「代理/切节点」入口 + 配置清单按钮（第 4 行）。
   return [
     [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
     [b("🔁 循环", "m:loop"), b("⚙️ 后台", "m:bg")],
     [b("🤖 模型", "ma:model"), b("🛠 系统", "m:sys")],
+    [b("🌐 代理/切节点", "m:proxy"), b("🧾 配置清单", "ma:config")],
   ]
   }
 
@@ -3464,6 +3551,17 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       e.stopped = false
       e.ts = Date.now()
       j.bots[BOT_ID] = e
+      // R2497：AI 宣告 [LOOP: PAUSE] 走的是**顶层软闸**（auto-continue 的
+      // writeCtlStopped(true,"agent",…)），而本函数原先只清 bots[bot].stopped →
+      // 顶层 stopped=true 仍在 → loopGateStopped 首判即停 → 用户按菜单「继续循环」
+      // （= /loop start）毫无效果，实报「自动循环没了，还不能切换」。
+      // agent 软闸语义 = 等用户处理完继续 → /loop start 应能清它。
+      // 但 /loop stop all 写的（by="user"）是用户显式硬闸，仍只由 /loop start all 清，语义不变。
+      if (j.stopped === true && j.by === "agent") {
+        j.stopped = false
+        j.by = "user"
+        j.reason = "user /loop start (cleared agent pause)"
+      }
     })
   }
 
@@ -3568,13 +3666,39 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const r = await client.session.messages({ path: { id: sid } })
         const msgs = Array.isArray((r as any)?.data) ? (r as any).data : []
         let stoppedAtCompaction = false
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          const m = (msgs[i] as any) ?? {}
+        // R718(loop 修复)：**必须先按时序归一** —— 实测宿主 API（及其 v1 适配）返回的列表是
+        // **新→旧（DESC）、封顶最近 50 条**；旧实现从数组尾部（=窗口里最旧一条）往前扫，
+        // 实际拿到的是「窗口内最旧的一条 assistant」，而不是这里注释声称的
+        // 「最近一次压缩之后**最后一条**（=最新）assistant」。活证据：2026-10-15T12:33:37
+        // 回填取到 153.3k = 压缩前 12:27:43 报告消息的 tokens 原位匹配，而当时压缩后
+        // 真实水位仅 ~45–80k；同窗口模拟扫描同样落在窗口最旧一条上。修法：显式按时序降序。
+        const ordered = [...msgs].sort((a: any, b: any) => {
+          const ta = Number(a?.info?.time?.created ?? a?.time?.created ?? 0)
+          const tb = Number(b?.info?.time?.created ?? b?.time?.created ?? 0)
+          return tb - ta
+        })
+        // R719（本段核心修复）：跳过「会话生命周期累计」形状的样本，**继续向更旧走**。
+        // 活证据（2026-10-15 12:33–13:18 restore-log + v2plugin.log 对账）：活跃回合中，
+        // 尚无真实步 tokens 的新消息被上层填充成 `{input: 会话累计(49.9m), 其余全 0}`；
+        // 旧实现把它当候选 → noteUsage 合法拒绝 → 无脑 `return`（不回落更老的真实样本）
+        // → 显示值与采样时刻永久停在上一份真实样本上，卡片挂「（N 分钟前）」——
+        // 这正是用户两次报「（127/27 分钟前）」的机制性根因。
+        // 修法：①同源判据 looksLikeLifetimeUsage（与 noteUsage 拒绝闸一致）→ continue；
+        //       ②只认 noteUsage 返回 accepted 才算命中（旧代码不看返回值，打印的是旧值，
+        //         日志看起来在刷新、实际纹丝不动——本 bug 长期未被识破的第二个原因）。
+        let skippedSamples = 0
+        for (const mm of ordered) {
+          const m = (mm as any) ?? {}
           const info = m?.info ?? {}
-          // 压缩标记（v1 形 data 或 v2 形 type）：遇到最近一次已完成压缩即停，不再往前取
+          // 压缩标记（v1 形 data 或 v2 形 type；R719 增补 info.compaction/compactionStatus 兼容形）：
+          // 新→旧扫描，遇到最近一次已完成压缩即停。旧实现只认 type/status，而 v1 包装行把
+          // 压缩标记放在 info.compaction=true / info.compactionStatus="completed" → 该停止条件
+          // 从不命中，扫描会**越过压缩点**把压缩前的样本当窗口值。
           const mtype = String(m?.type ?? info?.type ?? "")
-          const mstatus = String(m?.status ?? info?.status ?? "")
-          if (/compaction/i.test(mtype) && (mstatus === "" || /completed/i.test(mstatus))) {
+          const mstatus = String(m?.status ?? info?.status ?? info?.compactionStatus ?? "")
+          const isCompactionItem =
+            /compaction/i.test(mtype) || info?.compaction === true || /compaction/i.test(String(info?.compactionStatus ?? ""))
+          if (isCompactionItem && (mstatus === "" || /completed/i.test(mstatus))) {
             stoppedAtCompaction = true
             break
           }
@@ -3584,7 +3708,20 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const tIn = Number(info?.tokens?.input ?? 0)
           const tCache = Number(info?.tokens?.cache?.read ?? 0) + Number(info?.tokens?.cache?.write ?? 0)
           if (info?.role === "assistant" && (tIn > 0 || tCache > 0)) {
-            noteUsage(sid, info)
+            const tOthers =
+              Number(info?.tokens?.output ?? 0) + Number(info?.tokens?.reasoning ?? 0) + Number(info?.tokens?.cache?.read ?? 0) + Number(info?.tokens?.cache?.write ?? 0)
+            const winItem = windowFor(String(info?.model?.id ?? ""), String(info?.model?.providerID ?? ""))
+            if (looksLikeLifetimeUsage(tIn, tOthers, winItem)) {
+              // 这不是可用样本：继续向更旧走，去拿最近一条真实步 tokens。
+              skippedSamples++
+              continue
+            }
+            const accepted = noteUsage(sid, info)
+            if (!accepted) {
+              // 防御分支：形状过了预检但 noteUsage 仍拒绝（边缘情形）——同样继续走，别当成功打印。
+              skippedSamples++
+              continue
+            }
             const u = ctxUsage.get(sid)
             if (u && !u.modelID && ledger?.modelID) {
               // 消息里没带模型信息时，用账本补上（只补模型，不补数值）
@@ -3603,21 +3740,23 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
               const pct = known ? (total / win) * 100 : 0
               const winTxt = known ? fmtK(win) : "?"
               const pctTxt = !known ? "?" : total > win ? "over" : pct < 1 ? "<1%" : `${Math.round(pct)}%`
-              await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}=${fmtK(total)}/${winTxt} (${pctTxt}) in=${fmtK(uu.input)} out=${fmtK(uu.output)} rea=${fmtK(uu.reasoning)} cr=${fmtK(uu.cacheRead)} cw=${fmtK(uu.cacheWrite)} [msg]`)
+              const skipTxt = skippedSamples > 0 ? ` skips=${skippedSamples}` : ""
+              await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}=${fmtK(total)}/${winTxt} (${pctTxt}) in=${fmtK(uu.input)} out=${fmtK(uu.output)} rea=${fmtK(uu.reasoning)} cr=${fmtK(uu.cacheRead)} cw=${fmtK(uu.cacheWrite)}${skipTxt} [msg]`)
             }
             return
           }
         }
         // 没有可用的消息口径：只把账本当诊断信息输出，绝不写进 ctxUsage（否则 100% 假象）
+        const skipDiag = skippedSamples > 0 ? `, skippedLifetime=${skippedSamples}` : ""
         if (ledger && !ctxUsage.has(sid)) {
           const life = ledger.input + ledger.output + ledger.reasoning
           await log(
             "info",
-            `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}: no active-window value (msgs=${msgs.length}, stoppedAtCompaction=${stoppedAtCompaction}; lifetime=${fmtK(life)} [db] ignored for window)`
+            `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}: no active-window value (msgs=${msgs.length}, stoppedAtCompaction=${stoppedAtCompaction}${skipDiag}; lifetime=${fmtK(life)} [db] ignored for window)`
           )
           return
         }
-        await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}: no post-compaction assistant (msgs=${msgs.length}, stoppedAtCompaction=${stoppedAtCompaction})`)
+        await log("info", `[tg-bridge] ctx backfill ${sanitizeLog(sid).slice(0, 12)}: no post-compaction assistant (msgs=${msgs.length}, stoppedAtCompaction=${stoppedAtCompaction}${skipDiag})`)
       } finally {
         backfillInflight.delete(sid)
       }
@@ -3692,6 +3831,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       } catch (err) {
         await log("error", `[tg-bridge] ctx model windows: HttpApi /api/model failed: ${sanitizeLog(err).slice(0, 140)}`)
       }
+      if (n > 0) publishModelWindows()
       await log(
         n > 0 ? "info" : "error",
         n > 0
@@ -3700,6 +3840,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       )
       return
     }
+    publishModelWindows()
     await log("info", `[tg-bridge] ctx model windows: ${n} models`)
   }
   // R1882：这两步有**先后依赖** —— 窗口表必须先填好，回填算出的百分比才有正确分母。
@@ -4107,7 +4248,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 一旦成功就清零 —— 详见 floodBackoffSeconds（唯一实现，本处只做转发）。
   const FLOOD_WAIT_CAP_S = FLOOD_BACKOFF_CAP_S
   const floodWaitSeconds = (retryAfter?: number, attempt = 1): number =>
-    floodBackoffSeconds({ retryAfter, attempt })
+    // R2386：必须传 `rand`，否则 floodBackoffSeconds 的 `rand` 落到固定默认 0.5 →
+    // 抖动恒为 ×1.125 常量（不是随机）→ 三 Bot/多会话在同一个毫秒齐步重试，
+    // 正是 L3035-3036 注释里要避免的"齐步走"。默认 0.5 只应服务单元测试的确定性。
+    floodBackoffSeconds({ retryAfter, attempt, rand: Math.random() })
   type TelegramResult = { ok: boolean; id?: number; status?: number; desc?: string; retryAfter?: number; viaFallback?: boolean }
   const callTelegram = async (base: string, method: string, body: Record<string, unknown>): Promise<TelegramResult> => {
     const res = await fetch(`${base}/${method}`, {
@@ -4418,6 +4562,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const plain = text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/<[^>]*>/g, "")
       const fb: Record<string, unknown> = { chat_id: Number(chatID) || chatID, text: plain.slice(0, PUSH_MAX) }
       if (kb) fb.reply_markup = { inline_keyboard: kb }
+      // R2439：与分段路径（L4379-4381）补齐 —— 非分段 400 降级此前**丢 silent/replyTo**。
+      // R1880 的注释把"非分段路径"当基准来对齐，实则它自己也没带这两个字段：静默的
+      // 思考/状态卡一旦 HTML 非法走降级就会**变响铃**，replyTo 也会丢。这里补上。
+      if (silent) fb.disable_notification = true
+      if (replyTo) fb.reply_to_message_id = replyTo
       const r2 = await tgFetch("sendMessage", fb)
       if (r2.ok) {
         await log("info", `sendMessage plain-fallback ok (chat=${sanitizeLog(chatID)})`)
@@ -4566,11 +4715,23 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const congested = outQueue.length > 0
     const item = { chat: chatID, text, ts: Date.now(), kb, replyTo }
     // 命令回执优先于旧通知，避免用户刚发的 /whoami、/loop status 卡在历史队列尾。
-    if (text.trimStart().startsWith("[tg-bridge]")) outQueue.unshift(item)
+    const isPrio = text.trimStart().startsWith("[tg-bridge]")
+    if (isPrio) outQueue.unshift(item)
     else outQueue.push(item)
     if (outQueue.length > 50) {
-      outQueue.shift()
-      await log("error", "outbound queue full (50): dropped oldest")
+      // R2384：超限要丢的是**最旧**项。命令回执走 `unshift` 插到**队首**（那是最新、不是最旧），
+      // 若仍照旧 `shift()` 就会正好把刚插入的这条回执丢掉 —— 与上面"命令回执优先"自相矛盾，
+      // 且日志"dropped oldest"是假话。故按入队方向选真正的最旧项：
+      //   · 普通追加（队尾）→ 队首即最旧；
+      //   · 命令回执（队首）→ 丢"队首优先块之后的第一个非 [tg-bridge] 项"（最旧的普通项）；
+      //     整队都是命令回执时，丢队尾（最旧的那条回执）。
+      let dropIdx = 0
+      if (isPrio) {
+        const ni = outQueue.findIndex((qq) => !String(qq.text ?? "").trimStart().startsWith("[tg-bridge]"))
+        dropIdx = ni >= 0 ? ni : outQueue.length - 1
+      }
+      const [dropped] = outQueue.splice(dropIdx, 1)
+      await log("error", `outbound queue full (50): dropped oldest (len=${(dropped as any)?.text?.length ?? 0})`)
       noteDrop("queue-full", "outbound queue full (50): dropped oldest")
     }
     // 拥塞时先立占位条（直发不进队），排空即删；限流期跳过占位（省一次触网）
@@ -5492,6 +5653,32 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         await completeBar(sessionID)
       }
     }
+    // R2369（用户实报「没有发送报错信息（错误原因）比如说 速率限制」）：
+    // assistant 行上的 `error`（provider 限流/配额/传输错误；v2 形状 `{type,message}`）
+    // 此前**从不**渲染 —— 本函数只遍历 parts（text/reasoning/tool/step-finish），
+    // 而报错回合常常 parts=0（实测 assistant 行 keys 含 error、content 为空）→ 用户零提示。
+    // 这里补一张独立报错卡：key 稳定（同一条消息只一张），protoSend 自带去重/改写；
+    // 不走任何 filter（用户明确要报错原因），也不被限流脱载（只脱 thinking/tool/status）。
+    const mErr = (m as any)?.info?.error ?? (m as any)?.error ?? null
+    if (mErr) {
+      const eType = typeof mErr === "object" && mErr ? String((mErr as any)?.type ?? "") : ""
+      const eMsg = typeof mErr === "string" ? mErr : String((mErr as any)?.message ?? "")
+      const eText = (eMsg || (eType ? "" : JSON.stringify(mErr))).slice(0, 900)
+      const title = `❌ 生成失败${eType ? ` · ${eType}` : ""}`
+      const body = [eType && !eMsg ? eType : "", eText].filter(Boolean).join("\n") || "(无错误详情)"
+      // R2501（用户实报「这种频繁出现也应该切换吧」）：网络类 provider 错误（ECONNRESET /
+      // 速率限制 / 配额等）→ 尝试自动切代理节点。
+      // 为什么补在这里：此前唯一触发点是 auto-continue 的 eval，而它只在**循环目标会话**、
+      // 且可能被 gating（skip/waiting/HUNG）吞掉；而「❌ 生成失败」卡是 tg-bridge 侧**对所有
+      // 会话即时**渲染的 —— 在这里补触发，覆盖面才完整。与 auto-continue 触发点共用
+      // cooldownMs（含跨实例落盘闸，见 proxy-switch.ts），重复触发会被去重。
+      // 新鲜度闸：只对「刚发生」的错误触发，避免热重载回放历史消息时对陈旧错误误切。
+      const mAt = Number((m as any)?.info?.time?.completed ?? (m as any)?.time?.completed ?? (m as any)?.info?.time?.created ?? 0)
+      if (mAt <= 0 || Date.now() - mAt < 300_000) {
+        void maybeSwitchProxyNode({ name: eType, message: eText, sessionID, log })
+      }
+      await protoSend(`${sessionID}:error:${msgKey}`, chatID, protoBlock(ptitle(title, m, m, sessionID), body), true, undefined, undefined, undefined, force)
+    }
   }
 
   const lastStopNotify = new Map<string, number>()
@@ -6133,7 +6320,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const pos = pinQueue.filter((qq) => qq.sid === target).length
     // 发送前最后判断（②）：水位已超用户阈值 → 提示先压缩，不拦注入
     const cu = ctxUsage.get(target)
-    const overTh = cu ? ctxTotal(cu) / windowFor(cu.modelID, cu.providerID) >= compactPrefs.threshold : false
+    const overTh = cu && windowKnown(cu.modelID, cu.providerID) ? ctxTotal(cu) / windowFor(cu.modelID, cu.providerID) >= compactPrefs.threshold : false
     // 注入时机提示必须说真话：busyTurn 会被 turnActuallyIdle 提前清掉，单看它会把
     // “正在跑”说成“空闲”。这里用与泵同源的判定（读最后一条 assistant 是否 completed）。
     let injectNote = ""
@@ -6436,6 +6623,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "【推送控制】",
     "· /quiet — 推送过滤+压缩设置菜单（别名 /q；/loud 只恢复推送）",
     "· /loud — 恢复全部推送（别名 /l）",
+    "· /cnotice [on|off] — 压缩通知开关（「🗜 上下文已压缩」卡片是否发送；默认发；菜单「📣 推送」与 /quiet 里也有开关）",
     "· /watch [会话] — 附加镜像该会话（只发最终回复正文，标题带会话名）",
     "· /unwatch [会话] — 取消附加镜像（不带参数=全部取消）",
     "【应答与独立】",
@@ -6444,7 +6632,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /healcards — 按真实状态纠正卡在“执行中”的工具卡",
     "【运行控制】",
     "· /stop — 停自动循环＋中断当前回合（/loop start 恢复）",
-    "· /undo — 同上（撤回上一回合）",
+    "· /undo — 只中断当前回合（不停循环；等同卡片 ⏹ 按钮）",
     "· /retry — 重发上一次注入（回复机器人消息发“重来”同效）",
     "· /loop [start|stop|status] — 自动循环开关（默认一直跑，用户 /loop stop 才停）",
     "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
@@ -6566,6 +6754,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     kb.push([{ text: `🗜 自动压缩：${compactPrefs.auto ? "开" : "关"} ›`, callback_data: "flt:compact:auto" }])
     lines.push(`· 🗜 压缩阈值：${Math.round(compactPrefs.threshold * 100)}%`)
     kb.push([{ text: `🗜 压缩阈值：${Math.round(compactPrefs.threshold * 100)}% ›`, callback_data: "flt:compact:th" }])
+    // R719（用户点名新增）：压缩通知是否发送——关闭后不再把「🗜 上下文已压缩」卡片发到 TG，
+    // 但压缩事件本身仍会记录日志/更新水位状态（只省通知，不关功能）。
+    lines.push(`· 🗜 压缩通知：${compactPrefs.notice ? "发" : "不发"}（是否把「上下文已压缩」卡片发到 TG）`)
+    kb.push([{ text: `🗜 压缩通知：${compactPrefs.notice ? "发" : "不发"} ›`, callback_data: "flt:compact:notice" }])
     lines.push(`· 💉 注入时机：${injectMode === "idle" ? "完成插入" : "立即插入"}`)
     kb.push([{ text: `💉 注入时机：${injectMode === "idle" ? "完成插入" : "立即插入"} ›`, callback_data: "flt:inject:mode" }])
     kb.push([
@@ -6579,7 +6771,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // ── 单一按钮菜单 ──────────────────────────────────────────────
   // 目标：命令数量收敛到手机上一屏可点。命令本身全部保留（文本备用），
   // 但日常操作只需要点菜单；菜单消息**就地编辑**，任何时候只有一条。
-  const MENU_VIEWS = ["root", "sess", "push", "loop", "bg", "sys"] as const
+  const MENU_VIEWS = ["root", "sess", "push", "loop", "bg", "proxy", "sys"] as const
   const menuText = (view: string): string => {
     const t = fixedTarget ?? frontSessionID ?? persistedFront
     const nm = t ? sessionTag(t) : "(未确定)"
@@ -6635,11 +6827,25 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         "上半页只读诊断；中段队列维护与丢弃（🗑）；底部为设置与帮助。",
       ].join("\n")
     }
+    if (view === "proxy") {
+      const pCfg = readProxySwitchCfg()
+      const pLast = readLastSwitch()
+      return [
+        head,
+        `自动切节点：${pCfg.enabled ? "✅ 开" : "❌ 关"}`,
+        `方式：${pCfg.mode === "command" ? "命令" : "Clash 外部控制"} · 分组「${htmlEsc(pCfg.group)}」${pCfg.setRoot ? ` · 顶层「${htmlEsc(pCfg.setRoot)}」` : ""}`,
+        pLast ? `最近切换：${htmlEsc(pLast.from || "?")} → ${htmlEsc(pLast.to)}（${pLast.via === "auto" ? "自动" : "手动"}）` : "最近切换：（无记录）",
+        "",
+        "只放代理/切节点。出现网络类错误（ECONNRESET / 速率限制）时自动切下一个节点。",
+        "🔐 锁定 = Clash 内置锁定：锁定后健康检查不再改选、不漂移；🔓 解锁回「延迟选优」自动。",
+        "点按钮切换；候选清单与指定节点见 /proxy list、/proxy &lt;名字&gt;。",
+      ].join("\n")
+    }
     return [
       head,
       `目标会话：<b>${htmlEsc(nm)}</b>`,
       "",
-      "按主题分页：会话 / 推送 / 循环 / 后台 / 模型 / 系统。",
+      "按主题分页：会话 / 推送 / 循环 / 后台 / 代理 / 系统。",
     ].join("\n")
   }
   // 薄包装：把运行期状态喂给模块级的真定义（测试直接调 buildMenuKeyboard）
@@ -6657,6 +6863,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       bgAuto: readBg().enabled,
       bgShellAuto: readBg().shellPromo !== false,
       bgPromoteMs: readBg().promoteMs,
+      proxyEnabled: readProxySwitchCfg().enabled,
+      // R719：压缩通知开关（用户新增选项）
+      cnotice: compactPrefs.notice,
     })
   // R1646：每个 chat 当前打开的菜单视图（root/子页）。ma 动作执行后「原地刷新」当前视图，
   // 而不是拽回根页 —— 用户明确要"点按钮不回到主菜单"。sync 时保持与 card 一致。
@@ -6700,7 +6909,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   /** GET /api/session/{sid} → 当前模型 ref（{id, providerID}），取不到返回 null。 */
   const modelHttpSession = async (sid: string): Promise<{ id: string; providerID: string; variant?: string } | null> => {
     const b = (await modelHttp(`/api/session/${encodeURIComponent(sid)}`)).body
-    const m = (b && typeof b === "object" ? (b.model ?? b) : null) as any
+    // R2369（用户实报「当前模型不显示」）：HttpApi 所有响应都带 `{data: ...}` 信封
+    // （实测 `GET /api/session/<id>` → `{data:{id,model:{id,providerID,variant},...}}`）。
+    // 旧写法只看 `b.model ?? b` → 永远取不到 → `curKey=""` → 选择器恒显示「当前：未知」、
+    // `/model <名称>` 也失去"当前 provider"这一消歧依据。必须先剥一层 `data`。
+    const root = (b && typeof b === "object" ? ((b as any).data ?? b) : null) as any
+    const m = (root && typeof root === "object" ? (root.model ?? root) : null) as any
     if (m && typeof m.id === "string" && typeof m.providerID === "string") {
       return { id: m.id, providerID: m.providerID, variant: typeof m.variant === "string" ? m.variant : undefined }
     }
@@ -6943,6 +7157,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         } else if (which === "th") {
           const i = COMPACT_TH_STEPS.indexOf(compactPrefs.threshold as (typeof COMPACT_TH_STEPS)[number])
           compactPrefs.threshold = COMPACT_TH_STEPS[(i + 1) % COMPACT_TH_STEPS.length]!
+          savePersistedState()
+        } else if (which === "notice") {
+          // R719：压缩通知发送开关（默认开）
+          compactPrefs.notice = !compactPrefs.notice
           savePersistedState()
         } else {
           await answer("未知按钮")
@@ -7881,6 +8099,192 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(chatID, lines.join("\n"))
       return
     }
+    // ── R2498：/proxy —— 网络错误自动切节点的 TG 面板（可选功能，默认关）──────────
+    // 查看状态 / 切下一节点 / 切指定节点 / 列候选 / 开-关自动切。
+    // 手动切换不经冷却与频率闸（那是给"自动"用的）；自动切换只由 auto-continue 触发。
+    if (text === "/proxy" || text.startsWith("/proxy ") || cmd === "proxy") {
+      const arg = commandArg(text)
+      const lower = arg.toLowerCase()
+      const cfg = readProxySwitchCfg()
+      const resultText = (res: string): string => {
+        if (res.startsWith("switched:")) {
+          // R719b：rest 里除节点名外还可能有多个分号旗标（root-failed / skipped=n /
+          // verify-failed / lock-ok / lock-missing …）。旧解析只取到第 2 段 →
+          // 会把 "lock-ok" 当告警显示。这里逐段分类：lock-ok 是正面信息，其余旗标进告警。
+          const parts2 = res.slice("switched:".length).split(";")
+          const node = parts2[0] ?? ""
+          const flags = parts2.slice(1).filter(Boolean)
+          const lockOk = flags.includes("lock-ok")
+          // R722：;now-ok@Ns = 已确认实际生效（正面旗标）；;now-pending:… / ;now-abort:… 不冒充成功。
+          const nowOk = flags.some((f) => f.startsWith("now-ok"))
+          const warn = flags.filter((f) => f !== "lock-ok" && !f.startsWith("now-ok"))
+          return `[tg-bridge] ✅ 已切换节点：${node}${lockOk ? " · 🔐 已锁定" : ""}${nowOk ? " · 已确认生效" : ""}${warn.length ? `（⚠️ ${warn.join(" · ")}）` : ""}`
+        }
+        if (res.startsWith("already:")) return `[tg-bridge] ℹ️ 已经是该节点：${res.slice("already:".length)}`
+        if (res.startsWith("not-found:")) return `[tg-bridge] ❌ 未找到节点：${res.slice("not-found:".length)}（/proxy list 查看候选）`
+        if (res.startsWith("ambiguous(")) return `[tg-bridge] ❌ 节点名匹配到多个：${res}`
+        if (res === "unsupported-in-command-mode") return "[tg-bridge] ⚠️ 当前为命令模式（mode=command），无节点清单：只能 /proxy next（循环执行 command）或 /proxy on|off"
+        // R719b 锁定/解锁结果
+        if (res.startsWith("locked:")) return `[tg-bridge] 🔐 已锁定当前节点：${res.slice("locked:".length)}（Clash 内置锁定：健康检查不再改选、不漂移；/proxy unlock 解锁）`
+        if (res === "unlocked") return "[tg-bridge] 🔓 已解锁：回到「延迟选优」自动模式（节点可能随自动选优变化）"
+        if (res.startsWith("lock-verify-failed:")) return `[tg-bridge] ⚠️ 锁定读回校验失败：目标 ${res.slice("lock-verify-failed:".length)}（PUT 成功但 fixed 未落下，请在 Clash 面板确认）`
+        if (res === "unlock-verify-failed") return "[tg-bridge] ⚠️ 解锁读回校验失败：fixed 仍非空，请重试或到 Clash 面板手动解锁"
+        if (res === "lock-unsupported") return "[tg-bridge] ⚠️ 当前内核读不到 fixed 字段：不支持锁定（旧版 mihomo）"
+        if (res === "no-current") return "[tg-bridge] ⚠️ 当前没有可锁定的节点（分组尚未选择任何节点）"
+        return `[tg-bridge] ⚠️ 切换未完成：${res}`
+      }
+      if (!arg || lower === "status") {
+        const st = await readProxyStatus()
+        const lines: string[] = [`[tg-bridge] 🌐 代理切节点 · bot=${sanitizeLog(BOT_ID)}`]
+        lines.push(`自动切节点：${cfg.enabled ? "✅ 开" : "❌ 关（/proxy on 开启）"}`)
+        lines.push(
+          `方式：${cfg.mode === "command" ? "命令" : "Clash 外部控制"} · 分组「${cfg.group}」${cfg.setRoot ? ` · 顶层「${cfg.setRoot}」` : ""}`,
+        )
+        if (cfg.mode !== "clash") {
+          lines.push("当前为命令模式（mode=command）：无节点清单，/proxy next 循环执行 command。")
+        } else if (st.ok) {
+          lines.push(`当前节点：${st.now || "(未知)"}`)
+          // R719b：mihomo 内置锁定状态（PUT=锁定、DELETE=解锁；用户点名的 🔐 功能）
+          lines.push(
+            `锁定：${st.locked === undefined ? "（本内核不暴露 fixed 字段，不支持查询）" : st.locked ? `🔐 已锁定到 ${st.fixed}` : "🔓 未锁定（延迟选优自动模式）"}`,
+          )
+          lines.push(`候选节点：${(st.cands ?? []).length} 个${cfg.nodes.length ? `（配置固定 ${cfg.nodes.length} 个）` : "（分组全部非直连）"}`)
+        } else {
+          lines.push(`⚠️ 读取分组失败：${st.reason ?? "未知"}`)
+        }
+        if (st.last) {
+          const ago = Math.max(0, Math.round((Date.now() - st.last.at) / 60000))
+          lines.push(
+            `最近切换：${st.last.from || "?"} → ${st.last.to}（${st.last.via === "auto" ? "自动" : "手动"}，${ago} 分钟前${st.last.reason ? `，因 ${st.last.reason}` : ""}）`,
+          )
+        } else {
+          lines.push("最近切换：（无记录）")
+        }
+        lines.push("")
+        lines.push("命令：/proxy next 切下一节点 · /proxy list 列候选 · /proxy <节点名或片段> 切指定 · /proxy lock|unlock 锁定/解锁当前节点 · /proxy on|off 开/关自动切")
+        await reply(chatID, lines.join("\n"))
+        return
+      }
+      if (lower === "on" || lower === "off") {
+        const on = lower === "on"
+        const ok = setProxyEnabled(on)
+        await reply(
+          chatID,
+          ok
+            ? `[tg-bridge] 🌐 自动切节点已${on ? "开启" : "关闭"}（写入 proxy-switch.json，立即生效）`
+            : "[tg-bridge] ✗ 写入 proxy-switch.json 失败，请检查文件权限",
+        )
+        return
+      }
+      if (lower === "list") {
+        if (cfg.mode !== "clash") {
+          await reply(chatID, "[tg-bridge] ⚠️ 当前为命令模式（mode=command），无节点清单；/proxy next 循环执行 command")
+          return
+        }
+        const st = await readProxyStatus()
+        if (!st.ok) {
+          await reply(chatID, `[tg-bridge] ⚠️ 读取节点失败：${st.reason ?? "未知"}`)
+          return
+        }
+        const cands = st.cands ?? []
+        const MAX = 60
+        const lines: string[] = [`[tg-bridge] 🌐 候选节点 ${cands.length} 个（当前：${st.now || "?"}）`]
+        for (let i = 0; i < Math.min(cands.length, MAX); i++) {
+          const n = cands[i]!
+          lines.push(`${i + 1}. ${n}${n === st.now ? " ←当前" : ""}`)
+        }
+        if (cands.length > MAX) lines.push(`…（省略 ${cands.length - MAX} 个；用 /proxy <片段> 直接切）`)
+        await reply(chatID, lines.join("\n"))
+        return
+      }
+      if (lower === "next") {
+        await reply(chatID, resultText(await switchProxyNode(cfg, "manual")))
+        return
+      }
+      // R719b：内置锁定/解锁（用户指令「切换节点应该使用锁定🔐（clash内置功能）」）
+      if (lower === "lock" || lower === "lock on") {
+        await reply(chatID, resultText(await setNodeLock(cfg, true)))
+        return
+      }
+      if (lower === "unlock" || lower === "lock off") {
+        await reply(chatID, resultText(await setNodeLock(cfg, false)))
+        return
+      }
+      // 其余参数一律当作「切到指定节点」（精确名 → 唯一片段）。
+      await reply(chatID, resultText(await switchToNode(cfg, arg, "manual")))
+      return
+    }
+    // ── R2498：/config —— 在 TG 里查看配置清单（本 Bot / 循环 / 切节点 / Bot 注册表）──
+    if (text === "/config" || text.startsWith("/config ") || cmd === "config") {
+      const t = fixedTarget ?? frontSessionID ?? persistedFront
+      const guard = readGuard()
+      const bg = readBg()
+      const proxyCfg = readProxySwitchCfg()
+      const proxySt = await readProxyStatus()
+      // 全局闸 + 各 Bot 闸（读共享 loop-ctl.json）
+      const ctl = ((): any => {
+        for (const p of ["REDACTED_ROOT/.config/opencode/loop-ctl.json", "/tmp/opencode/loop-ctl.json"]) {
+          try {
+            const j = JSON.parse(readFileSync(p, "utf8")) as any
+            if (j && typeof j === "object") return j
+          } catch {
+            /* try next */
+          }
+        }
+        return {}
+      })()
+      const globalStopped = ctl?.stopped === true
+      const myGate = (ctl?.bots ?? {})[BOT_ID]?.stopped === true
+      // Bot 注册表
+      const botRows: string[] = (() => {
+        try {
+          const j = JSON.parse(readFileSync("REDACTED_ROOT/.config/opencode/tg-bots.json", "utf8")) as any
+          const arr = Array.isArray(j?.bots) ? j.bots : []
+          return arr.map((b: any) => {
+            const id = String(b?.id ?? "?")
+            const label = b?.label ? String(b.label) : ""
+            const gate = (ctl?.bots ?? {})[id]?.stopped === true ? "停" : "运行"
+            const me = id === BOT_ID ? "（本 Bot）" : ""
+            return `· ${id}${me} ${label ? `@${label}` : ""} 循环=${gate}`
+          })
+        } catch {
+          return ["· （读取 tg-bots.json 失败）"]
+        }
+      })()
+      const lines: string[] = [`[tg-bridge] 🧾 配置清单 · bot=${sanitizeLog(BOT_ID)} · v${VERSION}`]
+      lines.push("")
+      lines.push("【本 Bot】")
+      lines.push(`· 目标会话：${t ? `${sessionTag(t)} (${t.slice(0, 12)})` : "（未确定）"}`)
+      lines.push(`· 状态文件：${STATE_PATH}`)
+      lines.push(`· 应答模式：${selfMute ? "只答命令" : "开启"} · 推送暂停：${pausedMode ? "是" : "否"}`)
+      lines.push("")
+      lines.push("【循环 / 守卫】")
+      lines.push(`· 全局闸：${globalStopped ? `已停${ctl?.by ? `（by=${String(ctl.by)}）` : ""}` : "运行"}`)
+      lines.push(`· 本 Bot 闸：${myGate ? "已停" : "运行"} · 注入队列：${pinQueue.length} · 外发队列：${outQueue.length}`)
+      lines.push(`· 守卫：问题=${guard.problem !== false ? "开" : "关"} · 联网搜索=${guard.websearch !== false ? "开" : "关"}`)
+      lines.push(`· 后台：自动转后台=${bg.enabled ? "开" : "关"} · shell 自动后台=${bg.shellPromo !== false ? "开" : "关"} · 阈值=${Math.round(bg.promoteMs / 1000)}s`)
+      lines.push("")
+      lines.push("【切节点】")
+      lines.push(`· 自动切：${proxyCfg.enabled ? "开" : "关"} · 方式：${proxyCfg.mode === "command" ? "命令" : "Clash"} · 分组：「${proxyCfg.group}」`)
+      if (proxyCfg.mode !== "clash") {
+        lines.push("· 命令模式：无节点清单")
+      } else if (proxySt.ok) {
+        lines.push(`· 候选：${(proxySt.cands ?? []).length} 个 · 当前：${proxySt.now || "?"}`)
+        // R719b：锁定状态（🔐=已锁定到 fixed 节点；🔓=自动）
+        lines.push(`· 锁定：${proxySt.locked === undefined ? "（内核不支持查询）" : proxySt.locked ? `🔐 ${proxySt.fixed}` : "🔓 未锁定（自动）"}`)
+      } else {
+        lines.push(`· ⚠️ 读取失败：${proxySt.reason ?? "未知"}`)
+      }
+      if (proxySt.last) {
+        const ago = Math.max(0, Math.round((Date.now() - proxySt.last.at) / 60000))
+        lines.push(`· 最近：${proxySt.last.from || "?"} → ${proxySt.last.to}（${ago} 分钟前）`)
+      }
+      lines.push("")
+      lines.push("【Bot 注册表】")
+      lines.push(...botRows)
+      await reply(chatID, lines.join("\n"))
+      return
+    }
     if (text === "/background" || text.startsWith("/background ") || cmd === "background") {
       // 转后台（用户 2026-09-28 新增；菜单「🔁 循环」里也有按钮）。
       // 能力按**运行时探测**（不按版本号猜）：v2.0.10 OpenAPI=顶层 session.background，
@@ -8214,6 +8618,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       )
       return
     }
+    // R719：压缩通知发送开关（用户点名的「压缩是否发送」选项；等价于 /quiet 菜单里的同款按钮）
+    if (text === "/cnotice" || cmd === "cnotice") {
+      const arg = commandArg(text).toLowerCase()
+      if (arg === "on" || arg === "off") compactPrefs.notice = arg === "on"
+      else compactPrefs.notice = !compactPrefs.notice
+      savePersistedState()
+      await reply(
+        chatID,
+        `[tg-bridge] 🗜 压缩通知（「上下文已压缩」卡片）：${compactPrefs.notice ? "发" : "不发"} · 关掉后压缩事件仍记录日志，只是不发卡 · bot=${sanitizeLog(BOT_ID)}`,
+      )
+      return
+    }
     if (text === "/stop" || cmd === "stop") {
       const target = fixedTarget ?? (await activeFront())
       if (!target) {
@@ -8526,6 +8942,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           }
           for (const [key, rec] of protoMap) {
             if (!key.startsWith(`${sid}:tool:`)) continue
+            // R2372：`checked` 此前**声明后从未自增** → 回执恒为「核对 0 张工具卡」，
+            // 与实际发生的核对数不符（违反本模块「如实说明"做到了什么"」的纪律）。
+            // 语义 = 本次遍历到的工具卡张数；`fixed` = 其中被真正改写的张数，
+            // 差额即回复里"其余本来就不是终态或没有对应卡片"的那部分。
+            checked++
             const cid = staleCallId(key)
             const stt = real.get(cid) ?? ""
             if (stt !== "completed" && stt !== "error") continue
@@ -8549,8 +8970,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
               markReconciled(key, stt)
               protoMap.set(key, { ...rec, runningAt: 0 })
               staleToolBorn.delete(key)
-              // 同上：已被巡检对账纠正过就别再写第二遍（runningAt 已清、状态已落盘）。
-              if (alreadyReconciled(key, stt)) continue
+              // R2492 修复：这里原本还有一句「if (alreadyReconciled(key, stt)) continue」，
+              // 但它紧跟在 markReconciled(key, stt) 之后 —— markReconciled 刚把
+              // reconcileTag[key] 置成 `EPOCH:stt`，于是该判据**恒为真** → 每次都 continue，
+              // 后面的 `fixed++` **永远执行不到** → 回执与日志恒为「纠正 0 张」，与
+              // 本模块「如实说明做到了什么」的纪律（R2372 修 checked 时引用的同一条）相悖。
+              // 去重本由**编辑之前**的守卫（L8596）负责；此处再判一次纯属自相矛盾，删除即可。
               fixed++
             }
           }
@@ -8563,7 +8988,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await log("info", `healcards: checked=${checked} fixed=${fixed}`)
       return
     }
-    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "addbot", "botname", "botdesc", "autoguard", "background", "model"])
+    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "cnotice", "addbot", "botname", "botdesc", "autoguard", "background", "model", "proxy", "config"])
     if (text.startsWith("/")) {
       if (!KNOWN_CMDS.has(cmd)) {
         await reply(chatID, `❓ 未知命令 /${clean(cmd || text.slice(1).split(/\s/)[0], 30)}（发送 /help 查看列表）`)
@@ -9256,12 +9681,25 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     after: number,
   ): Promise<void> => {
     if ((Date.now() - (lastCompactNotice.get(sid) ?? 0)) < COMPACT_NOTICE_DEDUPE_MS) return
+    // R719（用户点名新增的选项）：压缩通知开关（默认开）。关闭 = 不发「🗜 上下文已压缩」卡片。
+    // 注意仍要更新去重状态与留痕日志：否则重新打开开关后，会把关闭期间积压的压缩事件补发一遍。
+    // 静默≠失明：日志照打（result=suppressed(option)），排障时"到底发生了什么"依然可查。
+    if (!compactPrefs.notice) {
+      lastCompactNotice.set(sid, Date.now())
+      lastCompactTotal.set(sid, after)
+      await log(
+        "info",
+        `compaction notice suppressed (option off; session=${sanitizeLog(sid).slice(0, 14)}, how=${how}, ` +
+          `${compactLogDelta(before, after)}, at=${atMs})`,
+      )
+      return
+    }
     const chat = pushChatResolve()
     if (!chat) return
     lastCompactNotice.set(sid, Date.now())
     lastCompactTotal.set(sid, after)
     const u = ctxUsage.get(sid)
-    const win = u ? windowFor(u.modelID, u.providerID) : 0
+    const win = u && windowKnown(u.modelID, u.providerID) ? windowFor(u.modelID, u.providerID) : 0
     const nm = clean(sessionNameOf(sid) || "", 40) || sid.slice(0, 12)
     const exact = how === "api" ? `${new Date(atMs).toISOString().replace("T", " ").slice(0, 16)}Z` : "刚刚（宿主未给出精确时间）"
     // 数字段与"怎么发现的"两段都交给纯函数判（v2lib/compact-notice.ts + 单测）。
@@ -9362,7 +9800,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
                 continue
               }
               const u = ctxUsage.get(sid)
-              const pctNow = u ? (ctxTotal(u) / windowFor(u.modelID, u.providerID)) * 100 : -1
+              const pctNow = u && windowKnown(u.modelID, u.providerID) ? (ctxTotal(u) / windowFor(u.modelID, u.providerID)) * 100 : -1
               await log(
                 "info",
                 `host compaction observed (session=${sanitizeLog(sid).slice(0, 14)}, at=${new Date(at).toISOString()}, ` +
@@ -9902,7 +10340,12 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         const hasText = content.some(
           (p: any) => (p?.type === "text" || p?.type === "reasoning") && String(p?.text ?? "").trim()
         )
-        if (!hasText) continue
+        // R2451：报错回合常常 parts=0（无正文/思考），旧代码 `!hasText → continue` 把
+        // **整条报错消息**跳过 —— 用户实报「部分错误不发送，比如速率限制」。放宽为
+        // 「有正文 **或** 带 error」→ 交给 protoPushAssistantMessage 末尾的「❌ 生成失败」卡
+        // （致命错误无 retry part、事件路径拿不到 message.updated，此补扫是就地的兜底）。
+        const hasErr = !!((m as any)?.info?.error ?? (m as any)?.error)
+        if (!hasText && !hasErr) continue
         const mid = String(m?.id ?? m?.info?.id ?? "")
         if (!mid) continue
         // 与 turn-note 同一"本实例启动基线"：只补 boot 之后**创建或完成**的消息，
@@ -9917,7 +10360,12 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         if (!(createdAt > turnNoteBootAt || (completedAt > 0 && completedAt > turnNoteBootAt))) continue
         const msgKey = mid.slice(0, 20)
         const seen = [...protoMap.keys()].some(
-          (k) => k.startsWith(`${sid}:message:${msgKey}:`) || k.startsWith(`${sid}:thinking:${msgKey}:`)
+          (k) =>
+            k.startsWith(`${sid}:message:${msgKey}:`) ||
+            k.startsWith(`${sid}:thinking:${msgKey}:`) ||
+            // R2451：报错卡（`:error:`）也是这条消息的"已推送"标志；否则每条无正文的
+            // 报错消息会每 25s 被补扫重算一次（protoSend 去重能防重发，但白跑无害）。
+            k.startsWith(`${sid}:error:${msgKey}`)
         )
         if (seen) continue
         await protoPushAssistantMessage(sid, String(chat), m, false, "full")
@@ -10072,6 +10520,98 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     await log("warn", `inject-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
   }
 
+  // ── R2498：自动切节点成功后 → 推送 TG 通知（best-effort，绝不阻塞切换主链路）──────
+  // 三个 Bot 实例都注册；只有「错误所在会话归属于本 Bot」的实例才发消息（ownsLoopSession
+  // 过滤），因此一次全局切换只会产生一条通知。sessionID 为空（罕见）时由 primary 兜底。
+  try {
+    registerProxyNotifier(BOT_ID, async (e) => {
+      if (e.sessionID) {
+        if (!ownsLoopSession(e.sessionID)) return
+      } else if (BOT_ID !== "primary") {
+        return
+      }
+      const chat = pushChatResolve()
+      if (!chat) return
+      // R720：双管齐下 —— 锁定质量监控触发的切换（reason=lock-quality）用不同文案
+      const quality = e.reason === "lock-quality"
+      // R722：按「锁定是否已确认生效」如实描述（detail 来自切换结果：;lock-ok;now-ok@Ns /
+      // ;now-pending:… / ;now-abort:…）——用户实报「锁定之后其实并没有实际切换」，卡片不能再
+      // 在未确认时声称已切换。
+      const detail = e.detail ?? ""
+      const nowOk = detail.includes("now-ok")
+      const nowPending = detail.includes("now-pending") || detail.includes("now-abort")
+      const lockLine = nowOk
+        ? "🔐 已锁定并确认生效（流量已走新节点）；/proxy unlock 可解锁回自动"
+        : nowPending
+          ? "🔐 已锁定新节点（mihomo 正在完成选优，通常数秒内自动切过去）；/proxy unlock 可解锁"
+          : "🔐 已用 Clash 内置锁定钉住新节点（不再自动改选）；/proxy unlock 可解锁回自动"
+      const lines = [
+        quality ? "🔀 <b>代理已自动切节点</b>（锁定节点质量下降）" : "🔀 <b>代理已自动切节点</b>（网络类错误触发）",
+        `${htmlEsc(e.from || "?")} → <b>${htmlEsc(e.to)}</b>`,
+        lockLine,
+        quality
+          ? "触发：原锁定节点失活或延迟超阈值（400ms）"
+          : e.reason
+            ? `触发错误：<code>${htmlEsc(e.reason)}</code>`
+            : "",
+        e.sessionID ? `会话：${sessionTag(e.sessionID)}` : "",
+      ].filter(Boolean)
+      await sendTextRaw(chat, lines.join("\n"), undefined, false)
+      await log("info", `proxy auto-switch notified (bot=${BOT_ID}, ${sanitizeLog(e.from)} -> ${sanitizeLog(e.to)})`)
+    })
+  } catch (err) {
+    await log("warn", `proxy-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
+  }
+
+  // ── R720（用户指令「…似乎不会自动切换到锁定的，应该双管齐下」）：锁定质量监控 ──────
+  // 双管齐下 = 内置锁定（🔐 钉住当前节点）＋ 自动切换（节点掉质量仍会换到更优节点并重锁）。
+  // 仅 primary 实例跑（三实例重复探测无意义；切换本身另有跨实例落盘冷却闸）；
+  // 首次 90s 后、此后每 180s 一次。常态（health/未锁定/冷却）静默，只有真切换或异常才记一行。
+  if (BOT_ID === "primary") {
+    const lockWatchTick = async () => {
+      try {
+        const res = await watchLockedQuality()
+        if (res.startsWith("quality->") || res.startsWith("error") || res.startsWith("group-failed")) {
+          await log("info", `proxy-lock-watch: ${res}`)
+        }
+      } catch {
+        /* 永不抛 */
+      }
+    }
+    // R721：热重载护栏 —— 旧实例闭包不会自动消亡（全靠 GEN_KEY 换代检查自灭）。
+    // 无护栏时每次重载残留一个 180s 空转 ticker（今天多轮重载 → 重复探测/切换风险）。
+    // 与 leaseWatch 同套路：发现自己已被取代就清掉自己的两个句柄。
+    let lwBoot: ReturnType<typeof setTimeout> | null = null
+    let lwTimer: ReturnType<typeof setInterval> | null = null
+    const lwGuard = (): boolean => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) {
+        if (lwBoot) {
+          try {
+            clearTimeout(lwBoot)
+          } catch {
+            /* ignore */
+          }
+        }
+        if (lwTimer) {
+          try {
+            clearInterval(lwTimer)
+          } catch {
+            /* ignore */
+          }
+        }
+        return false
+      }
+      return true
+    }
+    lwBoot = setTimeout(() => {
+      if (lwGuard()) void lockWatchTick()
+    }, 90_000)
+    lwTimer = setInterval(() => {
+      if (lwGuard()) void lockWatchTick()
+    }, 180_000)
+    await log("info", "proxy-lock-watch: enabled (locked-node quality guard, every 180s)")
+  }
+
   return {
     // R1487 回滚（用户指令：「就是你改的，快改回去」+「不要修改发送到服务器的请求」）：
     // 原先这里的 `tool: { shell: makeShellPromoTool(...) }` 走 V1 Hooks.tool 槽位，
@@ -10139,8 +10679,25 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
             }
           }
         }
-        // 压缩即清零（①）：compaction 事件到 → 水位置零，下条 assistant 重建
-        if (msgSid && takeCompacted(msgSid)) {
+        // 压缩即清零（①）：compaction 事件到 → 水位置零，下条 assistant 重建。
+        // R2369（用户实报「压缩的会话不对」）：旧的 `takeCompacted(msgSid)` 走的是
+        // `_v2compat` 的**模块级共享**一次性标志（三个 Bot 共用同一份 _v2compat），
+        // winner 未必拥有该会话 → 非拥有者清掉无意义的 ctxUsage 并把压缩卡发到自己的
+        // 聊天，拥有者反而被饿死（水位不清 + 通知漏发）。现在标记随事件
+        // `properties.compacted` 走，并**按会话归属**处理：只有把该会话作为自己的
+        // 前台/固定目标/已投递会话的实例才清水位并发卡（隔离模式；TG_SCOPE_TO_OWN_CHAT=0 退回共享）。
+        if (msgSid && (props as any).compacted === true) {
+          const scopeOwnC = process.env.TG_SCOPE_TO_OWN_CHAT !== "0"
+          const ownCompact =
+            !scopeOwnC || ownSessions.has(msgSid) ||
+            fixedTarget === msgSid || frontSessionID === msgSid || persistedFront === msgSid
+          if (!ownCompact) {
+            await log(
+              "info",
+              `compaction event for non-owned session ignored (bot=${BOT_ID}, sid=${sanitizeLog(msgSid).slice(0, 14)})`,
+            )
+            return
+          }
           // ⚠️ R1035：**必须在清零之前**取水位 —— 删掉就再也拿不到"压缩前占多少"。
           // 这一路是宿主**主动报**的 compaction 事件（tap 从 sqlite 的 compaction 行合成），
           // 是三条探测里**最可靠**的一条：api 探测可能取不到时间戳而静默跳过，
@@ -10212,3 +10769,4 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     },
   }
 }
+

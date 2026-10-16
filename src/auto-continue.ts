@@ -2,6 +2,8 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict } from "./_v2compat"
+// R2496：可选功能——网络类 provider 错误（ECONNRESET / 速率限制等）时，自动切换代理节点。
+import { maybeSwitchProxyNode } from "./proxy-switch"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
@@ -11,6 +13,7 @@ import { AUTO_INJECT_HINT } from "./turn-end-note"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
+// R2607：仅作**窗口表不可用**时的兜底分母（旧行为）；每会话真实窗口经 resolveContextWindow 解析。
 const CONTEXT_WINDOW = 1_048_576
 const COMPACT_THRESHOLD = 0.7
 const COMPACT_EVERY = 450
@@ -565,6 +568,40 @@ const readCompactPrefs = (): { auto: boolean; threshold: number } => {
     return { auto: true, threshold: COMPACT_THRESHOLD }
   }
 }
+
+// R2607（用户指令：纠正会话长度计算与自动压缩）：
+// 每会话**真实模型窗口**解析。tg-bridge 抓取的窗口表（provider.list / HttpApi /api/model）
+// 经 globalThis + 落盘文件双通道共享给本模块（同进程不同模块实例，不能直接 import）。
+// 此前 maybeCompact 一律除以硬编码 1M：200k/262k 模型的 70% 阈值被算松 5 倍
+// （真实 140k 只算 13.4%），自动压缩形同虚设 —— 与 tg-bridge 界面「窗口未知就显示 ?」
+// 的诚实口径直接矛盾。表不可用时回退 1M（保持旧行为，避免误压还有 headroom 的会话）。
+const MODEL_WINDOWS_PATH = "REDACTED_ROOT/.config/opencode/model-windows.json"
+export const resolveContextWindow = (modelID: string, providerID: string): number | null => {
+  const mid = String(modelID ?? "")
+  const pid = String(providerID ?? "")
+  if (!mid) return null
+  const key = `${pid}/${mid}`
+  try {
+    const g = (globalThis as Record<string, unknown>).__oc_model_windows__ as { windows?: Record<string, number> } | undefined
+    const v = Number(g?.windows?.[key])
+    if (Number.isFinite(v) && v > 0) return v
+  } catch {
+    /* ignore */
+  }
+  try {
+    const j = JSON.parse(readFileSync(MODEL_WINDOWS_PATH, "utf8")) as { windows?: Record<string, number> }
+    const v = Number(j?.windows?.[key])
+    if (Number.isFinite(v) && v > 0) return v
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+// R2607：token 全量口径（与 tg-bridge ctxTotal 一致的 in+out+rea+cr+cw）。
+export const tokenSumOf = (tk: any): number => {
+  const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0)
+  return n(tk?.input) + n(tk?.output) + n(tk?.reasoning) + n(tk?.cache?.read) + n(tk?.cache?.write)
+}
 const LOOP_USER_MARKERS = ["筛查循环", "自动筛查"]
 const STATUS_RE = /\[\s*STATUS\s*:/
 const isLoopControlUserText = (t: string): boolean =>
@@ -621,6 +658,14 @@ const errorName = (m: AssistantMessage): string => {
   const e = m?.error as any
   if (!e || typeof e !== "object") return "unknown"
   return String(e.name ?? e.type ?? "unknown")
+}
+
+// R2496：取错误文案（用于网络类错误匹配，触发自动切节点）。
+const errorText = (m: AssistantMessage): string => {
+  const e = m?.error as any
+  if (!e) return ""
+  if (typeof e === "string") return e
+  return String(e.message ?? e.data?.message ?? "")
 }
 
 const isAbortSignal = (e: any): boolean => {
@@ -1004,14 +1049,25 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     const TH = prefsCache.threshold
     const last = lastCompactCount.get(sessionID) ?? 0
     // 窗口口径必须是「最近一次请求的输入」，不是生命周期累计。
-    // session_v2.tokens_* 在当前宿主是累计值（f339 已 16.1M），拿它比 1M 窗口
+    // session_v2.tokens_* 在当前宿主是累计值（f339 已 16.1M），拿它比窗口
     // 会永远判超限 → 每 30 分钟撞一次注定失败的压缩。事件口径才是真实窗口。
     let u = Number(usage)
     let uSrc = "event"
+    // R2607（用户指令）：分母 = **该会话模型的真实窗口**（tg-bridge 抓取 → globalThis/文件共享）；
+    // 拿不到表时才回退 1M（旧行为）。此前一律 1M：200k 模型真实 70%（140k）只算 13.4%，
+    // 自动压缩几乎永不触发。
+    let dbRow: { input: number; output: number; reasoning: number; modelID: string; providerID: string } | null = null
+    try {
+      dbRow = await readSessionUsage(sessionID)
+    } catch {
+      /* keep event value */
+    }
+    const realWin = dbRow ? resolveContextWindow(dbRow.modelID, dbRow.providerID) : null
+    const win = realWin ?? CONTEXT_WINDOW
     // R-pending：口径守卫（与 tg-bridge 同族）。事件 input 被宿主报成寿命累计值时
-    // u > CONTEXT_WINDOW（单次调用输入不可能超过模型窗口）→ 判为累计值，丢弃并退回 ledger。
+    // u > win（单次调用输入不可能超过模型窗口）→ 判为累计值，丢弃并退回 ledger。
     let rejectedLifetime = false
-    if (Number.isFinite(u) && u > CONTEXT_WINDOW) {
+    if (Number.isFinite(u) && u > win) {
       rejectedLifetime = true
       ctxLifetimeRejected++
       if (ctxLifetimeRejected <= 5 || ctxLifetimeRejected % 50 === 0) {
@@ -1021,14 +1077,13 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
         // 看到 10 条 error 而白查一轮（真问题只有 0 条）。日志文本保持可 grep。
         await log(
           "info",
-          `auto-continue: ctx usage rejected (lifetime counter, not window): sid=${sanitizeLog(sessionID).slice(0, 12)} u=${Math.round(u)} win=${CONTEXT_WINDOW} (rejected x${ctxLifetimeRejected})`
+          `auto-continue: ctx usage rejected (lifetime counter, not window): sid=${sanitizeLog(sessionID).slice(0, 12)} u=${Math.round(u)} win=${win}${realWin ? "" : " (fallback)"} (rejected x${ctxLifetimeRejected})`
         )
       }
     }
-    try {
-      const db = await readSessionUsage(sessionID)
-      const cum = db ? db.input + db.output + db.reasoning : 0
-      if ((!(u > 0) || rejectedLifetime) && cum > 0 && cum < CONTEXT_WINDOW) {
+    {
+      const cum = dbRow ? dbRow.input + dbRow.output + dbRow.reasoning : 0
+      if ((!(u > 0) || rejectedLifetime) && cum > 0 && cum < win) {
         u = cum
         uSrc = rejectedLifetime ? "ledger(rejected)" : "ledger"
       } else if (rejectedLifetime) {
@@ -1036,15 +1091,13 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
         u = 0
         uSrc = "rejected"
       }
-    } catch {
-      /* keep event value */
     }
-    if (Number.isFinite(u) && u > 0 && u / CONTEXT_WINDOW >= TH) {
+    if (Number.isFinite(u) && u > 0 && u / win >= TH) {
       if (compactUnavailableNow()) {
         // 超阈值但本宿主没有压缩入口：只提示一次，随后交给宿主自身自动压缩。
         if (!ctxWarned.has(sessionID)) {
           ctxWarned.add(sessionID)
-          const pctNow = Math.round((u / CONTEXT_WINDOW) * 100)
+          const pctNow = Math.round((u / win) * 100)
           await log(
             "info",
             `auto-continue: WARN ctx=${pctNow}% >= ${Math.round(TH * 100)}% but compact unavailable in this host; relying on host auto-compaction`
@@ -1056,7 +1109,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       if (Date.now() - lastTry < COMPACT_RETRY_MS) return
       lastCompactAttempt.set(sessionID, Date.now())
       lastCompactCount.set(sessionID, assistantCount)
-      const usagePct = Math.round((u / CONTEXT_WINDOW) * 100)
+      const usagePct = Math.round((u / win) * 100)
       if (await compactNow(sessionID, `ctx=${usagePct}% >= ${Math.round(TH * 100)}%`)) resetSessionTokens(sessionID)
       return
     }
@@ -1076,12 +1129,23 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     }
     const nxtMsg = last === 0 ? STALL_SESSION_MSGS : last + COMPACT_EVERY
     const uTxt =
-      Number.isFinite(u) && u > 0 ? ((u / CONTEXT_WINDOW) * 100 < 1 ? "<1%" : `${Math.min(100, Math.round((u / CONTEXT_WINDOW) * 100))}%`) : "unknown"
+      Number.isFinite(u) && u > 0 ? ((u / win) * 100 < 1 ? "<1%" : `${Math.min(100, Math.round((u / win) * 100))}%`) : "unknown"
     const compactNote = compactUnavailableNow() ? " (compact unavailable: /migrate instead)" : ""
     await log(
       "info",
-      `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} ctx=${uTxt} src=${uSrc} (next compact ~${nxtMsg} msgs, no compact)${compactNote}`
+      `auto-continue: eval session=${sanitizeLog(sessionID)} msgs=${assistantCount} ctx=${uTxt} win=${win}${realWin ? "" : "(fb)"} src=${uSrc} (next compact ~${nxtMsg} msgs, no compact)${compactNote}`
     )
+  }
+
+  // R2607：usage 取值兜底链与 ctxTotal 口径对齐（避免 `msg.tokens.input` 单值口径
+  // 把界面 21% 报成 <1% 的老问题）；usage 表 → 消息 tokens 全量 → step tokens 全量 → 0。
+  const usageOf = (sid: string, msg: any): number => {
+    const u = usage.get(sid)
+    if (typeof u === "number" && u > 0) return u
+    const s = tokenSumOf(msg?.tokens)
+    if (s > 0) return s
+    const st = sessionTokens(sid)
+    return st.input + st.output + st.reasoning
   }
 
   const backoffMs = (attempts: number): number => {
@@ -1330,7 +1394,10 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           j = {}
         }
         try {
-          writeFileSync(ownerPath, JSON.stringify({ ...j, ac: { id: myAcId, ts: Date.now() } }), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
+          // R1849 同类缺口修复：tg-poll-owner.json 与 tg-bridge 的 claimPollOwner/amPollOwner
+          // 跨进程（多 Bot 进程）读写；裸 writeFileSync 的 O_TRUNC 窗口会让并发读者 parse 失败
+          // → 误判「无主」重复抢主 / 误判「无 ac 主」双实例各注入一次。改用 atomicWriteJson（tmp+rename）。
+          atomicWriteJson(ownerPath, { ...j, ac: { id: myAcId, ts: Date.now() } })
         } catch {
           /* best-effort */
         }
@@ -1413,13 +1480,13 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (m.info?.role === "assistant") {
           assistantCount++
           lastAssistant = { info: m.info, text: t, parts: Array.isArray(m.parts) ? m.parts : [] }
-          // 窗口占用 = input + cache.read。缓存命中的会话里 cache.read 才是大头
-          // （f339 实测 in=664 / cr=214k），只看 input 会把 21% 报成 <1%，
-          // 与 tg-bridge 的 ctx 后缀口径不一致，压缩阈值也因此失真。
+          // 窗口占用 = tokenSumOf = input+output+reasoning+cache.read+cache.write，
+          // 与 tg-bridge ctxTotal **五字段**完全一致（R2607 尾款：此前此处只算
+          // input+cache.read，而兜底路径 tokenSumOf 与界面都是五字段 → 同一会话
+          // eval% 比界面低 out+rea，压缩触发点两套口径各算各的）。cache.read 仍是
+          // 大头（f339 实测 in=664 / cr=214k），只看 input 会把 21% 报成 <1%。
           const tk = (m.info as any)?.tokens
-          const tIn = Number(tk?.input)
-          const tCr = Number(tk?.cache?.read)
-          const win = (Number.isFinite(tIn) ? tIn : 0) + (Number.isFinite(tCr) ? tCr : 0)
+          const win = tokenSumOf(tk)
           if (win > 0) usage.set(sessionID, win)
         }
         // 只有真实用户消息才能登记循环；助手报告和自动注入的 ROUND/RECOVER
@@ -1626,6 +1693,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
 
       if (msg.error) {
         settle(msg)
+        // R2496：可选功能——网络类 provider 错误（ECONNRESET/速率限制等）时自动切换代理节点。
+        // 默认关闭（proxy-switch.json enabled:false）；fire-and-forget，绝不阻塞本判定路径。
+        void maybeSwitchProxyNode({ name: errorName(msg), message: errorText(msg), sessionID, log })
         if (isFatal(msg)) {
           const n = errorName(msg)
           // R1548：ESC/宿主中断不再只认精确名 "MessageAbortedError"（host 实测写
@@ -1684,7 +1754,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             decided.delete(msg.id)
             return
           }
-          await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
+          await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
           settle(msg)
           const r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
           if (r !== "ok") {
@@ -1700,7 +1770,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           decided.delete(msg.id)
           return
         }
-        await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
+        await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
         settle(msg)
         const r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
         if (r !== "ok") {
@@ -1954,7 +2024,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       if (!(await injectAllowed(sessionID, msg, "round:normal"))) return
       emptyStreak.delete(sessionID)
-      await maybeCompact(sessionID, (usage.get(sessionID) ?? msg.tokens?.input ?? sessionTokens(sessionID).input ?? 0), assistantCount)
+      await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
 
       // 用户消息只影响当前回合；助手回合完成后仍继续自动循环。
       // 先认领后发送：并发 evaluate 在 await 间隙重入时，decided 已有记号，不会重复注入；失败则放回。
@@ -2108,10 +2178,10 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             return
           }
         }
+        // R2607 尾款：与 tg-bridge ctxTotal / tokenSumOf 统一为五字段口径
+        // （同文件另一处 usage.set 的注释详述缘由）。
         const tk = (info as any)?.tokens
-        const inWin = Number(tk?.input)
-        const crWin = Number(tk?.cache?.read)
-        const winNow = (Number.isFinite(inWin) ? inWin : 0) + (Number.isFinite(crWin) ? crWin : 0)
+        const winNow = tokenSumOf(tk)
         if (info?.role === "assistant" && sid && winNow > 0) {
           usage.set(sid, winNow)
         }
@@ -2138,3 +2208,4 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     },
   }
 }
+

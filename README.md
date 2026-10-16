@@ -15,6 +15,7 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | `src/bg-watch.ts` | 插件层「shell 跑超 N 秒强制转后台」的合规实现 |
 | `src/compact-notice.ts` | 「上下文已压缩」通知的文案判据（纯函数） |
 | `src/loop-guard.ts` | 循环「自动停止守卫」（检测到问题 / 网页搜索请求即停） |
+| `src/proxy-switch.ts` | 「切节点锁定」：provider 网络错误时经 mihomo 外部控制接口锁定/解锁节点（含锁定生效确认与质量巡检） |
 | `src/tabular.ts` | TG 等宽表格 / 键值列表渲染（纯函数，状态与诊断消息对齐用） |
 | `src/shell-promo.ts` | shell 结果晋升为后台任务卡的判据与文案 |
 | `src/abort-classify.ts` | 中止原因分类（用户中止 / 超时 / 宿主错误）与遥测字段 |
