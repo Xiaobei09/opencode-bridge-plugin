@@ -794,7 +794,10 @@ export const maybeSwitchProxyNode = async (args: {
 /**
  * R720（用户指令「切换节点应该使用锁定🔐…似乎不会自动切换到锁定的，应该双管齐下」）：
  * **锁定质量监控** —— 锁定（🔐 内置 fixed）与自动切换并存，双管齐下：
- *  · 未锁定/无 fixed（含 Selector：如 R830 起现网「手动选择」）→ not-locked / lock-unsupported，不做任何事；
+ *  · URLTest 未锁定（fixed=""）→ not-locked，不做任何事；
+ *  · R831：Selector 组（无 fixed 字段；R830 起现网「手动选择」）无独立锁概念——当当前选中
+ *    == 我方落盘选择（persisted.to）时视同"我方锁定"，复用同一质量监控（掉质量→同路径换节点并重选）；
+ *    外部（用户）手动改选（now≠落盘）→ external-select，尊重用户、不干预；
  *  · 锁定节点健康（可达且 delay ≤ probe.maxDelayMs，R2602 的 400ms 规则）→ ok:<节点>，静默；
  *  · 锁定节点失活/超阈 → 走与网络错误自动切换**同一条路径**（pickNextNode 有界窗口延迟
  *    选优 + 切后校验 + recordSwitch + TG 通知），并在新节点上重新锁定。
@@ -810,10 +813,20 @@ export const watchLockedQuality = async (): Promise<string> => {
     if (cfg.mode !== "clash") return "not-clash-mode"
     const g = await listGroup(cfg)
     if (!g.ok) return `group-failed:${g.reason ?? ""}`
-    if (g.fixed === undefined) return "lock-unsupported"
-    if (!g.fixed) return "not-locked"
+    // R831：Selector 组（无 fixed 字段；R830 起现网操作组 =「👋 手动选择」）——"锁定"语义
+    // = 选中即生效且粘滞。仅当当前选中 == 我方落盘选择（persisted.to）时视同"我方锁定"，
+    // 复用同一质量监控；外部（用户）改选 → external-select，尊重不干预。
+    let cur: string
+    if (g.fixed === undefined) {
+      const p0 = readLastSwitch()
+      if (!(p0 && p0.to && g.now === p0.to)) return "external-select"
+      cur = String(g.now ?? "")
+      if (!cur) return "no-selection"
+    } else {
+      if (!g.fixed) return "not-locked"
+      cur = g.fixed
+    }
     const now = Date.now()
-    const cur = g.fixed
     // R807：冷却/跨实例闸移到「换节点」分支 —— 只拦真正的新切换；补推（同目标重锁）与
     // 材料化检查不受闸（此前闸在函数顶部，锁后数分钟内的巡检全部被 cooldown 静默吞掉）。
     const persisted = readLastSwitch()
