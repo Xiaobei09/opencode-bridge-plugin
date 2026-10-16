@@ -9675,7 +9675,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const noteHostCompaction = async (
     sid: string,
     // R1035：加 "event" —— 宿主**主动报**的 compaction 事件（最可靠的一路）。
-    how: "api" | "ctxdrop" | "event",
+    // R724：加 "autoc" —— 自动循环压缩成功点经共享总线上报（唯一确知的自动压缩来源）。
+    how: "api" | "ctxdrop" | "event" | "autoc",
     atMs: number,
     before: number,
     after: number,
@@ -9724,6 +9725,65 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         `${compactLogDelta(before, after)}, result=${r.r}, at=${atMs})`,
     )
   }
+  // ── R724：压缩总线消费（15s 拍）────────────────────────────────────────
+  // auto-continue 的 compactNow 成功点把事件写到 globalThis `__oc_compaction_events__`
+  // （与 __oc_model_windows__ 同族：同进程模块无法直接互调，走全局总线）。
+  // 为什么必须补这一路：宿主 compaction 事件每事件只投一个 handler，非拥有者收到即丢
+  // （R722 实证「compaction event for non-owned session ignored」而拥有者无处理行）；
+  // API 时间戳会滞留、ctx 骤降依赖新样本 —— 自动压缩时三路都可能漏。此路 = 确知事件。
+  // 归属判据与 event 路逐字一致；多实例同时看到总线时以「先摘取者消费」避免重复发卡
+  // （单线程内 splice 原子）；去重与开关仍由 noteHostCompaction 统一兜底。
+  const COMPACTION_BUS_KEY = "__oc_compaction_events__"
+  const COMPACTION_BUS_TTL_MS = 10 * 60_000
+  const consumeCompactionBus = async (): Promise<void> => {
+    const G = globalThis as Record<string, unknown>
+    const arr = G[COMPACTION_BUS_KEY]
+    if (!Array.isArray(arr) || arr.length === 0) return
+    const nowMs = Date.now()
+    const claimed: Array<{ sid: string; at: number; reason: string }> = []
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const ev = arr[i] as { sid?: unknown; at?: unknown; reason?: unknown } | undefined
+      const sid = String(ev?.sid ?? "")
+      const at = Number(ev?.at ?? 0)
+      // TTL 丢弃：重启积压 / 换代太久的事件不再补发（避免"压缩卡穿越"）。
+      if (!sid.startsWith("ses_") || !Number.isFinite(at) || nowMs - at > COMPACTION_BUS_TTL_MS) {
+        arr.splice(i, 1)
+        continue
+      }
+      const scopeOwnB = process.env.TG_SCOPE_TO_OWN_CHAT !== "0"
+      const ownBus =
+        !scopeOwnB || ownSessions.has(sid) || fixedTarget === sid || frontSessionID === sid || persistedFront === sid
+      if (!ownBus) continue // 归属其他实例：留在总线里等它消费
+      arr.splice(i, 1)
+      claimed.push({ sid, at, reason: String(ev?.reason ?? "") })
+    }
+    for (const c of claimed) {
+      // 与 host event 路同款：压缩前水位 → 清零 → 尽力重建压缩后（拿不到就如实未知）。
+      const uBefore = ctxUsage.get(c.sid)
+      const beforeTotal = uBefore ? ctxTotal(uBefore) : 0
+      ctxUsage.delete(c.sid)
+      try {
+        await backfillCtxUsage(c.sid)
+      } catch {
+        /* best-effort：下一轮再试 */
+      }
+      const uAfter = ctxUsage.get(c.sid)
+      const rawAfter = uAfter ? ctxTotal(uAfter) : 0
+      const afterTotal = rawAfter > 0 && rawAfter < beforeTotal ? rawAfter : 0
+      await log(
+        "info",
+        `compaction bus (autoc): session=${sanitizeLog(c.sid).slice(0, 14)}, ` +
+          `reason=${sanitizeLog(c.reason).slice(0, 60)}, ${compactLogDelta(beforeTotal, afterTotal)}, at=${c.at}`,
+      )
+      await noteHostCompaction(c.sid, "autoc", c.at, beforeTotal, afterTotal)
+    }
+  }
+  setInterval(() => {
+    void (async () => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      await consumeCompactionBus()
+    })()
+  }, 15_000)
   setInterval(() => {
     void (async () => {
       if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return

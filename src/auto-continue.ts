@@ -1002,6 +1002,24 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
         `(session=${sanitizeLog(sessionID)}): ${sanitizeLog(why).slice(0, 140)}`,
     )
   }
+  // R724：压缩成功 → 共享总线（globalThis `__oc_compaction_events__`），供 tg-bridge 消费
+  // 补发「上下文已压缩」卡。为什么要总线：宿主事件路每事件只投一个 handler（非拥有者收到
+  // 就丢）、API 路时间戳可能滞留、ctx 骤降路依赖回填样本 —— R722 实证三路在自动压缩时全漏。
+  // compactNow 成功点是**唯一确知压缩发生**的位置。消费侧做会话归属判据 + 180s/会话去重
+  // （与其它三路互斥）；事件带 TTL，重启积压不补发。best-effort：失败不阻断压缩主链。
+  const publishCompactionEvent = (sessionID: string, reason: string): void => {
+    try {
+      const G = globalThis as Record<string, unknown>
+      const arr: Array<Record<string, unknown>> = Array.isArray(G.__oc_compaction_events__)
+        ? (G.__oc_compaction_events__ as Array<Record<string, unknown>>)
+        : []
+      arr.push({ sid: sessionID, at: Date.now(), reason: String(reason).slice(0, 80) })
+      while (arr.length > 20) arr.shift()
+      G.__oc_compaction_events__ = arr
+    } catch {
+      /* best-effort */
+    }
+  }
   const compactNow = async (sessionID: string, reason: string): Promise<boolean> => {
     // 宿主未开放压缩入口时直接放弃：compat 已经打过一次原因日志，
     // 这里再报错只会每次评估刷一行噪音（陈旧实例/边界评估都会触发）。
@@ -1013,6 +1031,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
         try {
           await base.post({ url: `/api/session/${encodeURIComponent(sessionID)}/compact` })
           await log("info", `auto-continue: compacted session=${sanitizeLog(sessionID)} (${reason})`)
+          publishCompactionEvent(sessionID, reason)
           return true
         } catch (err) {
           await log("error", `auto-continue: compact via _client failed: ${sanitizeLog(err).slice(0, 160)}`)
@@ -1022,6 +1041,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       if (typeof compatCompact === "function") {
         await compatCompact({ path: { id: sessionID } })
         await log("info", `auto-continue: compacted session=${sanitizeLog(sessionID)} (${reason})`)
+        publishCompactionEvent(sessionID, reason)
         return true
       }
       if (!base?.post) {
@@ -1030,6 +1050,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
       }
       await base.post({ url: `/api/session/${encodeURIComponent(sessionID)}/compact` })
       await log("info", `auto-continue: compacted session=${sanitizeLog(sessionID)} (${reason})`)
+      publishCompactionEvent(sessionID, reason)
       return true
     } catch (err) {
       if (isCompactUnsupported(err)) {

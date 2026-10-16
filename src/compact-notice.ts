@@ -15,7 +15,7 @@
  * 另：百分比一律经 pctOf(window) 算，window 未知时给 "?"，不给 0%。
  */
 
-export type CompactHow = "api" | "ctxdrop" | "event"
+export type CompactHow = "api" | "ctxdrop" | "event" | "autoc"
 
 export const fmtK = (n: number): string => {
   const v = Number.isFinite(Number(n)) ? Number(n) : 0
@@ -47,6 +47,7 @@ export const compactLogDelta = (before: number, after: number): string =>
 export const compactHowLine = (how: CompactHow, exact: string): string => {
   if (how === "api") return `压缩接口报告的时间：${exact}`
   if (how === "event") return `<i>宿主直接报告了压缩事件（最可靠的信号）—— 压缩后的水位由下一条回复重建。</i>`
+  if (how === "autoc") return `<i>自动循环触发了这次压缩（成功确认）—— 压缩后的水位由后续样本重建。</i>`
   return `<i>这次是靠 ctx 骤降发现的 —— 压缩接口没报这个事件（已记进日志，属接口漏报）。</i>`
 }
 
