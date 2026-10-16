@@ -745,6 +745,8 @@ export const readStatus = async (): Promise<{
 
 let lastSwitchAt = 0
 let switchTimes: number[] = []
+/** R895：slot-busy 日志静默窗口（配额封顶期每次错误尝试各记一行 → 噪音；首记+每 5min 至多一次）。 */
+let lastSlotBusyLogAt = 0
 // R722：锁定节点“健康但未被选中（now≠fixed）”的连续巡检计数（先补推一次 PUT，再无效则换节点）。
 const ineffectiveStrikes = new Map<string, number>()
 // R807（用户实报「锁定之后其实并没有实际切换」）：PUT 锁定后 `now` 跟随的材料化窗口。
@@ -836,7 +838,11 @@ export const maybeSwitchProxyNode = async (args: {
     }
     if (!claimAutoSwitchSlot(cfg)) {
       lastSwitchAt = now
-      if (cfg.log) await args.log("info", `proxy-switch: slot-busy (跨实例在途/全局配额满，放弃本次) err=${args.name ?? ""}`)
+      // R895：静默窗口——封顶期错误每分钟级，全量记行会刷屏；首记 + 每 5min 至多一次。
+      if (cfg.log && now - lastSlotBusyLogAt > 300_000) {
+        lastSlotBusyLogAt = now
+        await args.log("info", `proxy-switch: slot-busy (跨实例在途/全局配额满，放弃本次) err=${args.name ?? ""}`)
+      }
       return
     }
     lastSwitchAt = now
