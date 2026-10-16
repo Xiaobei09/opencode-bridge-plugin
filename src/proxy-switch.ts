@@ -343,7 +343,7 @@ const apiDelete = (cfg: ProxySwitchCfg, path: string): Promise<RunRes> =>
  */
 export const listGroup = async (
   cfg: ProxySwitchCfg,
-): Promise<{ ok: boolean; reason?: string; now?: string; all?: string[]; cands?: string[]; fixed?: string }> => {
+): Promise<{ ok: boolean; reason?: string; now?: string; all?: string[]; cands?: string[]; fixed?: string; type?: string }> => {
   const r = await apiGet(cfg, `/proxies/${encodeURIComponent(cfg.group)}`)
   if (!r.ok) return { ok: false, reason: `get-failed:${(r.err || r.out).slice(0, 160)}` }
   let g: any = null
@@ -358,7 +358,7 @@ export const listGroup = async (
   const cands = base.filter((n) => !isDirectName(cfg, n))
   // R719b：fixed 字段存在性也要保真（旧内核无此字段 → undefined，而非 ""）
   const fixed = typeof g?.fixed === "string" ? String(g.fixed) : undefined
-  return { ok: true, now, all, cands, fixed }
+  return { ok: true, now, all, cands, fixed, type: String(g?.type ?? "") }
 }
 
 // ── R2559 可达性探测（方案 A/B） ─────────────────────────────────────────────
@@ -640,7 +640,18 @@ export const setNodeLock = async (cfg: ProxySwitchCfg, on: boolean): Promise<str
     if (cfg.mode !== "clash") return "unsupported-in-command-mode"
     const g = await listGroup(cfg)
     if (!g.ok) return `pick-failed:${g.reason ?? ""}`
-    if (g.fixed === undefined) return "lock-unsupported" // 旧内核不暴露 fixed 字段
+    if (g.fixed === undefined) {
+      // R832：Selector 型组（无独立 fixed 字段；R830 起现网操作组「👋 手动选择」）——
+      // 语义 = 选中即锁定（粘滞、不被组自测改选）。on=true：重申选中（PUT 同名，零扰动）；
+      // on=false：**不发 DELETE**（对 Selector 的 unfix 行为未定义，安全化=不动），由 UI 说明。
+      if (String(g.type ?? "") !== "Selector") return "lock-unsupported" // 旧内核/非 Selector：维持原判定
+      const curS = g.now ?? ""
+      if (!curS) return "no-current"
+      if (!on) return `unlock-na-selector:${curS}`
+      const putS = await apiPut(cfg, `/proxies/${encodeURIComponent(cfg.group)}`, JSON.stringify({ name: curS }))
+      if (!putS.ok) return `put-failed:${(putS.err || putS.out).slice(0, 160)}`
+      return `locked-selector:${curS}`
+    }
     if (on) {
       const cur = g.now ?? ""
       if (!cur) return "no-current"
@@ -670,6 +681,8 @@ export const readStatus = async (): Promise<{
   cands?: string[]
   /** R719b：mihomo 内置锁定状态（非空=已锁定到该节点；空=自动；undefined=旧内核不支持）。 */
   fixed?: string
+  /** R832：分组类型（Selector/URLTest…），供锁语义与文案判定。 */
+  groupType?: string
   locked?: boolean
   last: ProxyLastSwitch | null
 }> => {
@@ -679,7 +692,7 @@ export const readStatus = async (): Promise<{
   try {
     const g = await listGroup(cfg)
     if (!g.ok) return { ok: false, reason: g.reason, cfg, last }
-    return { ok: true, cfg, now: g.now, all: g.all, cands: g.cands, fixed: g.fixed, locked: g.fixed !== undefined ? g.fixed !== "" : undefined, last }
+    return { ok: true, cfg, now: g.now, all: g.all, cands: g.cands, fixed: g.fixed, locked: g.fixed !== undefined ? g.fixed !== "" : undefined, groupType: g.type, last }
   } catch (e) {
     return { ok: false, reason: String(e).slice(0, 160), cfg, last }
   }

@@ -6837,7 +6837,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         pLast ? `最近切换：${htmlEsc(pLast.from || "?")} → ${htmlEsc(pLast.to)}（${pLast.via === "auto" ? "自动" : "手动"}）` : "最近切换：（无记录）",
         "",
         "只放代理/切节点。出现网络类错误（ECONNRESET / 速率限制）时自动切下一个节点。",
-        "🔐 锁定 = Clash 内置锁定：锁定后健康检查不再改选、不漂移；🔓 解锁回「延迟选优」自动。",
+        "🔐 锁定 = 「手动选择」选中即锁定（粘滞不漂移）；URLTest 组用内置 fixed 锁定。🔓 解锁仅对 fixed 型有意义。",
         "点按钮切换；候选清单与指定节点见 /proxy list、/proxy &lt;名字&gt;。",
       ].join("\n")
     }
@@ -8129,7 +8129,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (res === "unlocked") return "[tg-bridge] 🔓 已解锁：回到「延迟选优」自动模式（节点可能随自动选优变化）"
         if (res.startsWith("lock-verify-failed:")) return `[tg-bridge] ⚠️ 锁定读回校验失败：目标 ${res.slice("lock-verify-failed:".length)}（PUT 成功但 fixed 未落下，请在 Clash 面板确认）`
         if (res === "unlock-verify-failed") return "[tg-bridge] ⚠️ 解锁读回校验失败：fixed 仍非空，请重试或到 Clash 面板手动解锁"
-        if (res === "lock-unsupported") return "[tg-bridge] ⚠️ 当前内核读不到 fixed 字段：不支持锁定（旧版 mihomo）"
+        // R832：Selector 型组（手动选择）—— 选中即锁定；无 fixed 字段。
+        if (res.startsWith("locked-selector:")) return `[tg-bridge] 🔐 已锁定/保持：${res.slice("locked-selector:".length)}（手动选择组：选中即锁定，无独立 fixed 字段）`
+        if (res.startsWith("unlock-na-selector:")) return `[tg-bridge] ℹ️ 当前分组为「手动选择」：选中即保持，无"解锁回自动"概念（未做改动；当前：${res.slice("unlock-na-selector:".length)}）`
+        if (res === "lock-unsupported") return "[tg-bridge] ⚠️ 该分组无独立锁定字段（旧内核/非 Selector 组）：不支持锁定"
         if (res === "no-current") return "[tg-bridge] ⚠️ 当前没有可锁定的节点（分组尚未选择任何节点）"
         return `[tg-bridge] ⚠️ 切换未完成：${res}`
       }
@@ -8146,7 +8149,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           lines.push(`当前节点：${st.now || "(未知)"}`)
           // R719b：mihomo 内置锁定状态（PUT=锁定、DELETE=解锁；用户点名的 🔐 功能）
           lines.push(
-            `锁定：${st.locked === undefined ? "（本内核不暴露 fixed 字段，不支持查询）" : st.locked ? `🔐 已锁定到 ${st.fixed}` : "🔓 未锁定（延迟选优自动模式）"}`,
+            `锁定：${
+              st.locked === undefined
+                ? st.groupType === "Selector"
+                  ? "—（手动选择型分组：选中即锁定，无独立字段）"
+                  : "（本内核不暴露 fixed 字段，不支持查询）"
+                : st.locked
+                  ? `🔐 已锁定到 ${st.fixed}`
+                  : "🔓 未锁定（延迟选优自动模式）"
+            }`,
           )
           lines.push(`候选节点：${(st.cands ?? []).length} 个${cfg.nodes.length ? `（配置固定 ${cfg.nodes.length} 个）` : "（分组全部非直连）"}`)
         } else {
