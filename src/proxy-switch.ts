@@ -208,8 +208,11 @@ const isDirectName = (cfg: ProxySwitchCfg, n: string): boolean =>
   cfg.excludePatterns.some((p) => p && n.includes(p))
 
 // ── 原子写（tmp+rename）：与 tg-bridge/_v2compat 同套路，避免读到半截文件。 ──
+let atomicSeq = 0
 const atomicWrite = (path: string, data: string): void => {
-  const tmp = `${path}.tmp.${process.pid}`
+  // R772：同进程多实例（快照 tg-bridge / 活载 auto-continue）并发写同一 path 时，tmp 名带进程号会互撞；
+  // 追加单调序号隔离，防交叉内容经 rename 落盘（守卫依赖本文件判"我方锁"，完整性格外重要）。
+  const tmp = `${path}.tmp.${process.pid}.${++atomicSeq}`
   writeFileSync(tmp, data, { mode: 0o600 })
   renameSync(tmp, path)
 }
@@ -727,6 +730,15 @@ export const maybeSwitchProxyNode = async (args: {
             if (!alive) {
               await new Promise((r) => setTimeout(r, 1200))
               alive = (await probeNode(cfg, lockName)).ok
+            }
+            // R772（现场：13:33:09 bot3 把我方 auto-continue 并发刚切的 NL-223 误判为"外部锁"并 hold
+            // ——其进闸早于对方 record 落盘，own 读到旧记录）：并发竞态修补——探测耗时（≥列表+1~2 次
+            // 探测，~1s+）后**终读**一次落盘：若 fixed 已与我方记录一致 → 判我方（防误判 + 防双切），
+            // 静默跳过并置节流。
+            if ((readLastSwitch()?.to ?? "") === lockName) {
+              lastSwitchAt = now
+              if (cfg.log) await args.log("info", `proxy-switch: own-late-confirm:${lockName.slice(0, 44)} (并发我方锁，跳过) err=${args.name ?? ""}`)
+              return
             }
             if (!alive) {
               if (cfg.log) await args.log("info", `proxy-switch: user-lock-dead:${lockName.slice(0, 44)} -> 代切 err=${args.name ?? ""}`)

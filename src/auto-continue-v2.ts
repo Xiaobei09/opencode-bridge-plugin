@@ -26,3 +26,5 @@ export default v2Bridge("auto-continue", (client) =>
 // reload(content) 1792126065 R724 compaction-bus-publish
 
 // reload(content) 1792156571 R768 user-lock-respect-guard
+
+// reload(content) 1792157825 R772 own-switch-race-fix
