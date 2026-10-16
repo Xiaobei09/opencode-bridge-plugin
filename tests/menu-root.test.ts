@@ -11,16 +11,16 @@ const flat = (view: string, opts: Parameters<typeof buildMenuKeyboard>[1] = {}):
 
 // R231 菜单整理（小步1：根菜单）：对着**真定义**检查，避免"测试抄字面量、真菜单坏了溜过去"。
 describe("根菜单整理", () => {
-  it("根菜单 3 行 × 2 键，末行不再孤悬单个按钮", () => {
+  it("根菜单 4 行 × 2 键（R2498 代理/配置行入列），末行不再孤悬单个按钮", () => {
     const r = rows("root")
-    expect(r).toHaveLength(3)
+    expect(r).toHaveLength(4)
     for (const row of r) expect(row).toHaveLength(2)
   })
 
-  it("五个分页入口齐备，且后台/系统不再同图标", () => {
+  it("分页入口齐备（含代理/切节点），且后台/系统不再同图标", () => {
     const f = flat("root")
     const data = f.map((x) => x.callback_data)
-    for (const v of ["m:sess", "m:push", "m:loop", "m:bg", "m:sys"]) {
+    for (const v of ["m:sess", "m:push", "m:loop", "m:bg", "m:sys", "m:proxy"]) {
       expect(data).toContain(v)
     }
     const bg = f.find((x) => x.callback_data === "m:bg")
@@ -39,7 +39,7 @@ describe("根菜单整理", () => {
   })
 
   it("所有视图的 ma: 动作均有映射（回归防护）", () => {
-    for (const view of ["root", "sess", "push", "loop", "bg", "sys"]) {
+    for (const view of ["root", "sess", "push", "loop", "bg", "proxy", "sys"]) {
       for (const btn of flat(view)) {
         if (btn.callback_data.startsWith("ma:")) {
           const key = btn.callback_data.slice(3)
@@ -97,7 +97,7 @@ describe("根菜单整理", () => {
 // 不存在的视图（点下去只回"未知动作/无反应"）。这是对**真实菜单枚举**的钉死，
 // 而不是抄一份前缀白名单。
 describe("菜单回调完整性（R1908）", () => {
-  const VIEWS = ["root", "sess", "push", "loop", "bg", "sys"]
+  const VIEWS = ["root", "sess", "push", "loop", "bg", "proxy", "sys"]
   // handleCallback(data.split(":")) 实际分派的前缀（见 tg-bridge.ts 的 parts[0] 分支）
   const HANDLED_PREFIXES = new Set(["m", "ma", "flt", "use", "stop", "retry", "qpin", "full", "fold", "qa", "qfree", "q"])
 
