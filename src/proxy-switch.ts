@@ -6,6 +6,10 @@
 //    `secret: <REDACTED>`。裸节点挂在 `👋 手动选择`（49 个）与 `⚡️ 延迟选优`（URLTest，49 个）下；直连类是 `🌐 全局直连` / `🇨🇳 直连 | *`（要排除）。
 //  · R2606（用户指令 2026-10-15）：「代理在延迟选优组中选择！！！不是手动选择组」——
 //    操作组由 `👋 手动选择` 改为 `⚡️ 延迟选优`（根组 `🚀 节点选择` 指向它）；手动组不再由本桥操作。
+//  · R830（用户指令 2026-10-17）：「改回到在手动选择列表中选择代理」——**反转 R2606**：
+//    操作组改回 `👋 手动选择`（Selector；PUT=选中即生效，无两段式等待）；根组 `🚀 节点选择`
+//    已实测改指回它（2026-10-16 17:1xZ：PUT→204、now 即时=目标）；Selector 无 fixed（锁定校验
+//    自动跳过）。注：下文旧注释中「延迟选优」多为历史措辞。
 //    实测 mihomo 支持对 URLTest 组 PUT 指定节点：HTTP 204 且 `now` 随之变化（可钉住）。
 //  · 插件运行在 **WSL**，WSL2 为 NAT 模式，**连不到** Windows 的 `127.0.0.1:9090`；
 //    但可用 Windows 自带的 `curl.exe`（经 WSL 互操作在 Windows 上下文执行）访问该环回接口。
@@ -66,7 +70,7 @@ export interface ProxySwitchCfg {
   endpoint: string
   /** 控制接口密钥（Bettbox 生成）。 */
   secret: string
-  /** 要操作的分组（Selector / URLTest 均可；其 all 里含裸节点）。R2606：现网 = `⚡️ 延迟选优`（URLTest，PUT 实测 204）。 */
+  /** 要操作的分组（Selector / URLTest 均可；其 all 里含裸节点）。R830（反转 R2606）：现网 = `👋 手动选择`（Selector；PUT→204、now 即时生效、无 fixed 字段）。 */
   group: string
   /** 可选：把该顶层分组的当前选择也指向 group，使"指定节点"真正对流量生效。空=不动。 */
   setRoot: string
@@ -99,7 +103,7 @@ export const defaultProxySwitchCfg: ProxySwitchCfg = {
   mode: "clash",
   endpoint: "http://127.0.0.1:9090",
   secret: "",
-  group: "⚡️ 延迟选优",
+  group: "👋 手动选择",
   setRoot: "",
   nodes: [],
   excludePatterns: ["DIRECT", "REJECT", "直连", "🌐"],
@@ -790,7 +794,7 @@ export const maybeSwitchProxyNode = async (args: {
 /**
  * R720（用户指令「切换节点应该使用锁定🔐…似乎不会自动切换到锁定的，应该双管齐下」）：
  * **锁定质量监控** —— 锁定（🔐 内置 fixed）与自动切换并存，双管齐下：
- *  · 未锁定 → not-locked，不做任何事（URLTest「延迟选优」自己在优化）；
+ *  · 未锁定/无 fixed（含 Selector：如 R830 起现网「手动选择」）→ not-locked / lock-unsupported，不做任何事；
  *  · 锁定节点健康（可达且 delay ≤ probe.maxDelayMs，R2602 的 400ms 规则）→ ok:<节点>，静默；
  *  · 锁定节点失活/超阈 → 走与网络错误自动切换**同一条路径**（pickNextNode 有界窗口延迟
  *    选优 + 切后校验 + recordSwitch + TG 通知），并在新节点上重新锁定。
