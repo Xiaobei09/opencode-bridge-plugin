@@ -758,6 +758,16 @@ export const maybeSwitchProxyNode = async (args: {
         /* 读组失败不阻断切换（宁可行开朗） */
       }
     }
+    // R773（现场：13:42:32.788 auto-continue 与 13:42:35.332 bot3 双切同目标 NL-223、双通知×2——
+    // 双方闸检查均在对方 record 落盘前通过；TOCTOU 残余第二次现场）：**竞态缩窗复检**——走到这里
+    // 已耗时 ~1-3s（listGroup/守卫/选路），期间另一实例可能已完成切换并落盘。动手前终读一次：
+    // 落盘时间晚于本次进入（now）→ 对方刚切，放弃本次（单波单切，防双切/双通知）。
+    const raced = readLastSwitch()
+    if (raced && raced.at > now) {
+      lastSwitchAt = now
+      if (cfg.log) await args.log("info", `proxy-switch: race-skip:${(raced.to ?? "").slice(0, 44)} (并发实例刚落盘，放弃本次) err=${args.name ?? ""}`)
+      return
+    }
     lastSwitchAt = now
     switchTimes.push(now)
     const res = await switchProxyNode(cfg, "auto", args.sessionID ?? "", args.name ?? "")
