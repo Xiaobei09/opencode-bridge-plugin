@@ -685,6 +685,10 @@ let lastSwitchAt = 0
 let switchTimes: number[] = []
 // R722：锁定节点“健康但未被选中（now≠fixed）”的连续巡检计数（先补推一次 PUT，再无效则换节点）。
 const ineffectiveStrikes = new Map<string, number>()
+// R807（用户实报「锁定之后其实并没有实际切换」）：PUT 锁定后 `now` 跟随的材料化窗口。
+// 口径 = 组内一轮健康检查跑完（源码口径上限 ~10 分钟，组越大越久；小测试组"≤20s"不具代表性）。
+// 窗口内 now≠fixed 属正常等待 → 巡检记 pending，不补推、不换节点（防误伤正常材料化）。
+const LOCK_MATERIALIZE_MS = 11 * 60_000
 
 /** 冷却 + 频率闸 + 错误匹配后，fire-and-forget 地切换一次。永不抛异常。 */
 export const maybeSwitchProxyNode = async (args: {
@@ -790,7 +794,9 @@ export const maybeSwitchProxyNode = async (args: {
  *  · 锁定节点健康（可达且 delay ≤ probe.maxDelayMs，R2602 的 400ms 规则）→ ok:<节点>，静默；
  *  · 锁定节点失活/超阈 → 走与网络错误自动切换**同一条路径**（pickNextNode 有界窗口延迟
  *    选优 + 切后校验 + recordSwitch + TG 通知），并在新节点上重新锁定。
- * 门闸与 maybeSwitchProxyNode 一致：enabled / 冷却（含跨实例落盘）/ 每小时上限。
+ * R807：材料化窗口（LOCK_MATERIALIZE_MS）内 now≠fixed 静默 pending；冷却/每小时上限只拦
+ * 「换节点」这一步，不拦「补推」（同目标重锁，不是新切换）；外部锁（≠我方落盘 to）健康时永不换节点。
+ * 门闸与 maybeSwitchProxyNode 一致：enabled / 冷却（含跨实例落盘；仅换节点）/ 每小时上限。
  * 永不抛异常；返回诊断字符串（调用方仅在非 ok 时记日志，避免刷屏）。
  */
 export const watchLockedQuality = async (): Promise<string> => {
@@ -803,33 +809,44 @@ export const watchLockedQuality = async (): Promise<string> => {
     if (g.fixed === undefined) return "lock-unsupported"
     if (!g.fixed) return "not-locked"
     const now = Date.now()
-    if (now - lastSwitchAt < cfg.cooldownMs) return "cooldown"
-    const persisted = readLastSwitch()
-    if (persisted && persisted.at > 0 && now - persisted.at < cfg.cooldownMs) return "cooldown"
     const cur = g.fixed
+    // R807：冷却/跨实例闸移到「换节点」分支 —— 只拦真正的新切换；补推（同目标重锁）与
+    // 材料化检查不受闸（此前闸在函数顶部，锁后数分钟内的巡检全部被 cooldown 静默吞掉）。
+    const persisted = readLastSwitch()
+    const oursLock = !!persisted && persisted.to === cur
+    const sinceSwitch = persisted && persisted.at > 0 ? now - persisted.at : Infinity
     const p = await probeNode(cfg, cur)
     const maxD = cfg.probe.maxDelayMs
     const hasMaxD = typeof maxD === "number" && Number.isFinite(maxD) && maxD >= 0
     const healthy = p.ok && (!hasMaxD || (typeof p.delay === "number" && Number.isFinite(p.delay) && p.delay <= maxD))
-    // R722：健康还不够 —— 还要确认锁定**真的生效**（now===fixed）。PUT 锁定是异步生效
-    // （见 applySwitch 注释；实测 ≤20s）。若锁定节点健康却未被选中（跨过 1 个及以上巡检
-    // 周期，说明不是"正在生效"而是"未生效"）：第 1 次先补推 PUT（触发新一轮选优）；
-    // 连续 2 次仍无效 → 按“掉质量”同路径换到更优节点并重锁。
+    // R722+R807：健康还不够 —— 还要确认锁定**真的生效**（now===fixed）。PUT 锁定材料化
+    // 需一轮健康检查（上限 ~10 分钟；此前"实测 ≤20s"只对小测试组成立，大组会久得多）。
+    // 材料化窗口内静默等待（pending）；超出后第 1 次补推 PUT，连续 2 次仍无效且是我方锁
+    // → 按“掉质量”同路径换到更优节点并重锁（外部锁不换节点，见分支内注释）。
     const effective = g.now === cur
     if (healthy && effective) {
       ineffectiveStrikes.delete(cur)
       return `ok:${cur}`
     }
     if (healthy && !effective) {
+      // R807：我方锁 + 材料化窗口内 → 正常等待（静默 pending，不补推不换节点：
+      // 窗口内 now 未跟随是两段式设计的预期，此前易被误判为"未生效"）。
+      if (oursLock && sinceSwitch < LOCK_MATERIALIZE_MS) return `pending:${cur}`
       const n = (ineffectiveStrikes.get(cur) ?? 0) + 1
       ineffectiveStrikes.set(cur, n)
       if (n === 1) {
         const put = await apiPut(cfg, `/proxies/${encodeURIComponent(cfg.group)}`, JSON.stringify({ name: cur }))
-        return `ineffective-nudge:${cur}${put.ok ? "" : ";put-failed"}`
+        return `${oursLock ? "ineffective-nudge" : "ext-nudge"}:${cur}${put.ok ? "" : ";put-failed"}`
       }
+      // R807：外部锁（fixed≠我方落盘 to）健康时**永不换节点**（尊重用户在 UI 的锁定）；
+      // 只留痕，等下一轮巡检（若真掉质量，走上面的 !healthy 分支自然接管——R768 语义）。
+      if (!oursLock) return `ext-ineffective:${cur}`
     }
     ineffectiveStrikes.delete(cur)
-    // 锁定节点掉质量（失活/延迟超阈/锁定不生效）→ 与错误自动切换同一路径（内部另有 maxPerHour 闸）
+    // R807：冷却（含跨实例落盘）只拦「换节点」这一步（补推/材料化检查不过闸）。
+    if (now - lastSwitchAt < cfg.cooldownMs) return "cooldown"
+    if (persisted && persisted.at > 0 && now - persisted.at < cfg.cooldownMs) return "cooldown"
+    // 锁定节点掉质量（失活/延迟超阈/锁定长时未生效）→ 与错误自动切换同一路径（内部另有 maxPerHour 闸）
     switchTimes = switchTimes.filter((t) => now - t < 3_600_000)
     if (switchTimes.length >= cfg.maxPerHour) return "max-per-hour"
     lastSwitchAt = now
@@ -841,3 +858,6 @@ export const watchLockedQuality = async (): Promise<string> => {
   }
 }
 
+// reload(proxy-switch) 1792158294 R773 race-skip-recheck
+
+// reload(proxy-switch) 1792165450 R807 lock-materialize-window

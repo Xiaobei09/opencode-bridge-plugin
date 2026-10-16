@@ -10603,14 +10603,14 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       const lockLine = nowOk
         ? "🔐 已锁定并确认生效（流量已走新节点）；/proxy unlock 可解锁回自动"
         : nowPending
-          ? "🔐 已锁定新节点（mihomo 正在完成选优，通常数秒内自动切过去）；/proxy unlock 可解锁"
+          ? "🔐 已锁定新节点（mihomo 需跑完一轮健康检查才会切过去，最长约 10 分钟自动生效）；/proxy unlock 可解锁"
           : "🔐 已用 Clash 内置锁定钉住新节点（不再自动改选）；/proxy unlock 可解锁回自动"
       const lines = [
         quality ? "🔀 <b>代理已自动切节点</b>（锁定节点质量下降）" : "🔀 <b>代理已自动切节点</b>（网络类错误触发）",
         `${htmlEsc(e.from || "?")} → <b>${htmlEsc(e.to)}</b>`,
         lockLine,
         quality
-          ? "触发：原锁定节点失活或延迟超阈值（400ms）"
+          ? "触发：原锁定节点失活/延迟超阈（400ms），或锁定长时间未生效"
           : e.reason
             ? `触发错误：<code>${htmlEsc(e.reason)}</code>`
             : "",
@@ -10631,7 +10631,15 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     const lockWatchTick = async () => {
       try {
         const res = await watchLockedQuality()
-        if (res.startsWith("quality->") || res.startsWith("error") || res.startsWith("group-failed")) {
+        // R807：补推（无效警示）与外部锁状态也留痕（此前只记 quality->/error → 静默补推不可见）。
+        if (
+          res.startsWith("quality->") ||
+          res.startsWith("error") ||
+          res.startsWith("group-failed") ||
+          res.startsWith("ineffective-nudge") ||
+          res.startsWith("ext-nudge") ||
+          res.startsWith("ext-ineffective")
+        ) {
           await log("info", `proxy-lock-watch: ${res}`)
         }
       } catch {
@@ -10669,7 +10677,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     lwTimer = setInterval(() => {
       if (lwGuard()) void lockWatchTick()
     }, 180_000)
-    await log("info", "proxy-lock-watch: enabled (locked-node quality guard, every 180s)")
+    await log("info", "proxy-lock-watch: enabled (locked-node quality guard, every 180s; R807 materialize-window)")
   }
 
   return {
@@ -10830,3 +10838,6 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   }
 }
 
+// reload(tg-bridge) 1792079200 R719-R722 lock-quality-watch+now-confirm-notice
+
+// reload(tg-bridge) 1792165450 R807 lock-watch-nudge-log+honest-wording
