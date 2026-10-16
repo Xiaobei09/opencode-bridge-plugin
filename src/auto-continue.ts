@@ -2229,4 +2229,3 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     },
   }
 }
-

@@ -10837,7 +10837,3 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     },
   }
 }
-
-// reload(tg-bridge) 1792079200 R719-R722 lock-quality-watch+now-confirm-notice
-
-// reload(tg-bridge) 1792165450 R807 lock-watch-nudge-log+honest-wording

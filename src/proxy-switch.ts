@@ -857,7 +857,3 @@ export const watchLockedQuality = async (): Promise<string> => {
     return `error:${String(e).slice(0, 160)}`
   }
 }
-
-// reload(proxy-switch) 1792158294 R773 race-skip-recheck
-
-// reload(proxy-switch) 1792165450 R807 lock-materialize-window

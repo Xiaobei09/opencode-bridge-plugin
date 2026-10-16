@@ -98,7 +98,7 @@ export const writeBg = (cfg: BgCfg, extra?: Record<string, unknown>, path: strin
     mode: PRIVATE_FILE_MODE,
   })
   renameSync(tmp, path)
-}
+} // reload(bg-mode) 1792040953
 
 // ── 能力探测（纯函数：只看 client 上有没有那两个方法）──────────────────────
 

@@ -69,7 +69,7 @@ export const writeGuard = (cfg: GuardCfg, extra?: { lastTrip?: unknown }, path: 
   const tmp = `${path}.tmp-${process.pid}`
   writeFileSync(tmp, payload, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
   renameSync(tmp, path)
-}
+} // reload(loop-guard) 1792065705
 
 /**
  * 记一次触发（供菜单回显 + 跨重启判重）。**不**改开关本身。
