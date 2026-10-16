@@ -22,3 +22,7 @@ export default v2Bridge("auto-continue", (client) =>
 // reload(content) 1792075941 R720 toctou-cooldown-recheck
 // reload(content) 1792076685 R721 lock-watch gen-guard
 // reload(content) 1792079432 R722 lock-effective-confirm
+
+// reload(content) 1792126065 R724 compaction-bus-publish
+
+// reload(content) 1792156571 R768 user-lock-respect-guard

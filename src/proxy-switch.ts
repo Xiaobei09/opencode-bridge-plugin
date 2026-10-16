@@ -704,6 +704,48 @@ export const maybeSwitchProxyNode = async (args: {
     if (persisted && persisted.at > 0 && now - persisted.at < cfg.cooldownMs) return
     switchTimes = switchTimes.filter((t) => now - t < 3_600_000)
     if (switchTimes.length >= cfg.maxPerHour) return
+    // R768（用户指令：「切换节点应该使用锁定🔐（clash内置功能），而不是强行切换」「用户在代理
+    // 软件 UI 手动锁定之后，你的所有修改其实并没有生效，这是不对的」「锁定标并没有指向你所选
+    // 中的那个节点」）：**外部锁定尊重闸** —— 错误触发的自动切换在动手前先读一次分组，识别
+    // "不是我方的锁"：
+    //   判据 fixed 非空且 ≠ 落盘 state.to（我方最近一次切换目标）→ 外部（用户 UI）锁定：
+    //   · 锁定节点可达（/delay 探测；失败隔 1.2s 复测一次）→ **不覆盖**（记 user-lock-hold；
+    //     防"强行切换"把用户在 UI 的锁冲掉造成拉锯）；若 now≠fixed（锁未实际生效）顺手补推
+    //     一次 PUT（双管齐下，把锁钉实生效）。
+    //   · 锁定节点不可达 → 放行本条自动切换（记 user-lock-dead：换优节点+重锁，保用户在线）。
+    //   · fixed 为空（无锁）或 === state.to（就是我方上次的锁）→ 照常切换。
+    // 与 lock-watch（180s 巡检、全量服务"当前锁"含外部锁：now≠fixed 首击补推、连续无效/掉质量
+    // 才换节点并重锁）互补：巡检管锁质量，本闸管错误触发的换节点。
+    if (cfg.mode === "clash") {
+      try {
+        const g = await listGroup(cfg)
+        if (g.ok && g.fixed) {
+          const own = readLastSwitch()?.to ?? ""
+          if (g.fixed !== own) {
+            const lockName = g.fixed
+            let alive = (await probeNode(cfg, lockName)).ok
+            if (!alive) {
+              await new Promise((r) => setTimeout(r, 1200))
+              alive = (await probeNode(cfg, lockName)).ok
+            }
+            if (!alive) {
+              if (cfg.log) await args.log("info", `proxy-switch: user-lock-dead:${lockName.slice(0, 44)} -> 代切 err=${args.name ?? ""}`)
+            } else {
+              lastSwitchAt = now
+              let nudge = ""
+              if ((g.now ?? "") !== lockName) {
+                const put = await apiPut(cfg, `/proxies/${encodeURIComponent(cfg.group)}`, JSON.stringify({ name: lockName }))
+                nudge = put.ok ? ";nudge-ok" : ";nudge-failed"
+              }
+              if (cfg.log) await args.log("info", `proxy-switch: user-lock-hold:${lockName.slice(0, 44)}${nudge} (外部锁定存活，尊重不覆盖; now=${(g.now ?? "").slice(0, 32) || "?"}) err=${args.name ?? ""}`)
+              return
+            }
+          }
+        }
+      } catch {
+        /* 读组失败不阻断切换（宁可行开朗） */
+      }
+    }
     lastSwitchAt = now
     switchTimes.push(now)
     const res = await switchProxyNode(cfg, "auto", args.sessionID ?? "", args.name ?? "")
