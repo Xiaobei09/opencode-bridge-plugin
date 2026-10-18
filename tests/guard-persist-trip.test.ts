@@ -22,8 +22,8 @@ const tmpFile = (): string => {
 
 describe("alreadyTripped 跨重启持久化判重", () => {
   it("同一 sid+msgId = 已判过（重启后陈旧消息不再拉闸）", () => {
-    const t = { sid: "ses_eee6c66c", msgId: "msg_113a975600012sm0ESFohvQ5fL", at: 1 }
-    expect(alreadyTripped(t, "ses_eee6c66c", "msg_113a975600012sm0ESFohvQ5fL")).toBe(true)
+    const t = { sid: "ses_eee6c66c", msgId: "msg_sanitized03", at: 1 }
+    expect(alreadyTripped(t, "ses_eee6c66c", "msg_sanitized03")).toBe(true)
   })
 
   it("消息换了（新一轮真宣告）= 没判过，照常拉闸", () => {
@@ -71,7 +71,7 @@ describe("noteGuardTrip 落盘带 msgId", () => {
       p,
       JSON.stringify({ problem: true, websearch: true, lastTrip: { kind: "problem", reason: "检测到问题", sid: "ses_eee6c66c", at: 1791361281850 }, ts: 1791361281850 })
     )
-    const oldMsg = "msg_113a975600012sm0ESFohvQ5fL"
+    const oldMsg = "msg_sanitized03"
     // 旧格式下：还没判过（会触发一次拉闸，同时写入新格式）
     expect(alreadyTripped(readGuardLastTrip(p), "ses_eee6c66c", oldMsg)).toBe(false)
     noteGuardTrip("problem", "检测到问题", "ses_eee6c66c", oldMsg, p)

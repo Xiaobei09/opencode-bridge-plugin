@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
@@ -10,12 +10,37 @@ import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAut
 import { renderTgTable, renderKvList } from "./tabular"
 // 压缩通知的文案判据（纯函数 + 单测）：核心是「未知 ≠ 0」，见 compact-notice.ts 头注。
 import { compactWaterLine, compactLogDelta, compactHowLine, compactTitle } from "./compact-notice"
+// R201（用户 2026-10-18「TG桥增加选择思考深度选项」）：思考深度 = 宿主模型 variant（reasoningEffort）。
+// 纯函数抽在 think-depth.ts（可单测），桥里只做 I/O 与命令/按钮分发。
+import {
+  buildThinkKeyboard,
+  resolveThinkLevel,
+  thinkLabel,
+  thinkMenuText,
+  variantListOf,
+  THINK_DEFAULT,
+  type ThinkVariant,
+} from "./think-depth"
 // R1565：「AI 主动结束输出」短提示文案（纯函数 + 单测），见 turn-end-note.ts 头注。
 import { turnEndLine, extractRound, noteSkipped, SYNTHETIC_LOOP_MARKERS, noteOwnerOnlySkipped } from "./turn-end-note"
 import { appendShellBgHint, hasShellBgHint, isFreshRunningCard, HINT_FRESH_MS_DEFAULT } from "./bg-hint"
 // R2498：可选功能「网络错误自动切节点」的 TG 集成（/proxy）。配置在 proxy-switch.json，
 // 默认关闭不影响行为；本模块读取/切换/开关/通知都走这里，避免与 auto-continue 侧判据漂移。
 import { readProxySwitchCfg, readStatus as readProxyStatus, readLastSwitch, switchProxyNode, switchToNode, setEnabled as setProxyEnabled, setNodeLock, registerProxyNotifier, maybeSwitchProxyNode, watchLockedQuality } from "./proxy-switch"
+
+// R208（D7 根因）：宿主跨进程重启后，会话消息 seq 可能从 0 重计（实测 bot4 目标：新消息
+// seq=6..40、旧行 935..1035）⇒ 宿主 API 行序 ≠ 会话时序，新消息被排到旧消息之前。
+// 凡按「数组末条 = 会话尾部」消费 rows 的判定（如 turnActuallyIdle 里 idleVerdict 的
+// 回源复核）都必须先按 time.created 稳定排序，否则会把十几小时前的旧消息当成尾部
+// （实证：泵会据旧尾部误判会话空闲 / 循环注入被静默卡死）。与 auto-continue.ts 同名同义
+// （各自模块私有，不做跨文件导出）。time().created 缺失/非法者归 0（排最前）。
+const sortRowsByCreatedTime = (rows: any[]): void => {
+  const key = (r: any): number => {
+    const t = Number(r?.info?.time?.created ?? r?.time?.created ?? 0)
+    return Number.isFinite(t) && t > 0 ? t : 0
+  }
+  rows.sort((a, b) => key(a) - key(b))
+}
 
 // ── R1399：插件 client 白名单无 background 端点时的直连宿主 HttpApi 兜底 ────────
 // 背景：R1398 实证 v2.0.10 的插件 client 只含白名单子集（session 键无 background/），
@@ -24,14 +49,8 @@ import { readProxySwitchCfg, readStatus as readProxyStatus, readLastSwitch, swit
 // （2026-09-28 curl 实证：POST /api/session/{sid}/background → 204，空闲会话 no-op）。
 const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }> => {
   try {
-    const home = process.env.HOME ?? "/root"
-    const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
-      url?: string
-      password?: string
-    }
-    const url = String(reg?.url ?? "").replace(/\/+$/, "")
-    const pw = String(reg?.password ?? "")
-    if (!url || !pw) return { ok: false, text: "✗ 服务注册不可读（service.json 缺 url/password）" }
+    const { url, password: pw } = await hostServiceReg()
+    if (!url || !pw) return { ok: false, text: "✗ 宿主 HttpApi 凭证不可用（service.json 缺 url/password 且无 OPENCODE_PASSWORD）" }
     const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
     // R1833：必须显式超时。宿主 HttpApi 若"接受连接但不响应"（半边僵死），
     // 无 signal 的 fetch 会挂到 undici 默认头超时（约 5 分钟）才失败：手动
@@ -51,8 +70,24 @@ const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }
 }
 // 直连宿主 HttpApi 是否可用（service.json 同时含 url 与 password）。手动提升与自动提升共用此判据。
 const bgHttpAvail = (): boolean => {
+  // 同步判据。**不能只判 service.json 读得到** —— 文件可能因 serve 重启换密码而过期，
+  // 「读得到 ≠ 鉴权能过」（2026-10-18 实测：文件可读但密码已换 → 全 401）。
+  // 优先看进程原始 environ（绕过被清洗的 process.env），与 hostServiceReg 同源同序。
   try {
-    const reg = JSON.parse(readFileSync(`${process.env.HOME ?? "/root"}/.local/state/opencode/service.json`, "utf8")) as {
+    const raw = readFileSync("/proc/self/environ", "utf8")
+    if (
+      String(raw)
+        .split("\0")
+        .some((kv) => kv.startsWith("OPENCODE_PASSWORD=") && kv.length > "OPENCODE_PASSWORD=".length)
+    ) {
+      return true
+    }
+  } catch {
+    /* 无 /proc 或不可读：继续退级 */
+  }
+  if (typeof process.env.OPENCODE_PASSWORD === "string" && process.env.OPENCODE_PASSWORD) return true
+  try {
+    const reg = JSON.parse(readFileSync("REDACTED_ROOT/.local/state/opencode/service.json", "utf8")) as {
       url?: string
       password?: string
     }
@@ -71,7 +106,10 @@ const modelWindows = new Map<string, number>()
 let modelWinTs = 0
 const ctxTotal = (u: CtxUsage): number => u.input + u.output + u.reasoning + u.cacheRead + u.cacheWrite
 export const windowFor = (modelID: string, providerID: string): number =>
-  modelWindows.get(`${providerID}/${modelID}`) ?? 1048576
+  modelWindows.get(`${providerID}/${modelID}`) ??
+  // ROUND 31（D7）：兜底与 auto-continue 的 `CONTEXT_WINDOW` **同口径** —— 取**表内最小真值
+  // 200000**，不再用 1M（详见 auto-continue 同处注释：兜底偏大 = 压缩算晚 = 先溢出后失败）。
+  Number(process.env.AC_FALLBACK_WINDOW ?? 200_000)
 // R1881：窗口是**实取**还是**兜底猜的** —— 必须能区分。兜底常量 1048576 曾被当真实
 // 窗口显示（用户实报「默认模型的上下文是1m」），而实测默认模型 `opencode/big-pickle`
 // 的真实窗口是 **200000** → 显示值错 5 倍，连带自动压缩阈值也算松 5 倍。
@@ -121,6 +159,8 @@ export type ModelEntry = {
   context: number
   key: string
   display: string
+  /** R201：该模型可选的「思考深度」档位（宿主 `variants`，每模型不同）。 */
+  variants: ThinkVariant[]
 }
 /** GET /api/model 响应 → 可选模型表。去 deprecated、禁用；按 active→名称 排序。 */
 export const modelListEntries = (j: unknown): ModelEntry[] => {
@@ -142,6 +182,7 @@ export const modelListEntries = (j: unknown): ModelEntry[] => {
       context: Number(m?.limit?.context),
       key: `${providerID}/${id}`,
       display: name || `${providerID}/${id}`,
+      variants: variantListOf(m),
     })
   }
   out.sort((a, b) => {
@@ -444,6 +485,15 @@ const LOOP_CTL_PATH = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
 //   * 顶层 stopped=true = 全局闸（守卫 PROBLEM/WEBSEARCH、/loop stop all）→ 一律停；
 //   * bots[botId].stopped=true = 单 Bot 闸；sids 为空视为「本 Bot 全停」，
 //     非空则要求包含当前 front（front 切换后旧会话自动恢复，与 auto-continue 同判据）。
+/**
+ * 顶层软闸类型白名单 —— 这些 by 值表示「停机等用户确认，用户确认后即可恢复」，
+ * 因此用户的 `/loop start`（= 菜单「▶️ 继续循环」）有权清掉它们。
+ *   * agent      —— AI 宣告 [LOOP: PAUSE]（R2497）
+ *   * auto-guard —— 自动停止守卫触发 PROBLEM / WEBSEARCH（R2498，用户实报「按钮不能切换」）
+ * `by="user"`（`/loop stop all` 的显式硬闸）**有意不在**集合内：只由 `/loop start all` 恢复。
+ */
+export const SOFT_LOOP_GATES: ReadonlySet<string> = new Set(["agent", "auto-guard"])
+
 export const botLoopStopped = (j: any, botId: string, curSid: string): boolean => {
   if (!j || typeof j !== "object") return false
   if (j.stopped === true) return true
@@ -1726,10 +1776,59 @@ const haltedSet = new Set<string>()
  * 直接测会污染跨文件共享状态（`haltedSet` 是模块级，10 个测试文件都 import 本模块）。
  * 体积不是问题：每 sid ≈ 40 B，即便 2000 条也仅 ≈ 80 KB。
  */
+// ── 跨实例停机解除表（R2500）────────────────────────────────────────────
+// R1107 的 halted 逐 Bot 落盘，但 auto-continue 的判据取**各 Bot 状态文件的并集**，
+// 而清除只清本 Bot 自己那份 → 一个 Bot 写入的停机，别的 Bot 永远清不掉。
+// 2026-10-18 实测实证：`tg-chats-bot4.json` 里 `halted=["ses_sanitized01…"]`（bot4 的
+// front 早已是别的会话），而本会话由 primary 驱动 → primary 侧「用户发新消息」与
+// 「/loop start」都只清 primary 自己的集合 → auto-continue 的并集永远含该 sid →
+// **该会话自动循环被永久卡死**（用户报「循环不能正常进行」）。
+// 解法：加一张**共享解除表**，谁解除谁登记；所有消费方（各 Bot 桥实例 + auto-continue）
+// 读 halted 时都按它做差集。
+//   * 解除（新消息投递成功 / /loop start）→ 写入 sid
+//   * 重新停机（doStop）→ **抹除** sid 条目（否则新停机会被旧解除吃掉，时序错乱）
+const HALT_RELEASE_PATH = "REDACTED_ROOT/.config/opencode/halt-release.json"
+export const readHaltRelease = (): Record<string, number> => {
+  try {
+    const j = JSON.parse(readFileSync(HALT_RELEASE_PATH, "utf8")) as unknown
+    return j && typeof j === "object" ? (j as Record<string, number>) : {}
+  } catch {
+    return {} // 无解除表 = 无解除（保持原语义）
+  }
+}
+const writeHaltRelease = (rel: Record<string, number>): void => {
+  try {
+    writeFileSync(HALT_RELEASE_PATH, JSON.stringify(rel), { mode: 0o600 })
+  } catch {
+    /* 只读/并发：忽略（这是尽力而为的跨实例通道） */
+  }
+}
+/** 登记「已解除停机」。各 Bot 实例与 auto-continue 都据此把 sid 从 halted 里剔除。 */
+export const noteHaltRelease = (sids: Iterable<string>): void => {
+  const rel = readHaltRelease()
+  let dirty = false
+  for (const s of sids) {
+    if (typeof s === "string" && s) {
+      rel[s] = Date.now()
+      dirty = true
+    }
+  }
+  if (dirty) writeHaltRelease(rel)
+}
+/** 重新停机：抹除解除表条目，保证「停机 → 解除 → 再停机」时序正确。 */
+export const noteHaltArm = (sid: string): void => {
+  const rel = readHaltRelease()
+  if (sid in rel) {
+    delete rel[sid]
+    writeHaltRelease(rel)
+  }
+}
+
 export const loadHaltedInto = (hl: unknown, into: Set<string>): number => {
   if (!Array.isArray(hl)) return 0
+  const rel = readHaltRelease()
   let n = 0
-  for (const s of hl) if (typeof s === "string" && s) { into.add(s); n++ }
+  for (const s of hl) if (typeof s === "string" && s && !(s in rel)) { into.add(s); n++ }
   return n
 }
 const pendingSelect = new Map<string, { gen: number; ids: string[]; ts: number }>()
@@ -1873,7 +1972,7 @@ const loadPersistedState = (): void => {
       for (const [pi, item] of pq.slice(0, PINQ_MAX).entries()) {
         const o = item as any
         if (o && typeof o.sid === "string" && o.sid.startsWith("ses_") && typeof o.text === "string" && o.text && typeof o.chat === "string" && o.chat) {
-          pinQueue.push({ id: typeof o.id === "string" && o.id ? o.id : `restored-${typeof o.ts === "number" ? o.ts : 0}-${pinQueue.length}`, sid: o.sid, text: o.text, ctx: typeof o.ctx === "string" ? o.ctx : "", chat: o.chat, ts: typeof o.ts === "number" ? o.ts : 0 })
+          pinQueue.push({ id: typeof o.id === "string" && o.id ? o.id : `restored-${typeof o.ts === "number" ? o.ts : 0}-${pinQueue.length}`, sid: o.sid, text: o.text, ctx: typeof o.ctx === "string" ? o.ctx : "", chat: o.chat, ts: typeof o.ts === "number" ? o.ts : 0, tgMid: Number.isFinite(Number(o.tgMid)) && Number(o.tgMid) > 0 ? Number(o.tgMid) : undefined })
         } else {
           // 静默丢弃是这轮明确要消灭的行为：队列条目在重启后消失，用户只会看到"我排的东西没了"。
           // 注意：这里在**模块作用域**（loadPersistedState 随模块求值跑），工厂里的 log()
@@ -1900,7 +1999,7 @@ const loadPersistedState = (): void => {
         if (Array.isArray(item) && typeof item[0] === "string" && Number.isInteger(item[1])) {
           protoMap.set(item[0], {
             id: item[1],
-            text: typeof item[4] === "string" ? item[4] : "",
+            text: typeof item[4] === "string" ? protoRedact(item[4]) : "",
             fallback: item[2] === true,
             runningAt: Number(item[3] ?? 0) || 0,
           })
@@ -2231,7 +2330,9 @@ const savePersistedState = (): void => {
         // 于是用户视角巡检把 22 张**早已发完**的卡片报成"标签失衡"，我据此差点去"修"一个
         // 不存在的发送层缺陷。副本畸形 ≠ 线上畸形，但**副本畸形会让巡检永久不可信** ——
         // 而巡检是唯一能抓到真实格式缺陷的那一层（R1007 的真 bug 就是它抓到的）。
-        proto: [...protoMap.entries()].slice(-1000).map(([k, v]) => [k, v.id, v.fallback === true, v.runningAt ?? 0, v.text && k.includes(":tool:") ? balanceHtmlTags(v.text.slice(0, 1500)) : ""]),
+        // ROUND 10：先 protoRedact 再截断（截断会把 token 劈成两半而漏过正则），
+        // 既保住上面的"标签安全"，又不让工具卡原文里的凭据落盘。
+        proto: [...protoMap.entries()].slice(-1000).map(([k, v]) => [k, v.id, v.fallback === true, v.runningAt ?? 0, v.text && k.includes(":tool:") ? balanceHtmlTags(protoRedact(v.text).slice(0, 1500)) : ""]),
         hashes: [...sentHash].slice(-1500),
         rounds: Object.fromEntries([...lastRound.entries()].slice(-200)),
         // 只落盘真实 update_id（负数是菜单合成事件，见 handleUpdateInner）
@@ -2240,7 +2341,8 @@ const savePersistedState = (): void => {
         lastreply: Object.fromEntries(lastReply),
         stripkb: [...strippedKb].slice(-200),
         stripfail: Object.fromEntries([...stripFail.entries()].slice(-200)),
-        halted: [...haltedSet],
+        // R2500：落盘时按**共享解除表**做差集 —— 别的 Bot 解除过的停机不能被我写回。
+        halted: [...haltedSet].filter((s) => !(s in readHaltRelease())),
         filters: { ...filters },
         compact: { ...compactPrefs },
         inject: { mode: injectMode },
@@ -2376,7 +2478,7 @@ const htmlEsc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&
 export type InjectCardState = { msgID?: number; count: number; lastAt: number; lastKind: string; lastSid: string; avgGapMs: number }
 const INJECT_CARD_KEY_RE = /^[A-Za-z0-9_-]+$/
 export const injectCardStatePath = (bot: string): string =>
-  `REDACTED_ROOT/.config/opencode/inject-card-${INJECT_CARD_KEY_RE.test(bot) ? bot : "x"}.json`
+  "REDACTED_ROOT/.config/opencode/inject-card-${INJECT_CARD_KEY_RE.test(bot) ? bot : "x"}.json"
 export const readInjectCardState = (bot: string): InjectCardState => {
   try {
     const j = JSON.parse(readFileSync(injectCardStatePath(bot), "utf8")) as any
@@ -2762,6 +2864,17 @@ export const redactSecrets = (s: string): string =>
     .replace(/\bsk-[A-Za-z0-9_-]{12,}/g, "<redacted>")
     .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/-]{12,}=*/g, "$1 <redacted>")
     .replace(/([?&](?:api_key|apikey|access_token|token|key)=)[^&\s"'<>]{6,}/gi, "$1<redacted>")
+
+/**
+ * ROUND 10（D3）：`proto` 落盘存的是**工具卡片原文**（含 shell 命令行，历史上多次把 bot
+ * token 字面量写进去）。`redactSecrets` 此前只接在**日志出口**（console.error / restore diag），
+ * 漏掉了这条**持久化**路径 —— 于是 token 进入状态文件、`$HOME` 快照 tar、乃至 release 资产。
+ *
+ * 这里在**源头**（load + save 两处）对 proto 文本脱敏。替换串刻意用 HTML 实体
+ * `&lt;redacted&gt;`：proto 文本会原样编辑回 Telegram（parse_mode=HTML），裸 `<redacted>`
+ * 会被 Telegram 当成**未知标签**报 400，而实体是合法文本、显示即 `<redacted>`。
+ */
+const protoRedact = (s: string): string => redactSecrets(s).split("<redacted>").join("&lt;redacted&gt;")
 // R1873：日志"去控制字符"的**单一来源**（`sanitizeLog` 与 `log()` 出口共用）。目的：
 // 任何进日志的文本都必须是单行（`\n`/控制字符 → 空格），否则外部文本可撕裂/伪造日志行。
 export const stripLogControls = (s: string): string => s.replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -3220,6 +3333,8 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   bgstatus: "/background status",
   // R2231 模型选择：菜单按钮等价 /model（选择器独立消息，mdl: 回调驱动）。
   model: "/model",
+  // R201（用户 2026-10-18）：思考深度选择（等价 /think，thk: 回调驱动）。
+  think: "/think",
   // R2498 代理切节点：面板 + 切下一节点 / 开-关自动切 / 列候选 / 配置清单。
   proxy: "/proxy",
   proxynext: "/proxy next",
@@ -3338,11 +3453,13 @@ export const buildMenuKeyboard = (
   // 「后台」与「系统」原先共用 🛠 图标易混 —— 后台改 ⚙（与其页内「线程/阈值」语义一致）；
   // R2231 「模型」入驻根菜单（等价 /model），帮助移入系统页（ma:help 仍在）。
   // R2498 根菜单：新增「代理/切节点」入口 + 配置清单按钮（第 4 行）。
+  // R201（用户 2026-10-18）：「思考深度」与「模型」同行（同族设置，都在改会话的模型侧参数）。
   return [
     [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
     [b("🔁 循环", "m:loop"), b("⚙️ 后台", "m:bg")],
-    [b("🤖 模型", "ma:model"), b("🛠 系统", "m:sys")],
-    [b("🌐 代理/切节点", "m:proxy"), b("🧾 配置清单", "ma:config")],
+    [b("🤖 模型", "ma:model"), b("🧠 思考深度", "ma:think")],
+    [b("🛠 系统", "m:sys"), b("🌐 代理/切节点", "m:proxy")],
+    [b("🧾 配置清单", "ma:config")],
   ]
   }
 
@@ -3386,7 +3503,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // Single-owner: only the serve daemon drives TG (poll + push).
   // The TUI process loads the same plugin files; without this gate both
   // processes poll (409s) and push (duplicate TG messages) concurrently.
-  const IS_SERVE = process.argv.some((a) => a === "serve")
+  const IS_SERVE = process.argv.some((a) => a === "serve") || process.env.TG_BRIDGE_FORCE_SERVE === "1"
   if (!IS_SERVE) {
     try {
       await client.app.log({
@@ -3557,10 +3674,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // （= /loop start）毫无效果，实报「自动循环没了，还不能切换」。
       // agent 软闸语义 = 等用户处理完继续 → /loop start 应能清它。
       // 但 /loop stop all 写的（by="user"）是用户显式硬闸，仍只由 /loop start all 清，语义不变。
-      if (j.stopped === true && j.by === "agent") {
+      //
+      // R2498（2026-10-17 用户实报「设置界面循环按钮显示为关闭，但点击之后不能切换」）：
+      // 上面这条只认 by==="agent"，而 auto-guard 停闸写的是 **by="auto-guard"** → 条件不命中
+      // → 顶层 stopped:true 清不掉 → 按钮仍显示「▶️ 继续循环」，点了毫无反应
+      // （当日实测 loop-ctl.json = {stopped:true, by:"auto-guard", reason:"…循环缺少 END-STATE…"}）。
+      // 守卫停闸的语义同样是「等用户确认后继续」，用户亲手按「继续循环」即为该确认 → 一并放行。
+      // 用**白名单**而非再加一个 ||：by="user" 的显式硬闸永不在集合内，语义边界不被侵蚀。
+      if (j.stopped === true && SOFT_LOOP_GATES.has(String(j.by ?? ""))) {
+        const via = String(j.by ?? "soft")
         j.stopped = false
         j.by = "user"
-        j.reason = "user /loop start (cleared agent pause)"
+        j.reason = `user /loop start (cleared ${via} soft gate)`
       }
     })
   }
@@ -3777,13 +3902,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 数据源 2 = 宿主 HttpApi `GET /api/model`（实测 HTTP 200，`{data:[{providerID,id,limit:{context}}]}`）。
   // 凭证与 bgHttpPromote 同源：~/.local/state/opencode/service.json，Basic base64("opencode:"+pw)。
   const fetchModelWindowsHttp = async (): Promise<number> => {
-    const home = process.env.HOME ?? "/root"
-    const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
-      url?: string
-      password?: string
-    }
-    const url = String(reg?.url ?? "").replace(/\/+$/, "")
-    const pw = String(reg?.password ?? "")
+    const { url, password: pw } = await hostServiceReg()
     if (!url || !pw) return 0
     const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
     const r = await fetch(`${url}/api/model`, {
@@ -3927,13 +4046,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 返回 null 表示"取不到"（service.json 不可读 / 网络失败 / 非数组），调用方据此回落。
   const fetchSessionListHttp = async (): Promise<any[] | null> => {
     try {
-      const home = process.env.HOME ?? "/root"
-      const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
-        url?: string
-        password?: string
-      }
-      const url = String(reg?.url ?? "").replace(/\/+$/, "")
-      const pw = String(reg?.password ?? "")
+      const { url, password: pw } = await hostServiceReg()
       if (!url || !pw) return null
       const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
       const r = await fetch(`${url}/api/session?limit=${SESSION_LIST_LIMIT}`, {
@@ -5776,7 +5889,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // ⚠️ 这里**只中断当前回合**，绝不写全局循环总闸。
     // 旧实现调了 persistLoopStop()，而 loop-ctl.json 是**两个会话共用**的 → 用户在询问卡上
     // 点一次「⏹ 中断并释放会话」想释放那个会话，结果**两个会话的自动循环一起被关掉**
-    // （用户报"又不会自动循环了"；总闸 reason=manual stop ses_f260d5c5 就是这么来的）。
+    // （用户报"又不会自动循环了"；总闸 reason=manual stop ses_sanitized03 就是这么来的）。
     // 语义分离：停"一个回合"用中断；停"自动循环"只有 `/loop stop` 一条路。
     await clearPinnedBars(`stop ${target.slice(0, 12)}`)
     if (haltedSet.has(target)) return `[tg-bridge] stopped ${target.slice(0, 12)}（已停止，无运行中回合；自动循环不受影响）`
@@ -5817,6 +5930,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return "[tg-bridge] stop 未确认：已发出中断，但该回合仍未完成（可能在等一个提问的回答）。opencode 自己的队列不会自动清空；请在 opencode 侧按 Esc 中断该回合，或给该会话发一条新消息。"
     }
     haltedSet.add(target)
+    noteHaltArm(target) // R2500：重新停机须抹除旧解除条目，否则会被它吃掉
     savePersistedState()
     // R1107：⏹ 成功后该会话进入 halted —— auto-continue 读取 halted 数组后不再驱动该会话。
     // 这是**逐会话**暂停：共享总闸没动，其它会话/Bot 的循环不受影响；用户发新消息
@@ -6135,6 +6249,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     try {
       const res = await client.session.messages({ path: { id: sid } })
       const rows = Array.isArray(res?.data) ? res.data : []
+      sortRowsByCreatedTime(rows) // R208：序归一化（seq 跨进程重计，行序 ≠ 时序）
       const noIdle = (why: string): boolean => {
         void log("info", `idle check: not idle (${why}, sid=${sanitizeLog(sid).slice(0, 12)})`)
         return false
@@ -6283,7 +6398,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const k = lastInject.keys().next().value
           if (k !== undefined) lastInject.delete(k)
         }
-        if (haltedSet.delete(sid)) savePersistedState()
+        // R2500：无条件登记解除（本 Bot 未必是写入停机的那一个 —— 清了自己的集合也白搭，
+        // 真正卡住并集的是别的 Bot 状态文件里的那条）。同时清本地集合与落盘。
+        haltedSet.delete(sid)
+        noteHaltRelease([sid])
+        savePersistedState()
         lastStopNotify.delete(sid)
         lastRealPush.set(sid, Date.now())
         // 用户消息完成后继续自动循环；不再写 120 秒 loopskip 暂停标记。
@@ -6421,8 +6540,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
    * v2lib 源文件 mtime 重新快照并动态 import 新实例（generation gating 接管）。
    *
    * R1906 修正：入口真实路径是 `<config>/opencode/plugins/tg-bridge-v2.ts`
-   * （`REDACTED_ROOT/.config/opencode/plugins/…`），此前误写成
-   * `REDACTED_ROOT/.opencode/plugins/…`（该目录不存在）→ `/addbot` 的重载
+   * （"REDACTED_ROOT/.config/opencode/plugins/…"），此前误写成
+   * "REDACTED_ROOT/.opencode/plugins/…"（该目录不存在）→ `/addbot` 的重载
    * 常年静默失败（appendFileSync 抛 ENOENT 被吞成"失败：…"）。
    */
   const triggerBridgeReload = (): string => {
@@ -6638,6 +6757,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
     "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
     "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model &lt;名称&gt; 切换当前会话模型，下次生成生效）",
+    "· /think [档位] — 选择思考深度（模型 variant/reasoningEffort；无参=打开档位列表，档位随模型不同：如 default/low/高/max；只接受清单内的值）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
     "· /compact — 手动触发压缩（本宿主构建不可用时改用 /migrate）",
@@ -6876,14 +6996,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 所有宿主往返带显式 15s 超时（与文件内其它网络调用一致，避免半边僵死卡住命令应答）。
   const modelHttp = async (path: string, init?: RequestInit): Promise<{ ok: boolean; status: number; body: any }> => {
     try {
-      const home = process.env.HOME ?? "/root"
-      const reg = JSON.parse(readFileSync(`${home}/.local/state/opencode/service.json`, "utf8")) as {
-        url?: string
-        password?: string
-      }
-      const url = String(reg?.url ?? "").replace(/\/+$/, "")
-      const pw = String(reg?.password ?? "")
-      if (!url || !pw) return { ok: false, status: 0, body: { error: "service.json 缺 url/password" } }
+      const { url, password: pw } = await hostServiceReg()
+      if (!url || !pw) return { ok: false, status: 0, body: { error: "宿主 HttpApi 凭证不可用（service.json 缺 url/password 且无 OPENCODE_PASSWORD）" } }
       const token = Buffer.from(`opencode:${pw}`, "utf8").toString("base64")
       const headers: Record<string, string> = { Authorization: `Basic ${token}`, ...((init?.headers as Record<string, string>) ?? {}) }
       if (init?.method && init.method !== "GET") headers["Content-Type"] = "application/json"
@@ -6920,14 +7034,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     return null
   }
-  /** POST /api/session/{sid}/model → 204 表示切换成功。 */
-  const modelHttpSet = async (sid: string, ref: { id: string; providerID: string }): Promise<{ ok: boolean; status: number; body: any }> =>
+  /** POST /api/session/{sid}/model → 204 表示切换成功。
+   *  R201：`variant` 可选 = 思考深度档位。⚠️ 宿主对 variant **不校验**（实测传 "zzz"
+   *  也回 204 并真的存进会话）⇒ 只许传来自 `GET /api/model` 清单里的值。 */
+  const modelHttpSet = async (sid: string, ref: { id: string; providerID: string; variant?: string }): Promise<{ ok: boolean; status: number; body: any }> =>
     modelHttp(`/api/session/${encodeURIComponent(sid)}/model`, {
       method: "POST",
       body: JSON.stringify({ model: ref }),
     })
   /** 选择器缩略缓存（每个 chat 一份，90s TTL）：按钮回调按下标解析模型，无需把长 id 塞进 64B 的 callback_data。 */
   const modelMenuCache = new Map<string, { list: ModelEntry[]; ts: number }>()
+  /** R201：思考深度选择器缓存（同 modelMenuCache 的理由：callback_data 只有 64B）。 */
+  const thinkMenuCache = new Map<string, { vs: ThinkVariant[]; label: string; id: string; providerID: string; ts: number }>()
   const handleCallback = async (cq: any): Promise<void> => {
     try {
     const data = String(cq?.data ?? "")
@@ -7124,6 +7242,76 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return
       }
       await answer("未知按钮")
+      return
+    }
+    if (parts[0] === "thk") {
+      // R201 思考深度选择器按钮：set:<idx> 切档；refresh 重拉模型清单；close 收掉消息。
+      // （选择器由 /think 命令或根菜单 🧠 思考深度 打开。）
+      const sub = parts[1] ?? ""
+      const mid = Number(cq?.message?.message_id ?? 0)
+      if (sub === "close") {
+        await answer("已关闭")
+        if (mid) {
+          try {
+            const r = await tgFetch("deleteMessage", { chat_id: Number(cchat) || cchat, message_id: mid })
+            if (!r.ok) await editTextRaw(cchat, mid, thinkMenuText("", [], ""), [], false)
+          } catch {
+            /* best-effort */
+          }
+        }
+        return
+      }
+      const tTarget = fixedTarget ?? (await activeFront())
+      if (!tTarget) {
+        await answer("无法解析目标会话")
+        return
+      }
+      const sesNow = await modelHttpSession(tTarget)
+      if (!sesNow) {
+        await answer("读不到当前模型")
+        return
+      }
+      let cache = thinkMenuCache.get(cchat)
+      if (sub === "refresh" || !cache || Date.now() - cache.ts > 90_000) {
+        const fresh = await modelHttpList()
+        const entry = fresh.find((m) => m.id === sesNow.id && m.providerID === sesNow.providerID)
+        cache = {
+          vs: variantListOf(entry),
+          label: entry?.display ?? `${sesNow.providerID}/${sesNow.id}`,
+          id: sesNow.id,
+          providerID: sesNow.providerID,
+          ts: Date.now(),
+        }
+        thinkMenuCache.set(cchat, cache)
+        if (sub === "refresh") {
+          await answer("已刷新")
+          const cur = String(sesNow.variant ?? THINK_DEFAULT)
+          const t2 = thinkMenuText(cur, cache.vs, cache.label)
+          const kb = buildThinkKeyboard(cache.vs, cur)
+          const r = mid ? await editTextRaw(cchat, mid, t2, kb, false) : { r: "retry" as const }
+          if (r.r !== "sent") await sendTextRaw(cchat, t2, kb, false)
+          return
+        }
+      }
+      const hit = cache.vs[Number(parts[2] ?? "-1")]
+      if (!hit) {
+        await answer("档位不存在")
+        return
+      }
+      const res = await modelHttpSet(tTarget, { id: cache.id, providerID: cache.providerID, variant: hit.id })
+      if (!res.ok) {
+        await answer(`切换失败 ${res.status}`)
+        const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
+        if (mid) await editTextRaw(cchat, mid, `❌ 切换失败（HTTP ${res.status}）：${htmlEsc(clean(why, 120))}`, [], false)
+        return
+      }
+      await answer(`已切换 ${hit.id}`)
+      const text3 = `${thinkMenuText(hit.id, cache.vs, cache.label)}\n✅ 已切换 → <b>${htmlEsc(thinkLabel(hit))}</b>（下次生成生效）`
+      const kb3 = buildThinkKeyboard(cache.vs, hit.id)
+      if (mid) {
+        const r = await editTextRaw(cchat, mid, text3, kb3, false)
+        if (r.r !== "sent") await sendTextRaw(cchat, text3, kb3, false)
+      }
       return
     }
     if (parts[0] === "flt") {
@@ -7510,6 +7698,17 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const chatID = chatTarget(msg.chat)
     const inboundMsgID = Number(msg?.message_id ?? 0)
     currentInbound = Number.isFinite(inboundMsgID) && inboundMsgID > 0 ? { chat: chatID, msgID: inboundMsgID } : null
+    // ROUND 19（运营者症状②「编辑不被注入」）：**编辑事件必须先留痕**。
+    // 此前只有走到「入队命中 / 未命中」分支才记日志 → 「编辑根本没到达桥」与
+    // 「到达但被静默返回（非文本、命令等）」在日志里无法区分，排障只能靠猜。
+    // 这行保证任何 edited_message 一旦到达就必然可 grep（含 chat/message_id/是否带文本）。
+    if (Boolean(u?.edited_message) || Number(msg?.edit_date ?? 0) > 0) {
+      const hasText = typeof msg?.text === "string" || typeof msg?.caption === "string"
+      await log(
+        "info",
+        `tg edited_message received (chat=${sanitizeLog(chatID)}, mid=${inboundMsgID}, hasText=${hasText})`,
+      )
+    }
     // R1823：群聊命令可能带 @botname 后缀；解析前先剥离，否则参数切片失配（详见 stripCmdBotSuffix）。
     const text = stripCmdBotSuffix((typeof msg.text === "string" ? msg.text : typeof msg.caption === "string" ? msg.caption : "").trim())
     let cmd = normalizeCmd(text)
@@ -8026,7 +8225,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           clearLoopStop()
         }
         const target = fixedTarget ?? (await activeFront())
-        if (target && haltedSet.delete(target)) savePersistedState()
+        if (target) {
+          // R2500：/loop start 同样**跨 Bot**解除 —— 停机可能记在别的 Bot 状态文件里。
+          haltedSet.delete(target)
+          noteHaltRelease([target])
+          savePersistedState()
+        }
         await reply(
           chatID,
           all
@@ -8304,18 +8508,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const shape = bgApiShape(client)
       const envOn = bgEnvOn()
       const capLabel = bgApiLabel(shape) === "无（不支持）" ? "无（不支持）·HTTP直连可用" : bgApiLabel(shape)
-      // HTTP 直连可用性=宿主机服务注册可读（url+password 都在才算）。
-      const bgHttpReady = ((): boolean => {
-        try {
-          const reg = JSON.parse(readFileSync(`${process.env.HOME ?? "/root"}/.local/state/opencode/service.json`, "utf8")) as {
-            url?: string
-            password?: string
-          }
-          return Boolean(reg?.url && reg?.password)
-        } catch {
-          return false
-        }
-      })()
+      // HTTP 直连可用性=与 bgHttpAvail 同判据（env 凭据优先，退回 service.json）。
+      const bgHttpReady = bgHttpAvail()
       // R1505：状态用等宽表格回显（代码块恒定等宽 + box-drawing 边框对齐全靠等宽）。
       // R1509/R1510：配置清单按用户设计反馈用「键值列表」——标题+━分隔线、无竖线边框；
       // R1510 起用 tab 对齐（tabAlign:true，键补到 8 的倍数-1 + 单个 \t，值落 8 的倍数列）。
@@ -8429,6 +8623,58 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       modelMenuCache.set(chatID, { list, ts: Date.now() })
       await reply(chatID, modelMenuText(curKey, list), buildModelKeyboard(list, 0, curKey))
+      return
+    }
+    if (cmd === "think" || text === "/think" || text.startsWith("/think ")) {
+      // R201（用户 2026-10-18「TG桥增加选择思考深度选项」）。思考深度 = 宿主模型 variant
+      // （`settings.reasoningEffort`）。档位清单**随模型不同**，唯一来源是 `GET /api/model`
+      // 的 `variants`；`default`（不指定）不在清单里，由纯函数显式补第一档。
+      // 无参 = 渲染选择器（thk: 按钮驱动）；/think <档位> = 直切（中文名或 id 均可）。
+      const tTarget = fixedTarget ?? (await activeFront())
+      if (!tTarget) {
+        await reply(chatID, "[tg-bridge] 无法解析目标会话（没有任何已知会话）")
+        return
+      }
+      const list = await modelHttpList()
+      if (list.length === 0) {
+        await reply(chatID, "❌ 拉取模型列表失败（宿主 HttpApi GET /api/model 不可用）")
+        return
+      }
+      const sesNow = await modelHttpSession(tTarget)
+      if (!sesNow) {
+        await reply(chatID, "❌ 读不到该会话的当前模型（宿主 HttpApi GET /api/session 不可用）")
+        return
+      }
+      const entry = list.find((m) => m.id === sesNow.id && m.providerID === sesNow.providerID)
+      const vs = variantListOf(entry)
+      const curVar = String(sesNow.variant ?? THINK_DEFAULT)
+      const tLabel = entry?.display ?? `${sesNow.providerID}/${sesNow.id}`
+      const tArg = commandArg(text).trim()
+      if (tArg) {
+        const hit = resolveThinkLevel(tArg, vs)
+        if (!hit) {
+          // 宿主不校验 variant（传错也 204），所以这里必须自己挡住，不能放行去写坏会话档位。
+          const sample = vs.map((v) => thinkLabel(v)).join("、")
+          await reply(
+            chatID,
+            `❌ 未找到档位：${htmlEsc(clean(tArg, 30))}\n可选：${htmlEsc(sample)}\n发 /think 打开选择列表。`,
+          )
+          return
+        }
+        const res = await modelHttpSet(tTarget, { id: sesNow.id, providerID: sesNow.providerID, variant: hit.id })
+        if (!res.ok) {
+          const why = typeof res.body === "object" && res.body ? String(res.body.error ?? "") || String(res.body) : String(res.body)
+          await reply(chatID, `❌ 切换失败（HTTP ${res.status}）：${htmlEsc(clean(why, 140))}`)
+          return
+        }
+        await reply(
+          chatID,
+          `✅ ${htmlEsc(sessionTag(tTarget))}（${htmlEsc(tTarget.slice(0, 12))}）思考深度 → <b>${htmlEsc(thinkLabel(hit))}</b>（${htmlEsc(hit.id)}）\n下次生成生效；随时 /think 查看或再切。`,
+        )
+        return
+      }
+      thinkMenuCache.set(chatID, { vs, label: tLabel, id: sesNow.id, providerID: sesNow.providerID, ts: Date.now() })
+      await reply(chatID, thinkMenuText(curVar, vs, tLabel), buildThinkKeyboard(vs, curVar))
       return
     }
     if (text === "/autoguard" || text.startsWith("/autoguard ") || cmd === "autoguard") {
@@ -9129,7 +9375,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         void renameBotToSession(cur)
       }
     }
-      const url = `${apiBase}/getUpdates?offset=${encodeURIComponent(offset)}&limit=10&timeout=20`
+      // ROUND 12（运营者症状②）：**显式**声明 allowed_updates。此前完全省略 —— 而 Telegram
+      // 对省略的语义是"沿用**上一次**的 allowlist"。一旦历史上任何一次调用（旧版本 / 别的
+      // 工具 / 手工调试）把它设成不含 `edited_message`，编辑事件就会被 **TG 端永久静默丢弃**：
+      // poll 里根本收不到该 update，桥的编辑分支（`tg edit has no queued item` / 原地替换）
+      // 永远得不到任何输入 —— 正是运营者反复反馈的"对已发消息的修改不会被注入"。
+      // 显式写全=消除这个**服务端粘滞**状态。三类与桥实际消费的类型严格一致
+      // （grep 证实仅 message / edited_message / callback_query）。
+      const url = `${apiBase}/getUpdates?offset=${encodeURIComponent(offset)}&limit=10&timeout=20&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D`
       pollAbort = new AbortController()
       const res = await fetch(url, {
         signal: AbortSignal.any([pollAbort.signal, AbortSignal.timeout(30_000)]),
@@ -9297,7 +9550,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const ctl = new AbortController()
       const timer = setTimeout(() => ctl.abort(), 15000)
       try {
-        const r = await fetch(`${apiBase}/getUpdates?offset=-1&limit=1`, {
+        // ROUND 12：窥视也必须带同一个 allowlist，否则它可能继承**旧的**受限设置、
+        // 看不到编辑类 update，自愈判据随之失真。
+        const r = await fetch(`${apiBase}/getUpdates?offset=-1&limit=1&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D`, {
           headers: { "content-type": "application/json" },
           signal: ctl.signal,
         })
@@ -10068,7 +10323,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             // 回合不结束，注入闸（r100）就一直按住不注入。所以这里把**出路**写清楚。
             // ⚠️ **撤回 r712 的说法**：我原先在这里写"按 ctrl+b 可把 shell 转到后台，回合随即
             // 结束、自动循环才能继续"。查完证据后发现**这条是假承诺**，现已删除：
-            //   ① 宿主二进制（REDACTED_ROOT/.opencode/bin/opencode，185MB，strings 出 75 万行）里
+            //   ① 宿主二进制（$HOME/.opencode/bin/opencode，185MB，strings 出 75 万行）里
             //      **没有** ctrl+b 的按键绑定（只有 2 处在压缩后的 UI 渲染代码里偶然出现，
             //      是变量名子串，不是绑定）；
             //   ② 配置里也没有：`opencode.jsonc`(292B) / `cli.json`(393B) 均无 key/bind/ctrl；
@@ -10286,7 +10541,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   }, 10 * 60_000)
 
   // R1567：turn-end note 改为**轮询**（用户指令：AI 主动结束输出→每轮一条短提示）。
-  // 实证：宿主写完 time.completed 后不再发 message.updated 事件（msg_0eacd1e69 在
+  // 实证：宿主写完 time.completed 后不再发 message.updated 事件（msg_sanitized02 在
   // 01:36:47 后零事件、01:36:48.4 才被 auto-continue 轮询读出终态）→ 事件驱动
   // 结构性看不见终态，必须与 auto-continue（L1584 acTimer 轮询）同源。从尾部反向
   // 找最近一条 completed>0 的 assistant 消息，按消息 id 去重；不受 loopStopped 限制

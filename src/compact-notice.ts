@@ -8,11 +8,19 @@
  *
  * 语义约定（全部由 compactNoticeBody 一处实现，别在别处再拼一次）：
  *   · after <= 0  = **压缩后水位未知**（不是 0B）→ 只报压缩前，并明说未知
- *   · before > 0 且 after > 0 → 报箭头 + 两个百分比
+ *   · before > 0 且 after > 0 且 after < before → 报箭头 + 两个百分比
+ *   · before > 0 且 after >= before → **不是压缩后水位**（样本未刷新）→ 明说"待刷新"，
+ *     并给出当前样本（R199 新增；见下）
  *   · before <= 0 且 after > 0 → 压缩前未知，只报当前水位
  *   · 两者都 <= 0 → 只说发生过压缩，不给数字
  *
  * 另：百分比一律经 pctOf(window) 算，window 未知时给 "?"，不给 0%。
+ *
+ * R199：`api` 路把 `ctxUsage` 的**当前样本**当 after 传进来（tg-bridge
+ * `noteHostCompaction(sid, "api", at, lastCompactTotal, ctxTotal(uNow))`），而宿主报告
+ * 压缩时间戳的那一刻，样本往往仍是压缩**前**的值。实测 2026-10-18T15:22:02 primary
+ * `91.1k->163.9k`：卡片标题写「🗜 上下文已压缩」而数字在**涨**（46% → 82%），
+ * 用户可感知的自相矛盾。after >= before 时不假装它是压缩后水位。
  */
 
 export type CompactHow = "api" | "ctxdrop" | "event" | "autoc"
@@ -34,6 +42,13 @@ export const compactWaterLine = (before: number, after: number, win: number): st
     // 压缩后未知：只报压缩前，并**明说未知**。绝不写"现在只占 0B"。
     const head = before > 0 ? `压缩前占 ${fmtK(before)}　（${pctOf(before, win)}）` : "压缩前水位未知"
     return `${head}　· 压缩后水位未知`
+  }
+  if (before > 0 && after >= before) {
+    // 样本尚未刷新（after 是"当前样本"而非"压缩后水位"）：绝不写成上升的箭头。
+    return (
+      `压缩前占 ${fmtK(before)}　（${pctOf(before, win)}）` +
+      `　· 压缩后水位待刷新（当前样本 ${fmtK(after)}，${pctOf(after, win)}）`
+    )
   }
   if (before > 0) return `${fmtK(before)} → ${fmtK(after)}　（${pctOf(before, win)} → ${pctOf(after, win)}）`
   return `现在只占 ${fmtK(after)}　（${pctOf(after, win)}）`

@@ -117,7 +117,7 @@ describe("idleVerdict —— 回合真空闲判据（R2232）", () => {
   })
 
   // ── 回归：压缩（compaction）被 rowToV1 渲染成 role=assistant 的"假完成消息"，骗过 ③ ──
-  // DB 实证 bot3 2026-10-10：12:09:53.689 决策参照 msg=msg_125b7fda7001（=seq 8545，
+  // DB 实证 bot3 2026-10-10：12:09:53.689 决策参照 msg=msg_sanitized01（=seq 8545，
   // type=compaction，len=46 正是压缩 header），结果注进了正在压缩的会话（下一个 assistant
   // 直到 12:11:29 才落盘）。压缩行的 info 无 finish，若不识别会被当"回合已 stop"。
   it("回归：进行中的压缩（compactionStatus!=completed）在最尾 → 不空闲", () => {

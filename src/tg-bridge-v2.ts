@@ -2,7 +2,7 @@
  * 多 Bot 桥接入口（注册表驱动）。
  *
  * 设计目标：以后增加机器人时「一键接入」——只往
- *   REDACTED_ROOT/.config/opencode/tg-bots.json  追加一条（id + 各自的 token env 文件），
+ *   $HOME/.config/opencode/tg-bots.json  追加一条（id + 各自的 token env 文件），
  * 不改代码、不新建插件文件。
  *
  * 每个 Bot 一套（互不干扰）：
@@ -22,8 +22,9 @@
  */
 import { readFileSync, statSync, appendFileSync, cpSync, rmSync, readdirSync, mkdirSync } from "node:fs"
 
-/** 诊断写文件：插件的 console.error 会进 server 的 stderr（socket），日志里看不到 */
-const DIAG_PATH = "/tmp/opencode/tg-bots-instance.log"
+/** 诊断写文件：插件的 console.error 会进 server 的 stderr（socket），日志里看不到。
+ *  可用 TG_BRIDGE_DIAG_LOG 改写：隔离回归测试要写自己的日志，不能污染生产 diag（R-round2）。 */
+const DIAG_PATH = process.env.TG_BRIDGE_DIAG_LOG ?? "/tmp/opencode/tg-bots-instance.log"
 const diag = (msg: string): void => {
   try {
     appendFileSync(DIAG_PATH, `${new Date().toISOString()} ${msg}\n`, { encoding: "utf8", mode: 0o600 })
@@ -155,14 +156,28 @@ const readEnvFile = (path?: string): Record<string, string> => {
   return out
 }
 
-const bots = readRegistry()
-const primarySpec = bots[0] ?? { id: "primary" }
-const primaryEnv = readEnvFile(primarySpec.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env")
+// R-round2（2026-10-17 根因修复）：这里读到的是**模块顶层一次性常量**。
+// 热重载只对缓存模块重调 setup()、不重求值顶层 → 顶层 bots 会永远停在进程启动时的
+// 注册表，/addbot 新增的 bot 因此「登记了却不上线」（13:49:15 对照实验证明）。
+// 改成 let + refreshRegistry()，由 setup() 每次进入时重读。
+let bots = readRegistry()
+let primarySpec = bots[0] ?? { id: "primary" }
+// D4 诊断（R1）：模块求值即打印注册表读取结果——用于区分「入口被缓存只重跑 setup
+// （旧 bots）」与「setup 循环卡死」两种「新 bot 不上线」故障（2026-10-17 实测排查）。
+diag(`[tg-bridge-v2] module eval: registry ids=${bots.map((b) => b.id).join(",")}`)
+let primaryEnv = readEnvFile(primarySpec.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env")
 
-/** 主实例当前目标（给新实例做起始 front；只读，不修改主实例状态） */
-const readPrimaryFront = (): string | undefined => {
+/** 重读注册表 + 重算 primary 派生值。必须在 setup() 开头调用（见上方注释）。 */
+const refreshRegistry = (): void => {
+  bots = readRegistry()
+  primarySpec = bots[0] ?? { id: "primary" }
+  primaryEnv = readEnvFile(primarySpec.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env")
+}
+
+/** 读某个状态文件的 front（只读，不修改任何实例状态）。 */
+const readFrontFrom = (path: string): string | undefined => {
   try {
-    const j = JSON.parse(readFileSync("REDACTED_ROOT/.config/opencode/tg-chats.json", "utf8")) as any
+    const j = JSON.parse(readFileSync(path, "utf8")) as any
     const f = typeof j?.front === "string" && /^ses_[A-Za-z0-9_-]+$/.test(j.front) ? j.front : ""
     return f || undefined
   } catch {
@@ -190,7 +205,7 @@ const botConfig = (bot: BotSpec, index: number) => {
     genKey: index === 0 ? undefined : `__tgBridgeGen_${bot.id}`,
     // 首个 Bot 沿用历史状态文件：auto-continue 的循环作用域读的是 tg-chats.json，
     // 换路径会让“当前循环会话”与桥接脱节。
-    statePath: index === 0 ? "REDACTED_ROOT/.config/opencode/tg-chats.json" : `REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json`,
+    statePath: index === 0 ? "REDACTED_ROOT/.config/opencode/tg-chats.json" : "REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json",
     // 首个 Bot 沿用历史 owner 文件名：既让既有租约检查/AC 写入指向同一处，
     // 也保证换代时旧实例的租约能被直接接管。
     ownerPath: index === 0 ? "/tmp/opencode/tg-poll-owner.json" : `/tmp/opencode/tg-poll-owner${sfx}.json`,
@@ -202,7 +217,14 @@ const botConfig = (bot: BotSpec, index: number) => {
     fallbackEnvPath: bot.noFallback ? null : bot.fallbackEnvFile ?? null,
     token,
     // 新实例没有自己的 front 时继承主实例当前目标（之后各自独立）
-    initialFront: index === 0 ? undefined : readPrimaryFront(),
+    // R2500：非主实例的起始 front 必须读**它自己**的状态文件，绝不能读 primary 的。
+    // 旧实现读 tg-chats.json（primary.front）→ 冷启动时若非主实例 persistedFront 尚为空，
+    // 就会抢占 primary 会话 → 三 Bot 目标塌缩成一个、bot3/bot4 各自循环死
+    // （2026-10-18 实报「循环注入提示卡没有更新，并且没有循环」的根因）。
+    initialFront:
+      index === 0
+        ? undefined
+        : readFrontFrom("REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json"),
     // 队列置顶卡只有一个 owner（同一 chat 里 Telegram 不允许跨 Bot 编辑）
     queueCardOwner: index === 0,
     // 非主实例从空 watch 开始：避免镜像主会话造成两个 Bot 交叉发言
@@ -231,6 +253,10 @@ const srcVersion = (): string => {
 export default {
   id: "tg-bridge-v2",
   setup: async (context: any) => {
+    // R-round2：热重载的唯一入口就是重调本函数——注册表必须在这里重读，
+    // 否则顶层缓存的 bots 会让新增 bot 永远进不来。诊断行用于验证「确实读到了新注册表」。
+    refreshRegistry()
+    diag(`[tg-bridge-v2] setup: registry ids=${bots.map((b) => b.id).join(",")}`)
     const disposers: Array<(() => void) | void> = []
     const version = srcVersion()
     // 一次 setup 快照一份，三个 Bot 共用；仍按 ?bot= 分成三个模块实例（见上方注释）。
@@ -255,6 +281,7 @@ export default {
       diag(`[tg-bridge-v2] 启动日志保全失败（不影响启动）: ${String(e).slice(0, 140)}`)
     }
     for (const [idx, bot] of bots.entries()) {
+      diag(`[tg-bridge:${bot.id}] loading (idx=${idx})`)
       try {
         const mod: any = await import(`${live}/tg-bridge.ts?bot=${bot.id}&v=${version}`)
         const configure = mod?.configureBot ?? mod?.default?.configureBot
@@ -285,3 +312,7 @@ export default {
     }
   },
 }
+
+// addbot reload 2026-10-17T13:32:56Z
+
+// addbot reload 2026-10-17T13:40:39Z (round1 verify)

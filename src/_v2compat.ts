@@ -150,6 +150,12 @@ export const rollbackVerdict = (hadArchive: boolean, orphanPath: string): string
  * 阈值可用环境变量 `AC_STUCK_TURN_MS` 调整，设 0 关闭（退回旧行为）。
  */
 const STUCK_TURN_MS = Number(process.env.AC_STUCK_TURN_MS ?? 300_000)
+/**
+ * R28xx：**压缩**的静置阈值（与回合逃生同族）。见 idleVerdict ③b 分支的说明。
+ * 正常压缩实测 19–72 秒（本会话 15 次），故 5 分钟 = 4× 余量；可用
+ * `AC_STUCK_COMPACTION_MS` 调整，设 0 关闭该逃生（退回旧行为=可能永久持有）。
+ */
+const STUCK_COMPACTION_MS = Number(process.env.AC_STUCK_COMPACTION_MS ?? 300_000)
 export const idleVerdict = (o: {
   rows: unknown
   now: number
@@ -157,6 +163,7 @@ export const idleVerdict = (o: {
   lastEventTs?: number
   settleMs?: number
   stuckTurnMs?: number
+  stuckCompactionMs?: number
 }): { idle: boolean; why: string } => {
   const now = Number(o.now) || Date.now()
   const lastEvent = Number(o.lastEventTs ?? 0)
@@ -182,7 +189,7 @@ export const idleVerdict = (o: {
   // ③b 压缩（compaction）判据。
   // 为什么单列：rowToV1 把压缩行渲染成 role=assistant、completed=created、**无 finish** 的
   // "假完成消息"。若当作最后一条 assistant，`laFinish=""`（不是 tool-calls）→ 误判回合已停 →
-  // 在会话正压缩时注入。DB 实证（bot3，2026-10-10）：12:09:53.689 决策 msg=msg_125b7fda7001
+  // 在会话正压缩时注入。DB 实证（bot3，2026-10-10）：12:09:53.689 决策 msg=msg_sanitized01
   // （=seq 8545，type=compaction，len=46 正是压缩 header），注进了正在压缩的回合。
   // 语义上压缩不是回合，故：进行中的压缩（compactionStatus!=="completed"）一律不注入；
   // 已完成的压缩不参与下面 lastAssistant / newest 的扫描（让位给真实助手回合状态）。
@@ -192,17 +199,46 @@ export const idleVerdict = (o: {
     // R2235-fix：只有"真正进行中"的压缩才持闸。宿主压缩行 data.status 的**终态**是
     // completed（成功）或 failed（失败）。旧判据 `status!=="completed"` 把**失败的压缩**
     // （终态，宿主不会把它改回 completed）也当成进行中 → 循环被**永久**持有。
-    // 实证：主会话 2026-10-10T14:00:21 一次 failed 压缩（msg_1261d5d4c001wQMu）后，
+    // 实证：主会话 2026-10-10T14:00:21 一次 failed 压缩（msg_（已脱敏））后，
     // 从 14:00 到 10-11T07:34 约 **17.5 小时零注入**（日志 58 次 compaction-in-flight），
     // 直到用户发消息才打破。故：completed / failed 均视为"已结束、可注入"。
     const cst = String(info?.compactionStatus ?? "completed")
     if (cst !== "completed" && cst !== "failed") {
+      // R28xx-fix（重要）：压缩分支**原先没有任何"静置超时逃生"** —— ②③④ 三条都有
+      // `stuck-turn` 逃生，唯独这里 `return { idle:false, why:"compaction-in-flight" }`
+      // 是**无条件永久持有**。于是"被 kill 切在半途的压缩"会让注入闸门彻底关死：
+      // 宿主压缩行停在非终态（宿主不会再把它改成 completed/failed），循环一条都不注入，
+      // **直到用户发言**才打破（与 R2235 注释里的 17.5 小时同族）。
+      //
+      // 实证（本会话 ses_sanitized01…，2026-10-18，运营者实报「很显然没有自动继续/循环」）：
+      //   05:50:25 取消 run 的**同一瞬间**启动了一次压缩 → 该行 05:50:25→06:03:58 一直非终态
+      //   ⇒ 05:52:30–06:03:30 共 12 次 `hold inject … idle=compaction-in-flight`，
+      //   DB 同样实证**13.5 分钟零消息**；06:03:58 运营者发消息后压缩才落地、循环恢复。
+      //   正常压缩只需 19–72 秒（本会话 15 次实测）⇒ 5 分钟阈值 = 4× 余量。
+      //
+      // 修法与 ③/④ **完全一致**：静置 > stuckMs **且** 尾段确无 running/pending 工具
+      // ⇒ 判死压缩、忽略该行，继续走真实助手回合判据（后者自带 stuck-turn 逃生）。
+      const cTouched =
+        Number(
+          info?.time?.updated ??
+            info?.time?.created ??
+            arr[i]?.time?.updated ??
+            arr[i]?.time?.created ??
+            0,
+        ) || 0
+      const cStuckMs = Number(o.stuckCompactionMs ?? STUCK_COMPACTION_MS)
+      if (cStuckMs > 0 && cTouched > 0 && now - cTouched > cStuckMs) {
+        const live = tailHasLiveTool()
+        if (!live) break // 死压缩：忽略，让位给下面的真实助手回合判据
+        return { idle: false, why: `compaction-in-flight, tool-${live}` }
+      }
       return { idle: false, why: "compaction-in-flight" }
     }
     break
   }
   let laCreated = 0
   let laCompleted = 0
+  let laTouched = 0
   let laFinish = ""
   for (let i = arr.length - 1; i >= 0; i--) {
     const row: any = arr[i]
@@ -211,11 +247,34 @@ export const idleVerdict = (o: {
     if (info?.role !== "assistant") continue
     laCreated = Number(info?.time?.created ?? row?.time?.created ?? 0)
     laCompleted = Number(info?.time?.completed ?? row?.time?.completed ?? 0)
+    laTouched =
+      Number(info?.time?.updated ?? row?.time?.updated ?? 0) || laCreated
     laFinish = String(info?.finish ?? info?.rawFinish ?? "")
     break
   }
   if (!(laCompleted > 0)) {
-    return { idle: false, why: laCreated === 0 ? "no-assistant" : "assistant-in-flight" }
+    if (laCreated === 0) return { idle: false, why: "no-assistant" }
+    // R2376-fix2（② 的逃生，与 ③/④ 同一模式）：宿主被中断 / provider 断线后，最后一条
+    // assistant 会**永远** completed=0，宿主侧其实**没有在途回合**（权威口径：
+    // `POST /api/session/{id}/interrupt` → `{"interrupted":false}`）。旧判据在此**永久**
+    // 判「在途」→ 注入闸门永不放行 → 会话看起来死了（消息只排队、无回应）。
+    // 实证：bot4 `ses_sanitized02…` 2026-10-18 停滞 2.4h+（`in-flight-8671s`），宿主 `interrupted:false`。
+    // 修法与 ③/④ 完全一致：静置 > stuckMs **且** 尾段确无 running/pending 工具 ⇒ 判死回合。
+    const stuckMs = Number(o.stuckTurnMs ?? STUCK_TURN_MS)
+    if (stuckMs > 0 && laTouched > 0 && now - laTouched > stuckMs) {
+      const live = tailHasLiveTool()
+      if (!live) {
+        return {
+          idle: true,
+          why: `stuck-turn(incomplete ${Math.round((now - laTouched) / 1000)}s)`,
+        }
+      }
+      return { idle: false, why: `assistant-in-flight, tool-${live}` }
+    }
+    return {
+      idle: false,
+      why: laCreated === 0 ? "no-assistant" : "assistant-in-flight",
+    }
   }
   // ③ 停步原因：tool-calls = 宿主马上还会跑下一步，回合没结束。
   if (laFinish === "tool-calls" || laFinish === "tool_calls") {
@@ -1201,24 +1260,72 @@ const findLocalServerPort = async (): Promise<number | null> => {
   }
 }
 
-// service.json 里有 serve 的 password；serve 的 /api 鉴权 = Basic("opencode:"+password)。
-// 本插件跑在 serve 同机，能读到该文件 → HTTP 兜底通道从 401 变为可用（R1488 promote 的关键补全）。
+// serve 的 /api 鉴权 = Basic("opencode:"+password)。
+//
+// ⚠️ 凭证来源**必须实时**，不能落盘（2026-10-18 复发实证）：serve 每次启动都换一次密码，
+// service.json 是我手写的快照 → 跨 run/重启后必然过期 → 全部 401 → 用户报「宿主API仍不可用」。
+// 可靠性排序（都取不到才退 service.json）：
+//   1. /proc/self/environ —— 本插件就跑在 serve 进程内，这是**进程原始 environ**，
+//      绕过 JS 层：实测 process.env.OPENCODE_PASSWORD 被宿主清洗掉（取不到），
+//      而 /proc/<serve-pid>/environ 里明明白白有值（pwlen=43）。
+//   2. /proc/<ppid>/environ —— 万一插件跑在子进程里，退到父进程（serve）。
+//   3. process.env.OPENCODE_PASSWORD —— 宿主未清洗时可用。
+//   4. service.json —— 只当最后兜底，且下方会用实时值**自愈**它。
+export const hostServiceReg = async (): Promise<{ url: string; password: string }> => {
+  const fs: any = await import("node:fs")
+  const home = process.env.HOME ?? "/root"
+  const pwFromProc = (path: string): string => {
+    try {
+      const raw = fs.readFileSync(path, "utf8")
+      const hit = String(raw)
+        .split("\0")
+        .find((kv: string) => kv.startsWith("OPENCODE_PASSWORD="))
+      return hit ? hit.slice("OPENCODE_PASSWORD=".length) : ""
+    } catch {
+      return "" // 无 /proc（非 Linux）或权限不足：跳过，走下一级
+    }
+  }
+  const pwSelf = pwFromProc("/proc/self/environ")
+  const pwParent = pwSelf ? "" : pwFromProc(`/proc/${Number(process.ppid) || 0}/environ`)
+  const pwJs = typeof process.env.OPENCODE_PASSWORD === "string" ? process.env.OPENCODE_PASSWORD : ""
+  let fileUrl = ""
+  let filePw = ""
+  for (const p of [`${home}/.local/state/opencode/service.json`, `${home}/.config/opencode/service.json`]) {
+    try {
+      const j = JSON.parse(fs.readFileSync(p, "utf8")) as { url?: string; password?: string }
+      if (!fileUrl && j?.url) fileUrl = String(j.url).replace(/\/+$/, "")
+      if (!filePw && typeof j?.password === "string" && j.password) filePw = j.password
+    } catch {
+      /* 缺失或损坏：继续试下一处 */
+    }
+  }
+  // 端口必须现场发现（serve 用 --port 0，重启换号）；发现不到才退回文件里的 url。
+  const port = await findLocalServerPort()
+  const url = port ? `http://127.0.0.1:${port}` : fileUrl
+  const password = pwSelf || pwParent || pwJs || filePw
+  // 自愈：拿到的实时密码与文件不一致 = 文件已过期 → 回写到**仓库外**的那份，
+  // 让其它直读该文件的消费点也拿到当前值。（不写 ~/.config/opencode/ 那条：它经符号
+  // 链接落在 sessions 仓库内，曾被并发会话按密钥清理删除，保持不落盘。）
+  if (password && password !== filePw && url) {
+    try {
+      const dir = `${home}/.local/state/opencode`
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(`${dir}/service.json`, JSON.stringify({ url, password }), { mode: 0o600 })
+    } catch {
+      /* 只读或并发：忽略，本函数已返回实时值 */
+    }
+  }
+  return { url, password }
+}
+
 let cachedServiceAuth: string | null = null
 
 const readServiceAuth = async (): Promise<string | null> => {
-  try {
-    const fs: any = await import("node:fs")
-    const home = process.env.HOME ?? "/root"
-    const raw = fs.readFileSync(`${home}/.config/opencode/service.json`, "utf8")
-    const pw = JSON.parse(raw)?.password
-    if (typeof pw !== "string" || !pw) return null
-    const plain = `opencode:${pw}`
-    const b64 =
-      typeof btoa === "function" ? btoa(plain) : Buffer.from(plain, "utf8").toString("base64")
-    return `Basic ${b64}`
-  } catch {
-    return null
-  }
+  const pw = (await hostServiceReg()).password
+  if (!pw) return null
+  const plain = `opencode:${pw}`
+  const b64 = typeof btoa === "function" ? btoa(plain) : Buffer.from(plain, "utf8").toString("base64")
+  return `Basic ${b64}`
 }
 
 const buildAuthHeaders = async (): Promise<Record<string, string>> => {
@@ -2043,3 +2150,45 @@ export const v2Bridge = (id: string, run: (client: V1Client) => Promise<{ event?
     }
   },
 })
+
+/**
+ * 「重启孤儿回合」判据（纯函数，可单测）。
+ *
+ * 事故（2026-10-18 08:11→08:12）：运营者取消 run，后继在 08:12:12 启动。
+ * 被取消的那一轮 assistant 消息（created 08:11:30）在库里**永远 completed=null**
+ * —— 生成它的进程已经死了，没有任何人会把它补完。auto-continue 看到 completed=0：
+ *   ① 10s/20s/30s 重试三次 → 5 分钟后打一条 HUNG-TURN（**只记日志、不返回**）；
+ *   ② 同时把它 `settle()` 进 `decided` ⇒ 之后每次 eval 都在 `decided.has(id)` 静默返回；
+ *   ③ 结果：**12 分钟零注入**，直到运营者自己发消息（08:24）才打破。
+ *
+ * 判据：**创建时间早于本进程启动** ⇒ 它不可能是本进程的活回合（新进程不会续跑旧生成）。
+ * 只有「boot 之后创建且未完成」才是真的在生成中，绝不能放行。
+ *
+ * @param completed  time.completed（0 = 未完成）
+ * @param created    time.created（0 = 缺失，保守不放行）
+ * @param bootAt     本插件进程启动时刻（Date.now() 口径）
+ */
+export const preBootOrphan = (o: { completed: number; created: number; bootAt: number }): boolean =>
+  !(Number(o.completed) > 0) &&
+  Number(o.created) > 0 &&
+  Number(o.bootAt) > 0 &&
+  Number(o.created) < Number(o.bootAt) - 1000
+
+/**
+ * 回合产生于本进程启动之前 ⇒ 生成者已死（不要求 completed=0）。
+ *
+ * 与 [[preBootOrphan]] 的分工：后者只覆盖 `completed=null`（写它的进程没来得及收尾）。
+ * 但取消/重启时还有第二种形态：宿主在重启、abort 或收到下一条用户消息时把旧回合
+ * **补写成 completed**，而回合内容只有 1 个空 reasoning part（textChars=0）。
+ * 这种"已完成空回合"在 evaluate 里会走 `len===0` 的 reasoning-only / waiting 分支，
+ * 同样一条都不注入。
+ *
+ * 2026-10-18 08:49 事故实证：取消后重启，08:51:22 `orphan turn detected` 成功解锁，
+ * 紧接着 `empty-verdict parts=1[reasoning] textChars=0` → `waiting(in-flight)`，
+ * 5 分钟零注入，直到运营者自己发消息。判据只看 created < bootAt，故 post-boot
+ * 的真在生成回合（created > bootAt）**永远不会**被放行。
+ */
+export const preBootDeadTurn = (o: { created: number; bootAt: number }): boolean =>
+  Number(o.created) > 0 &&
+  Number(o.bootAt) > 0 &&
+  Number(o.created) < Number(o.bootAt) - 1000

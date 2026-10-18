@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
-import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict } from "./_v2compat"
+import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn } from "./_v2compat"
 // R2496：可选功能——网络类 provider 错误（ECONNRESET / 速率限制等）时，自动切换代理节点。
 import { maybeSwitchProxyNode } from "./proxy-switch"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
@@ -13,8 +13,13 @@ import { AUTO_INJECT_HINT } from "./turn-end-note"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
-// R2607：仅作**窗口表不可用**时的兜底分母（旧行为）；每会话真实窗口经 resolveContextWindow 解析。
-const CONTEXT_WINDOW = 1_048_576
+// R2607：仅作**窗口表不可用**时的兜底分母；每会话真实窗口经 resolveContextWindow 解析。
+// ⚠️ ROUND 31（D7 实测）：兜底取 1_048_576 是**危险方向** —— 模型不可解析的会话（实测 bot4
+// `ses_sanitized02…`：无 model-switched 记录 ⇒ realWin=null ⇒ 回退 1M，`ctx=7%`）会被当成 1M 窗口，
+// 而本宿主模型表里**最小真值就是 200000**（big-pickle/deepseek/glm/mimo 均 200k）⇒ 压缩阈值会
+// 算到 ~700k 才触发（真值 140k）⇒ **先溢出、回合直接失败**。改为保守兜底 = 表内最小真值 200000：
+// 宁愿早压缩（有成本、无故障），绝不晚压缩。可用 `AC_FALLBACK_WINDOW` 覆盖。
+const CONTEXT_WINDOW = Number(process.env.AC_FALLBACK_WINDOW ?? 200_000)
 const COMPACT_THRESHOLD = 0.7
 const COMPACT_EVERY = 450
 const ABORT_STALE_MS = 3 * 60 * 1000
@@ -23,7 +28,21 @@ const ABORT_STALE_MS = 3 * 60 * 1000
 const AC_BOOT_AT = Date.now()
 const STALL_SESSION_MSGS = 600
 
-// 规范状态文件仍为 REDACTED_ROOT/.opencode/loop-state.md（本会话约定）；提示词**刻意不写死路径**，
+// R208（D7 根因）：宿主跨进程重启后，会话消息 seq 可能从 0 重计（实测 bot4 目标：新消息
+// seq=6..40、旧行 935..1035）⇒ 宿主 API 的行序 ≠ 会话时序，新消息被排到旧消息之前。
+// 凡按「数组末条 = 会话尾部」消费 rows 的判定（尾部选取 / idleVerdict）都必须先按
+// time.created 稳定排序，否则会把十几小时前的旧消息当成尾部（实证：bot4 目标被静默
+// 停止注入 12+ 分钟，根因即旧 abort 消息因 seq 排序占据尾部 + decided 闩锁）。
+// time().created 缺失/非法者归 0（排最前），让「有时序证据的真实消息」占据尾部语义。
+const sortRowsByCreatedTime = (rows: any[]): void => {
+  const key = (r: any): number => {
+    const t = Number(r?.info?.time?.created ?? r?.time?.created ?? 0)
+    return Number.isFinite(t) && t > 0 ? t : 0
+  }
+  rows.sort((a, b) => key(a) - key(b))
+}
+
+// 规范状态文件仍为 $HOME/.opencode/loop-state.md（本会话约定）；提示词**刻意不写死路径**，
 // 以满足用户要求"不强调循环具体存放文件"。agent 可从该文件的头部/上下文获知规范位置。
 const ROUND_PROMPT = `继续自动筛查循环（直到用户按 ESC 中断为止；本机制不再依赖回复中的 [STATUS] 标记判定，每次助手回合完成便自动续跑）:
 
@@ -62,7 +81,28 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2233-compaction-idle-guard"
+const VERSION = "r2234-stuck-compaction-escape"
+// 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
+// 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
+// env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
+// R204（D4）：**陈旧认领逃生**阈值（ms）。末条错误消息比这还老、空闲复核已过、且 recover
+// 注入被判去重命中时，判定 claim 为陈旧（宿主从未产出回合），释放后改注入 ROUND_PROMPT。
+// 实测场景：bot4 的 front 目标末条是 12h 前的 abort，每拍 `recover-inject duplicate
+// suppressed` 且无回退 ⇒ 永久 0 回合。env AC_STALE_CLAIM_MS 覆盖。
+const STALE_CLAIM_MS = (() => {
+  const v = Number(process.env.AC_STALE_CLAIM_MS ?? "1800000")
+  return Number.isFinite(v) && v >= 0 ? v : 1800000
+})()
+const ERR_STREAK_LIMIT = (() => {
+  const v = Number(process.env.AC_ERR_STREAK_LIMIT ?? "5")
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 5
+})()
+// R188 诊断注记（热载与 diag 日志的关系）：运行期改动**任一** plugin 文件内容会触发宿主
+// 热载整个插件集（同进程 reload，PID 不变；banner/self-check 走 client.app.log，不发 TG）。
+// 热载**不截断** diag 日志（`/tmp/opencode/tg-bots-instance.log`），故其 `instance registered`
+// （token=set/allowed=set）计数会跨「启动+热载」累加；只有**真实进程启动**才截断重写。
+// 因此 restore-monitor 的 `bridge token=set/allowed=set` 期望值应以「单次启动的注册数」为准，
+// 排查时先确认 BRLOG 时间戳是否只含一次启动块。
 // R1916（用户指令 2026-10-09）：「增加在循环是否启动在会话名称的显示」。
 // 原实现只有运行态标记 [LOOP]，停止态标题无任何标识 → 会话名只回答了「循环在跑
 // 吗」的一半（跑→有标；停→与从未循环无差别）。现扩展为双标记三态：
@@ -155,9 +195,14 @@ const LOOP_CTL_LEGACY = "/tmp/opencode/loop-ctl.json"
 // —— 流式中的消息一旦有了文字就被当成本轮结束。
 // 为什么 completed 是唯一可靠的信号：opencode 的宿主侧回合结束**就是**给最后一条
 // assistant 消息写 time.completed（tg-bridge 的 pumpInject 也用同一个信号等空闲）。
-// 刻意**不**提供"陈旧兜底"（例如超过 N 分钟就强行注入）：往一个卡住的回合里注入，
-// 宿主不会消费它，只会在它自己的队列里越积越多（实测卡住那一轮积了 4 条发不出去）。
-// 卡住由 HUNG-TURN 如实上报，不靠继续投喂来"解决"。
+// ⚠️ R2376-fix2（2026-10-18）**修正**上面「刻意不提供陈旧兜底」的旧结论：
+// 该结论的前提是「宿主终会消费排队注入」——但实测反例：宿主被中断/provider 断线后，最后一条
+// assistant 会**永远** completed=0，而宿主自述**没有在途回合**（`POST /api/session/{id}/interrupt`
+// → `{"interrupted":false}`）⇒ 该回合**永不结束**，`injectGateVerdict` 在**第一道闸**就永久拦死，
+// 第二道权威闸 `idleVerdict`（它**早有** R2376「死回合逃生」：静置 > 阈值 + 尾段无活工具）根本没机会跑。
+// 实证：bot4 `ses_sanitized02…` 2026-10-18 停滞 2.4h+（`in-flight-8671s`）而宿主 `interrupted:false`。
+// 故此处与 ③/④/② 一致：静置超阈值**只做「移交给第二道权威闸」**，绝不强行注入
+// （gate-2 仍会因「尾段有 running/pending 工具」或「未静置」而拒绝）。阈值同 `AC_STUCK_TURN_MS`，设 0 退回旧行为。
 export const injectGateVerdict = (
   completed: number,
   updated: number,
@@ -166,6 +211,10 @@ export const injectGateVerdict = (
   if (completed > 0) return { go: true, why: "completed" }
   if (!(updated > 0) || !Number.isFinite(updated)) return { go: false, why: "no-updated-ts" }
   const ageS = Math.max(0, Math.round((now - updated) / 1000))
+  const stuckMs = Number(process.env.AC_STUCK_TURN_MS ?? 300_000)
+  if (stuckMs > 0 && ageS * 1000 > stuckMs) {
+    return { go: true, why: `stale-in-flight-${ageS}s(→gate2)` }
+  }
   return { go: false, why: `in-flight-${ageS}s` }
 }
 
@@ -526,12 +575,25 @@ let haltedSessionsCache = { ts: 0, sids: [] as string[] }
 const haltedSessions = (): string[] => {
   const now = Date.now()
   if (now - haltedSessionsCache.ts < 2_000) return haltedSessionsCache.sids
+  // R2500：先读**共享解除表**。halted 是各 Bot 状态文件的并集，而清除只由「当前那个 Bot」
+  // 写自己的文件 → 跨 Bot 的停机**永远解不掉**（2026-10-18 实测：bot4 文件里的本会话停机
+  // 让 primary 的循环永久跳过）。解除表是唯一能跨实例生效的通道，故并集必须先减它。
+  let rel: Record<string, unknown> = {}
+  try {
+    const rj = JSON.parse(
+      readFileSync("REDACTED_ROOT/.config/opencode/halt-release.json", "utf8"),
+    ) as unknown
+    if (rj && typeof rj === "object") rel = rj as Record<string, unknown>
+  } catch {
+    /* 无解除表：保持原语义（该 sid 仍算停机） */
+  }
   const out: string[] = []
   for (const p of [TG_STATE_PATH, ...EXTRA_TARGET_PATHS]) {
     try {
       const j = JSON.parse(readFileSync(p, "utf8")) as any
       const hl = Array.isArray(j?.halted) ? (j.halted as unknown[]) : []
-      for (const s of hl) if (typeof s === "string" && s.startsWith("ses_") && !out.includes(s)) out.push(s)
+      for (const s of hl)
+        if (typeof s === "string" && s.startsWith("ses_") && !(s in rel) && !out.includes(s)) out.push(s)
     } catch {
       /* 个别状态文件读不到：跳过该文件 */
     }
@@ -733,6 +795,8 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     console.log(`${banner} (app.log failed: ${String(err)})`)
   }
   const decided = new Set<string>()
+  // 重启孤儿只记一次日志（每个 msg.id）—— 必须与 decided 同处提前声明（闭包引用安全）
+  const orphanLogged = new Set<string>()
   const pending = new Map<string, number>()
   const emptyStreak = new Map<string, number>()
   // 已回源核对过的消息（避免同一条反复打 API）
@@ -820,6 +884,9 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // 被注入闸拦下的时刻（诊断用：连续拦多久 = 宿主侧回合卡了多久）
   const heldInject = new Map<string, number>()
   const fatalStreak = new Map<string, number>()
+  // 连续可恢复错误计数（按 distinct msg.id）；达 ERR_STREAK_LIMIT 则结束本轮 CI（exit 0 → relay 重启）。
+  const errStreak = new Map<string, number>()
+  const errStreakSeen = new Map<string, string>()
   const coldCompacted = new Set<string>()
   const lastCompactCount = new Map<string, number>()
   const lastCompactAttempt = new Map<string, number>()
@@ -1236,6 +1303,20 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   // 迟早让人连不上** —— 与其在分析脚本里做前缀匹配，不如把日志本身统一。
   const injectAllowed = async (sid: string, m: any, tag: string): Promise<boolean> => {
     const t = (m as any)?.time ?? {}
+    // 重启孤儿（创建早于本进程启动 + 未完成）：生成者已死，不可能是活回合。
+    // 这里**跳过两道空闲闸**：回源看到的 completed 永远是 0（没人会补写），
+    // 会被 idleVerdict 判成"回合未结束"，而这正是 2026-10-18 08:12 重启后
+    // 12 分钟零注入的根因。
+    if (preBootOrphan({ completed: Number(t.completed ?? 0), created: Number(t.created ?? 0), bootAt: AC_BOOT_AT })) {
+      if (!orphanLogged.has(String(m?.id ?? ""))) {
+        orphanLogged.add(String(m?.id ?? ""))
+        await log(
+          "info",
+          `auto-continue: orphan turn escaped idle gates (${tag}, session=${sanitizeLog(sid)}, msg=${String(m?.id ?? "").slice(0, 20)}, created=${new Date(Number(t.created)).toISOString()} < boot ${new Date(AC_BOOT_AT).toISOString()})`,
+        )
+      }
+      return true
+    }
     const hold = async (why: string): Promise<boolean> => {
       heldInject.set(sid, Date.now())
       await log(
@@ -1254,6 +1335,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     try {
       const res = await withTimeout(client.session.messages({ path: { id: sid } }), "session.messages")
       const rows = res?.data ?? []
+      if (Array.isArray(rows)) sortRowsByCreatedTime(rows) // R208：序归一化（seq 跨进程重计，行序 ≠ 时序）
       const iv = idleVerdict({ rows, now: Date.now(), settleMs: ROUND_SETTLE_MS })
       if (!iv.idle) {
         // 仅"落定窗口未到"需要补一拍重评（已在生成中会有 message.updated 来复查）。
@@ -1343,6 +1425,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       // R2228 循环注入提醒：注入成功后 fire（由拥有该会话的 Bot 侧发送；
       // fire-and-forget，通知失败/挂起绝不影响循环主链路）。
       fireInjectNotices(sessionID, kind)
+      // 成功注入一轮 = 会话已恢复推进 → 清空连续错误计数（用户指令 2026-10-18）。
+      if (kind === "round") {
+        errStreak.delete(sessionID)
+        errStreakSeen.delete(sessionID)
+      }
       return "ok"
     } catch (err) {
       unclaimInject(sessionID, msg.id)
@@ -1451,6 +1538,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         )
         return
       }
+      // R208：行序归一化（宿主 seq 跨进程可重计 ⇒ 行序 ≠ 时序，见 sortRowsByCreatedTime）
+      sortRowsByCreatedTime(messages)
 
       // 粘性：该会话此前已被识别为循环会话（见 loopSessions 注释）
       // 每轮重读**两个**名单：/loop on|off 是**桥**（另一个模块）写的，本进程内存可能还是旧的。
@@ -1647,11 +1736,32 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         const lastNote = lastUserNote.get(sessionID) ?? 0
         if (Date.now() - lastNote > 5 * 60_000) {
           lastUserNote.set(sessionID, Date.now())
-          await log("info", `auto-continue: eval session=${sessionID} msgs=${assistantCount} -> CONTINUE(user-active, loop keeps running until /loop stop)`)
+          await log("info", `auto-continue: note session=${sessionID} msgs=${assistantCount} user-active(真实用户发言; 循环照常续跑, 直至 /loop stop)`)
         }
       }
       // dormant 跳过已取消：用户主动停止之前一直循环（空会话由 empty-stall 熔断兜底）。
       const { info: msg } = lastAssistant
+
+      // ── 重启孤儿回合解锁（2026-10-18 08:12 事故）─────────────────────────────
+      // 取消/重启后，最后一条 assistant 常常 completed=null（写它的进程已死）。
+      // 10s/20s/30s 重试后它会被 settle() 进 decided ⇒ 之后每次 eval 都在
+      // `decided.has(id)` 静默返回，5 分钟时只打一条 HUNG-TURN 日志 ⇒ **永不注入**，
+      // 直到用户发话（实测 08:12→08:24 共 12 分钟）。这里强制解锁：
+      // 创建早于本进程启动 + 未完成 = 孤儿，不是活回合，允许继续走注入路径。
+      {
+        const t0 = (msg as any)?.time ?? {}
+        if (preBootOrphan({ completed: Number(t0.completed ?? 0), created: Number(t0.created ?? 0), bootAt: AC_BOOT_AT })) {
+          decided.delete(msg.id)
+          skipState.delete(sessionID)
+          if (!orphanLogged.has(String(msg.id))) {
+            orphanLogged.add(String(msg.id))
+            await log(
+              "info",
+              `auto-continue: orphan turn detected (session=${sanitizeLog(sessionID)}, msg=${String(msg.id).slice(0, 20)}, created=${new Date(Number(t0.created)).toISOString()} before boot ${new Date(AC_BOOT_AT).toISOString()}) -> unlock decided, resume loop`,
+            )
+          }
+        }
+      }
 
       // ── 宿主侧回合挂起告警（只检测 + 如实上报，**不**擅自中断用户的会话） ──
       // 实测：备用会话最后一个工具 state=running 挂了 11 分钟、time.completed 一直为空，
@@ -1777,7 +1887,23 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           }
           await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
           settle(msg)
-          const r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
+          let r = await inject(sessionID, msg, RECOVER_PROMPT, "recover")
+          // R204（D4）**陈旧认领逃生**。实测症状：某 bot 的 front 目标末条是 12h 前的 abort，
+          // claim（`${sid}:${msg.id}`，持久化于 /tmp/opencode/round-claims.json）在早期注入时
+          // 已写盘但宿主从未产出回合 ⇒ 此后每拍 `recover-inject duplicate suppressed`、
+          // **没有任何回退**，该会话永久 0 回合（目标饿死）。三者同时满足才判「陈旧」：
+          // ① 末条错误消息本身已 ≥ STALE_CLAIM_MS（默认 30min）；② 空闲复核已通过
+          // （injectAllowed=true ⇒ 尾部无活回合，不会插进正在跑的回合）；③ recover 去重命中。
+          // 处置：释放陈旧 claim 后改注入 ROUND_PROMPT（正常循环驱动；成功注入还会清零连错计数）。
+          if (r === "duplicate") {
+            const errAt = Number((msg as any).time?.completed ?? (msg as any).time?.created ?? 0)
+            const errAgeMs = errAt > 0 ? Date.now() - errAt : 0
+            if (errAgeMs >= STALE_CLAIM_MS) {
+              unclaimInject(sessionID, msg.id)
+              await log("info", `auto-continue: stale claim escape (session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(msg.id)}, errAge=${Math.round(errAgeMs / 1000)}s) -> ROUND inject`)
+              r = await inject(sessionID, msg, ROUND_PROMPT, "round")
+            }
+          }
           if (r !== "ok") {
             decided.delete(msg.id)
             return
@@ -1786,6 +1912,27 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
         fatalStreak.delete(sessionID)
         await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} len=${len} error=${errorName(msg)} -> RECOVER`)
+        // 用户指令（2026-10-18）：连续可恢复错误（按 distinct msg.id 计）达阈值 →
+        // 「结束本轮 CI」= 结束本次 run；iterate.yml 的 relay 步随即自动重启新 run（重启 CI）。
+        // 依据：relay 触发条件为 run_opencode.outcome==success（或 cancelled()），故以 exit(0)
+        // 干净退出即会接力重启；非 0 退出则「this run will not relay」（不重启）。
+        {
+          if (errStreakSeen.get(sessionID) !== msg.id) {
+            errStreakSeen.set(sessionID, msg.id)
+            const es = (errStreak.get(sessionID) ?? 0) + 1
+            errStreak.set(sessionID, es)
+            if (es >= ERR_STREAK_LIMIT) {
+              await log(
+                "info",
+                `auto-continue: consecutive recoverable errors x${es} (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run)`,
+              )
+              if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+                setTimeout(() => process.exit(0), 1500)
+              }
+              return
+            }
+          }
+        }
         // R2233：同上——宿主已自行重试（尾部有更新的 in-flight 步）时不往活着的回合插恢复提示。
         if (!(await injectAllowed(sessionID, msg, "recover"))) {
           decided.delete(msg.id)
@@ -1846,6 +1993,46 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
 
       if (len === 0) {
+        // ── pre-boot 死回合 + 空文本（2026-10-18 08:49 事故）────────────────────
+        // 取消/重启瞬间被杀的回合常常只剩 1 个空 reasoning part（textChars=0）。
+        // 生成者已死 ⇒ 不是"流式中"：`waiting(in-flight)` 会无限等待（实测 5 分钟
+        // 零注入，直到用户发话）。这里把它按"已完成空回合"直接续跑。
+        // 必须先确认它仍是**最后一条消息**：若已有更新的用户/助手消息（新回合已开始），
+        // 交给常规路径，绝不往活回合里插提示词。
+        {
+          const t = (msg as any)?.time ?? {}
+          if (preBootDeadTurn({ created: Number(t.created ?? 0), bootAt: AC_BOOT_AT })) {
+            let newest = ""
+            try {
+              const res = await withTimeout(client.session.messages({ path: { id: sessionID } }), "session.messages")
+              const rows = Array.isArray(res?.data) ? res.data : []
+              sortRowsByCreatedTime(rows) // R208：序归一化（尾检必须按 time.created）
+              const tail: any = rows[rows.length - 1]
+              newest = String(tail?.id ?? tail?.info?.id ?? "")
+            } catch {
+              return
+            }
+            // 取不到 id（API 异常/空数组）时也不放行：宁可下一拍再判，不做无证据注入。
+            if (newest !== String(msg.id)) return
+            if (!(await injectAllowed(sessionID, msg, "round:preboot-empty"))) return
+            emptyStreak.delete(sessionID)
+            pending.delete(msg.id)
+            giveupCount.delete(sessionID)
+            skipState.delete(sessionID)
+            lastRoundAt.set(sessionID, Date.now())
+            settle(msg)
+            const rr = await inject(sessionID, msg, ROUND_PROMPT, "round")
+            if (rr !== "ok") {
+              decided.delete(msg.id)
+              return
+            }
+            await log(
+              "info",
+              `auto-continue: preboot-empty dead turn -> inject (session=${sessionID}, msg=${msg.id}, created=${new Date(Number(t.created ?? 0)).toISOString()} < boot ${new Date(AC_BOOT_AT).toISOString()})`,
+            )
+            return
+          }
+        }
         // 事件流给的消息对象**可能不带 parts**（实测第二个会话：keys=id|role|time|error|
         // tokens|model，parts=0），于是"有内容"被误判成"空转"，连续 5 次就熔断 → 该会话
         // 表现为"总是不循环"。而走会话 API 读同一条消息是带 parts 的（桥接能渲染真实内容
