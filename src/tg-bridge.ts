@@ -3707,6 +3707,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const e = (j.bots[BOT_ID] ?? {}) as any
       e.stopped = false
       e.ts = Date.now()
+      // R433（R425 待办）：清闸时一并清 by/reason 残留 —— stopped=false 却留着
+      // "user /loop stop" 会误导 D1/菜单判读（审计信息走日志，不留在闸文件里）。
+      delete e.by
+      delete e.reason
       j.bots[BOT_ID] = e
       // R2497：AI 宣告 [LOOP: PAUSE] 走的是**顶层软闸**（auto-continue 的
       // writeCtlStopped(true,"agent",…)），而本函数原先只清 bots[bot].stopped →
@@ -3724,8 +3728,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (j.stopped === true && SOFT_LOOP_GATES.has(String(j.by ?? ""))) {
         const via = String(j.by ?? "soft")
         j.stopped = false
-        j.by = "user"
-        j.reason = `user /loop start (cleared ${via} soft gate)`
+        // R433：同理清残留 —— 原先写 by="user"/"user /loop start (cleared …)" 同样造成
+        // stopped=false + by/reason 不一致；审计改走日志。
+        delete j.by
+        delete j.reason
+        void log("info", `loop start cleared ${via} soft gate (by/reason reset)`)
       }
     })
   }
