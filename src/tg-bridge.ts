@@ -942,6 +942,10 @@ let TURN_NOTE_OWNER_ONLY = process.env.TG_TURN_NOTE_OWNER_ONLY !== "0"
 const AC_MIN_ROUND_MS = Number(process.env.AC_MIN_ROUND_MS ?? 90_000) || 90_000
 const TURN_NOTE_QUIET_MS = Number(process.env.TG_TURN_NOTE_QUIET_MS ?? "") || AC_MIN_ROUND_MS + 30_000
 const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 12 // R1889 重试总额度（12 次 ≈ 退避累计 5 分钟）；理由见 run() 内 retry 分支的注释
+// R-2026-10-19 补发标注降噪（运营者实报「补发也太多了」）：catchup 补推常见迟到仅数秒~25s，
+// R276 的「（补发 …）」括注在高频补推时刷屏。现仅当迟到 ≥ LATE_NOTE_MIN_MS 才显示括注；
+// 阈值内补推**仍改写标题时钟**（发送顺序单调不变，R276 初衷保留）。可用 TG_LATE_NOTE_MIN_MS 调整。
+const LATE_NOTE_MIN_MS = Number(process.env.TG_LATE_NOTE_MIN_MS ?? "") || 60_000
 
 const loadFileEnv = (path?: string | null): Record<string, string> => {
   const out: Record<string, string> = {}
@@ -5568,11 +5572,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const doneAt = Number(m?.time?.completed ?? m?.info?.time?.completed ?? m?.time?.created ?? m?.info?.time?.created ?? 0)
     const backfillLate = backfill && doneAt > 0 && lastProtoSendAt > doneAt
     const backfillClock = backfillLate ? fmtClock(Date.now()) : ""
+    // R-2026-10-19：迟到时长（毫秒）。≥ LATE_NOTE_MIN_MS 才显示「（补发 …）」括注；以下仍改写时钟。
+    const lateMs = backfillLate ? Date.now() - doneAt : 0
+    const lateNote = lateMs >= LATE_NOTE_MIN_MS
     // 验证锚点（R276）：触发「补发时刻」改写时留一行日志，下一代可直接 grep 'backfill-late'
     // 核对（无此行则"已修复"与"没触发过"完全同形，无法验证）。
-    if (backfillLate) void log("info", `backfill-late (${sanitizeLog(sessionID).slice(0, 12)} msg=${msgKey} 补=${backfillClock} 原=${fmtClock(doneAt)})`)
+    if (backfillLate) void log("info", `backfill-late (${sanitizeLog(sessionID).slice(0, 12)} msg=${msgKey} 补=${backfillClock} 原=${fmtClock(doneAt)} late=${Math.round(lateMs / 1000)}s${lateNote ? " note" : ""})`)
     const lateTitle = (base: string, p: any): string =>
-      `${base} · ${backfillClock}（补发 ${fmtClock(partTime(p) || doneAt)}）${ctxSuffix(sessionID)}`
+      lateNote
+        ? `${base} · ${backfillClock}（补发 ${fmtClock(partTime(p) || doneAt)}）${ctxSuffix(sessionID)}`
+        : `${base} · ${backfillClock}${ctxSuffix(sessionID)}`
     // 附加镜像档：标题前加会话名，避免多会话正文混淆。
     const tag = mode === 'text' ? `📌 ${sessionTag(sessionID)}` : ''
     let idx = 0
