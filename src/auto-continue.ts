@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
-import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync } from "node:fs"
+import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync, readdirSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn } from "./_v2compat"
 // R2496：可选功能——网络类 provider 错误（ECONNRESET / 速率限制等）时，自动切换代理节点。
 import { maybeSwitchProxyNode } from "./proxy-switch"
@@ -96,6 +96,15 @@ const STALE_CLAIM_MS = (() => {
 const ERR_STREAK_LIMIT = (() => {
   const v = Number(process.env.AC_ERR_STREAK_LIMIT ?? "5")
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : 5
+})()
+// R210（运营者 2026-10-18 指令：连续错误提示 → 结束本轮 CI + 自动重启）：**墙钟停滞**判据。
+// 实证缺口：abort 类错误不计入 errStreak，且同一条错误消息按 distinct msg.id 去重后永远只算 1 次
+// ⇒ bot4 16:18–16:53 每分钟评估同一 abort、循环停滞，却从不触发 END-ROUND-CI，只能人工取消。
+// 语义：会话尾条消息**持续是错误**（≥ 阈值无更新消息 = 宿主无推进）→ 与 5 连错同一出口（exit 0 → relay 重启）。
+// 非错误评估 / 成功注入 round / PAUSE / SKIP 时清零。
+const AC_ERR_STALL_MS = (() => {
+  const v = Number(process.env.AC_ERR_STALL_MS ?? "300000")
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 300000
 })()
 // R188 诊断注记（热载与 diag 日志的关系）：运行期改动**任一** plugin 文件内容会触发宿主
 // 热载整个插件集（同进程 reload，PID 不变；banner/self-check 走 client.app.log，不发 TG）。
@@ -887,6 +896,16 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // 连续可恢复错误计数（按 distinct msg.id）；达 ERR_STREAK_LIMIT 则结束本轮 CI（exit 0 → relay 重启）。
   const errStreak = new Map<string, number>()
   const errStreakSeen = new Map<string, string>()
+  // R210：错误停滞墙钟表（见 AC_ERR_STALL_MS 注释）。返回 true = 持续错误已超过阈值。
+  const errStallSince = new Map<string, number>()
+  const stallExceeded = (sid: string): boolean => {
+    const t0 = errStallSince.get(sid)
+    if (t0 === undefined) {
+      errStallSince.set(sid, Date.now())
+      return false
+    }
+    return Date.now() - t0 >= AC_ERR_STALL_MS
+  }
   const coldCompacted = new Set<string>()
   const lastCompactCount = new Map<string, number>()
   const lastCompactAttempt = new Map<string, number>()
@@ -1301,6 +1320,43 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   // R1020 实测：只有这一行是 12 位 → 统计脚本按等值连接时，会话级数据全成假数
   // （每个会话都显示"100% 拦截 / 0% 注入"）。**同一份信息在相邻日志行里两种写法，
   // 迟早让人连不上** —— 与其在分析脚本里做前缀匹配，不如把日志本身统一。
+  // R213 END-ROUND-CI 真正落地（2026-10-19 03:45 实证）：插件跑在 `opencode serve` 子进程里，
+  // 旧实现 `process.exit(0)` 只杀死 serve —— 客户端 `opencode --standalone` 与 `timeout` 包裹层
+  // 仍然活着 ⇒ CI 步骤永不收尾、relay 不触发，运营者只能人工取消（观感「并没有重启，仍然空跑」）。
+  // 新实现：先给**其他** opencode 进程（客户端）发 SIGKILL ⇒ 外层 `timeout` 以 137 返回，
+  // 而 iterate.yml 把 124/137 视为「时间预算到期=成功」⇒ 步骤 success ⇒ relay 自动重启；
+  // 再自我 exit(0)。非生产（无 TG_BRIDGE_FORCE_SERVE=1）保持旧行为，绝不误杀。
+  const endRunNow = (): void => {
+    if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+      try {
+        for (const name of readdirSync("/proc")) {
+          if (!/^\d+$/.test(name)) continue
+          const pid = Number(name)
+          if (pid === process.pid) continue
+          let comm = ""
+          try {
+            comm = readFileSync(`/proc/${name}/comm`, "utf8").trim()
+          } catch {
+            continue
+          }
+          if (comm === "opencode") {
+            try {
+              process.kill(pid, "SIGKILL")
+            } catch {
+              /* 已退出/无权限：忽略 */
+            }
+          }
+        }
+      } catch {
+        /* /proc 不可读：忽略 */
+      }
+    }
+    try {
+      setTimeout(() => process.exit(0), 450)
+    } catch {
+      process.exit(0)
+    }
+  }
   const injectAllowed = async (sid: string, m: any, tag: string): Promise<boolean> => {
     const t = (m as any)?.time ?? {}
     // 重启孤儿（创建早于本进程启动 + 未完成）：生成者已死，不可能是活回合。
@@ -1429,6 +1485,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       if (kind === "round") {
         errStreak.delete(sessionID)
         errStreakSeen.delete(sessionID)
+        errStallSince.delete(sessionID)
       }
       return "ok"
     } catch (err) {
@@ -1664,6 +1721,46 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           }
         }
       }
+      // ── R211 死循环跳闸（运营者 2026-10-19 03:16 指令：「任何错误都应该触发」）──
+      // 事故实证（10-18 夜 5.5h 静默，run 39168964380）：错误尾条出现后，decided 闉锁 /
+      // 持久认领 / in-flight-hold / fatal-giveup / empty-stall 熔断**任意一层短路**，
+      // 都能让其后的所有守卫（墙钟 L1846、连错计数）静默失效 → 既不输出也不重启。
+      // 本检查位于**全部短路之前**，只看「尾条是错误 + 错误态已持续 + 会话确已空闲」：
+      //   · t0 = 本进程内首次见到错误尾条的墙钟（跨进程重置；新进程给 5min 自愈期）
+      //   · quiet = 尾条自 updated/completed/created 起 ≥ ROUND_SETTLE_MS 无动静（不在宿主重试里）
+      //   · injectAllowed 复核 = 宿主确认会话空闲（活回合/流式中 ⇒ 永不跳闸）
+      //   · 用户显式停（user-abort-pause/agent-paused/loop-stopped/auto-guard）永不跳闸
+      // 三者齐备且 ≥ AC_ERR_STALL_MS ⇒ END-ROUND-CI（exit 0 → relay 重启 CI；运营者授权）。
+      {
+        const sk = skipState.get(sessionID)
+        const userExcluded =
+          !!sk &&
+          (sk.reason === "loop-stopped" ||
+            sk.reason === "auto-guard" ||
+            sk.reason === "user-abort-pause" ||
+            sk.reason === "agent-paused")
+        if (userExcluded) {
+          errStallSince.delete(sessionID)
+        } else if ((lastAssistant!.info as any)?.error) {
+          const la: any = lastAssistant!.info
+          const t = la?.time ?? {}
+          const activity = Math.max(Number(t.updated ?? 0), Number(t.completed ?? 0), Number(t.created ?? 0))
+          if (errStallSince.get(sessionID) === undefined) errStallSince.set(sessionID, Date.now())
+          const quiet = activity > 0 && Date.now() - activity >= ROUND_SETTLE_MS
+          if (quiet && stallExceeded(sessionID) && (await injectAllowed(sessionID, la, "stall-trip"))) {
+            await log(
+              "info",
+              `auto-continue: dead-loop trip (pre-latch; session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(String(la?.id ?? ""))}, err=${errorName(la)}, idle=${Math.round((Date.now() - activity) / 1000)}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
+            )
+            if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+              endRunNow()
+            }
+            return
+          }
+        } else {
+          errStallSince.delete(sessionID)
+        }
+      }
       // R-1720：全局 /loop stop 期间由 readCtl 分支写入的 "loop-stopped" 粘性条目，
       // 在 /loop start 重开闸后必须立即失效 —— 否则闸已开而 newestId 无新消息时，
       // 每拍命中下方 `skip.lastId === newestId` 静默 return，会话永久停摆
@@ -1822,6 +1919,19 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         return
       }
 
+      if (!msg.error) {
+        errStallSince.delete(sessionID)
+      } else if (stallExceeded(sessionID)) {
+        // R210（运营者指令）：错误停滞 ≥ 阈值（5 连错的墙钟等价物）→ 结束本轮 CI。
+        await log(
+          "info",
+          `auto-continue: error stall ≥${Math.round(AC_ERR_STALL_MS / 60000)}min (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
+        )
+        if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+          endRunNow()
+        }
+        return
+      }
       if (msg.error) {
         settle(msg)
         // R2496：可选功能——网络类 provider 错误（ECONNRESET/速率限制等）时自动切换代理节点。
@@ -1927,7 +2037,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
                 `auto-continue: consecutive recoverable errors x${es} (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run)`,
               )
               if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-                setTimeout(() => process.exit(0), 1500)
+                endRunNow()
               }
               return
             }
@@ -2295,6 +2405,38 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   let tickN = 0
   const acTimer = setInterval(() => {
     try {
+      // R210/R211 演练钩子（运营者已授权「错误重启模拟」）：仅当
+      // /tmp/opencode/sim-err-restart 的内容等于本 run 的 GITHUB_RUN_ID 时命中，
+      // 复刻错误出口（exit 0 → iterate.yml relay 自动重启 CI）。删除标记文件即永久失效。
+      // R211 增加**年龄门（≥240s）**：上一版靠 nohup sleeper 延迟写标记，结果标记疑似
+      // 根本没落盘（run 39143823566 跑满 5.5h 且全日志无演练行）——改为直接写标记 + 年龄门
+      // 等待，等待期每拍打一行 marker present 日志，可现场验证钩子确实在跑。
+      try {
+        const simRaw = readFileSync("/tmp/opencode/sim-err-restart", "utf8").trim()
+        if (simRaw !== "" && simRaw === String(process.env.GITHUB_RUN_ID ?? "")) {
+          let simAgeS = 0
+          try {
+            simAgeS = Math.round((Date.now() - statSync("/tmp/opencode/sim-err-restart").mtimeMs) / 1000)
+          } catch {
+            simAgeS = 0
+          }
+          if (simAgeS < 240) {
+            void log(
+              "info",
+              `auto-continue: SIM drill marker present (run=${simRaw}, age=${simAgeS}s < 240s) — waiting (age gate)`,
+            )
+          } else if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+            void log(
+              "info",
+              `auto-continue: SIM err-restart drill (run=${simRaw}, age=${simAgeS}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
+            )
+            endRunNow()
+            return
+          }
+        }
+      } catch {
+        /* 无标记文件：正常路径 */
+      }
       // 桥的"死人开关"（见模块级注释）：只在**状态变化**时记一条，不刷屏。
       // 判据只用 bridgeLivenessState() 这**一个**来源 —— 不留两份实现
       // （两份判据迟早会分叉，而"心跳停滞"这种告警一旦分叉就无法判断该信谁）。
