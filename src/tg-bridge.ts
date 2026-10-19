@@ -5559,6 +5559,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const doneAt = Number(m?.time?.completed ?? m?.info?.time?.completed ?? m?.time?.created ?? m?.info?.time?.created ?? 0)
     const backfillLate = backfill && doneAt > 0 && lastProtoSendAt > doneAt
     const backfillClock = backfillLate ? fmtClock(Date.now()) : ""
+    // 验证锚点（R276）：触发「补发时刻」改写时留一行日志，下一代可直接 grep 'backfill-late'
+    // 核对（无此行则"已修复"与"没触发过"完全同形，无法验证）。
+    if (backfillLate) void log("info", `backfill-late (${sanitizeLog(sessionID).slice(0, 12)} msg=${msgKey} 补=${backfillClock} 原=${fmtClock(doneAt)})`)
     const lateTitle = (base: string, p: any): string =>
       `${base} · ${backfillClock}（补发 ${fmtClock(partTime(p) || doneAt)}）${ctxSuffix(sessionID)}`
     // 附加镜像档：标题前加会话名，避免多会话正文混淆。
