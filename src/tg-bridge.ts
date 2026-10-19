@@ -5199,12 +5199,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             const transientStripFail = isTransientStripFailure(status)
             if (transientStripFail) {
               if (status === 429) {
-                await log("error", `backfill strip deferred (mid=${v.id}, status=429; flood gate, 瞬时失败不计入放弃)`)
+                // R434（R433 backlog 微项）：瞬时 defer 不该用 error（语义=闸内延迟、非放弃；
+                // error 只留给确定性失败/放弃），与 R431 retry 降噪同旨。
+                await log("warn", `backfill strip deferred (mid=${v.id}, status=429; flood gate, 瞬时失败不计入放弃)`)
                 break
               }
               const kind = status === 0 ? `network/no-response${r.desc ? ` (${r.desc})` : ""}` : `status=${status}`
               const why = status === 0 ? "网络层失败可重试" : "服务端瞬时失败可重试"
-              await log("error", `backfill strip failed (mid=${v.id}, ${kind}; ${why}，不计入放弃)`)
+              await log("warn", `backfill strip failed (mid=${v.id}, ${kind}; ${why}，不计入放弃)`)
               continue
             }
             // 到此为**非瞬时**且非 400/403（例如 404 message not found）：确定性失败，累计用于放弃。
