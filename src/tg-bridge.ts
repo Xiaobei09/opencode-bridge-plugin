@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
-import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync } from "node:fs"
+import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync, existsSync } from "node:fs"
 import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
@@ -10984,6 +10985,45 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       if (lwGuard()) void lockWatchTick()
     }, 180_000)
     await log("info", "proxy-lock-watch: enabled (locked-node quality guard, every 180s; R807 materialize-window)")
+  }
+
+  // ── R277（运营者 R276 指令）：快照交接优化 save 侧 ──────────────────────────────
+  // primary 实例周期性（默认 300s，1-10 分钟可调）把 $HOME 载荷同步到会话仓库孤儿
+  // 分支 `env-sync`（脚本 opencode/config/scripts/env-sync.sh；设计与实测见
+  // sessions/2026-10-19-snapshot-handoff-optimization.md）。目标：run 尾的 env 全量
+  // 打包（≈1m45s）改由运行期滚动完成，restore 侧随后可优先从分支恢复（新鲜度
+  // ≤5 分钟；release 资产保持兜底）。仅 primary 触发（三实例重复同步无意义）；
+  // detached 子进程 + 脚本自持锁 ⇒ 热重载/重叠触发安全，不占事件循环。
+  if (BOT_ID === "primary") {
+    const envSyncScript = process.env.ENV_SYNC_SCRIPT ?? "REDACTED_ROOT/work/sessions/opencode/config/scripts/env-sync.sh"
+    const envSyncEveryMs = Math.min(3_600_000, Math.max(60_000, Number(process.env.ENV_SYNC_INTERVAL_MS ?? 300_000) || 300_000))
+    const runEnvSyncTick = (why: string) => {
+      try {
+        if (!existsSync(envSyncScript)) return
+        const child = spawn("bash", [envSyncScript], {
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env, ENV_SYNC_WHY: why },
+        })
+        child.unref()
+      } catch (err) {
+        void log("warn", `env-sync spawn failed: ${sanitizeLog(String(err)).slice(0, 120)}`)
+      }
+    }
+    // R721 同款热重载护栏：被换代后清掉两个句柄，避免旧实例空转 ticker。
+    let esBoot: ReturnType<typeof setTimeout> | null = null
+    let esTimer: ReturnType<typeof setInterval> | null = null
+    const esGuard = (): boolean => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) {
+        if (esBoot) { try { clearTimeout(esBoot) } catch { /* ignore */ } }
+        if (esTimer) { try { clearInterval(esTimer) } catch { /* ignore */ } }
+        return false
+      }
+      return true
+    }
+    esBoot = setTimeout(() => { if (esGuard()) runEnvSyncTick("boot") }, 150_000)
+    esTimer = setInterval(() => { if (esGuard()) runEnvSyncTick("interval") }, envSyncEveryMs)
+    await log("info", `env-sync: enabled (save-side R277; every ${Math.round(envSyncEveryMs / 1000)}s, script=${envSyncScript})`)
   }
 
   return {
