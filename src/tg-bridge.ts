@@ -3444,7 +3444,7 @@ export const buildMenuKeyboard = (
       [b("🧽 清理旧按钮", "ma:stripall"), b("🩹 纠正卡住的工具卡", "ma:healcards")],
       [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
       [b("🧬 迁移到新会话", "ma:migrate"), b("🪪 我是谁", "ma:whoami")],
-      [b("🤖 版本/owner", "ma:owner"), b("🔢 版本号", "ma:version")],
+      [b("👤 属主记录", "ma:owner"), b("🔢 桥版本", "ma:version")],
       [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute"), b("❓ 帮助", "ma:help")],
       [b("⬅️ 返回", "m:root")],
     ]
@@ -3715,7 +3715,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // Menu signature cache: hot reloads should not spend Telegram quota on identical commands.
   const registerMyCommands = async (): Promise<void> => {
     try {
-      // 收敛后的命令面板：手机端命令菜单只暴露 6 个入口，其余功能全在 /menu 按钮菜单里。
+      // 收敛后的命令面板：手机端命令菜单只暴露 7 个入口，其余功能全在 /menu 按钮菜单里。
       // 文本命令全部保留（菜单动作复用同一条处理链），只是不再占菜单位置。
       const commands = [
         { command: "menu", description: "打开控制台（全部功能）" },
