@@ -942,6 +942,10 @@ let TURN_NOTE_OWNER_ONLY = process.env.TG_TURN_NOTE_OWNER_ONLY !== "0"
 const AC_MIN_ROUND_MS = Number(process.env.AC_MIN_ROUND_MS ?? 90_000) || 90_000
 const TURN_NOTE_QUIET_MS = Number(process.env.TG_TURN_NOTE_QUIET_MS ?? "") || AC_MIN_ROUND_MS + 30_000
 const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 12 // R1889 重试总额度（12 次 ≈ 退避累计 5 分钟）；理由见 run() 内 retry 分支的注释
+// R431（「乱序消息再次出现」的传输层根因收敛）：瞬时失败（网络异常/5xx）首次重试从 5s 提前到
+// 0.6s —— 迟到窗口越小，期间新消息抢先送达造成的时钟倒挂越少。429 仍用原 5s 首拍（尊重
+// flood gate / retry_after）；后续退避不变（5s×attempt）。可用 TG_PROTO_RETRY_QUICK_MS 覆盖。
+const PROTO_RETRY_QUICK_MS = Number(process.env.TG_PROTO_RETRY_QUICK_MS ?? "") || 600
 // R-2026-10-19 补发标注降噪（运营者实报「补发也太多了」）：catchup 补推常见迟到仅数秒~25s，
 // R276 的「（补发 …）」括注在高频补推时刷屏。现仅当迟到 ≥ LATE_NOTE_MIN_MS 才显示括注；
 // 阈值内补推**仍改写标题时钟**（发送顺序单调不变，R276 初衷保留）。可用 TG_LATE_NOTE_MIN_MS 调整。
@@ -4961,7 +4965,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     kb: unknown[][] | undefined,
     silent: boolean,
     editId = 0,
-    fallback = false
+    fallback = false,
+    firstDelayMs = 5_000
   ): void => {
     if (!key.includes(":message:") && !key.includes(":ask:")) return
     const old = protoRetry.get(key)
@@ -5096,7 +5101,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       )
       protoRetry.delete(key)
     }
-    item.timer = setTimeout(() => void run(), 5_000)
+    item.timer = setTimeout(() => void run(), firstDelayMs)
   }
 
   // 启动回扫：protoMap 里残留的旧 :message: 键一律扒键（新回复落地后自然只剩最新）。
@@ -5372,7 +5377,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           lastProtoSendAt = Date.now()
           await log("warn", `proto edit-degrade delivered (${sanitizeLog(key)}) no message_id, 无法锚定卡片: ${ndv.why}`)
         } else if (n.r === "retry") {
-          scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true)
+          const nStatus = (n as { status?: number }).status ?? 0
+          scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true, nStatus === 429 ? 5_000 : PROTO_RETRY_QUICK_MS)
         } else {
           // R1877：降级新发**永久失败**（4xx/drop）。旧写法只匹配 sent+id / retry / sent，`drop`
           // 三支全不中 → **静默丢弃**：既不排重试、不进 dropRing、也没日志。用户视角是"编辑失败后
@@ -5415,8 +5421,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await log("warn", `proto send degraded (${sanitizeLog(key)}) no message_id, 无法锚定卡片: ${dv.why}`)
     } else {
       rollback()
-      if (r.r === "retry") scheduleProtoRetry(key, chatID, text, kb, silent)
-      await log("error", `proto send ${r.r} (${sanitizeLog(key)}) len=${text.length}`)
+      if (r.r === "retry") scheduleProtoRetry(key, chatID, text, kb, silent, 0, false, r.status === 429 ? 5_000 : PROTO_RETRY_QUICK_MS)
+      // R431：retry 是可自愈的瞬时状态（成功另行 info），error 级会被巡检误读成故障
+      // （D8 曾把 26 条正常重试全计成「错误」）；永久失败（drop）仍保持 error。
+      await log(r.r === "retry" ? "warn" : "error", `proto send ${r.r} (${sanitizeLog(key)}) len=${text.length}`)
     }
   }
 
