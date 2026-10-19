@@ -1210,6 +1210,23 @@ export const lastRealUserExcerpt = (rows: unknown[]): string => {
   return ""
 }
 
+// 运营者实报（2026-10-19）「乱序消息再次出现」：传输层重试（proto retry）与 catchup 补推不同——
+// 重试件携带的是**渲染时**的标题时钟，几秒~几分钟后才送达；期间更新的消息可能已先行 ⇒
+// 聊天流出现时钟倒挂（与 R276「签署时间与发送顺序不符」同源）。本纯函数在重试发送前
+// 把标题首行的时钟改写为**本次发送时刻**；迟到达到阈值时把原时刻放进「（补发 原时刻）」括注。
+// 幂等：已是「新钟（补发 原钟）」时再次改写仍以**最初原时刻**为准，不叠加括注。
+// 只动首行第一个 ` · HH:MM:SS`（找不到则原样返回），正文/代码块不触碰。
+export const rewriteRetryClock = (text: string, nowClock: string, withNote: boolean): string => {
+  const nl = text.indexOf("\n")
+  const head = nl >= 0 ? text.slice(0, nl) : text
+  const m = head.match(/ · (\d{2}:\d{2}:\d{2})(?:（补发 (\d{2}:\d{2}:\d{2})）)?/)
+  if (!m || m.index === undefined) return text
+  const origClock = m[2] ?? m[1]
+  const note = withNote ? `（补发 ${origClock}）` : ""
+  const newHead = `${head.slice(0, m.index)} · ${nowClock}${note}${head.slice(m.index + m[0].length)}`
+  return nl >= 0 ? `${newHead}${text.slice(nl)}` : newHead
+}
+
 const readSessionMessages = async (sessionID: string): Promise<any[]> => {
   const db = await openDb()
   if (!db) return []

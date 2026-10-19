@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync, existsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg, rewriteRetryClock } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
@@ -4052,6 +4052,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     silent: boolean
     editId: number
     attempt: number
+    firstTryAt: number
     timer?: ReturnType<typeof setTimeout>
   }>()
   const pollInstanceId = `pid-${process.pid}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`
@@ -4973,7 +4974,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       old.fallback = fallback
       return
     }
-    const item = { chatID, text, kb, silent, editId, fallback, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined }
+    const item = { chatID, text, kb, silent, editId, fallback, attempt: 0, firstTryAt: Date.now(), timer: undefined as ReturnType<typeof setTimeout> | undefined }
     protoRetry.set(key, item)
     while (protoRetry.size > 200) {
       const first = protoRetry.keys().next()
@@ -5014,9 +5015,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return
       }
       item.timer = undefined
+      // R-2026-10-19（运营者实报「乱序消息再次出现」）：本函数=传输层重试路径，item.text 带的是
+      // **渲染时**标题时钟；迟到数秒~数分钟送达时，期间更新的消息可能已先行 ⇒ 聊天流时钟倒挂
+      // （与 R276 补推同源的观感问题）。发送时改写标题时钟为**本次发送时刻**；迟到 ≥
+      // LATE_NOTE_MIN_MS 时把原时刻放进「（补发 原时刻）」括注（幂等，只动首行第一个时钟）。
+      // 只改发送副本，item.text 保持原文 ⇒ 下方「重复发送自清理」的同文比对不受影响。
+      const sendText = rewriteRetryClock(item.text, fmtClock(Date.now()), Date.now() - (item.firstTryAt || Date.now()) >= LATE_NOTE_MIN_MS)
       const r = item.editId > 0
-        ? await editTextRaw(item.chatID, item.editId, item.text, item.kb, item.fallback)
-        : await sendTextRaw(item.chatID, item.text, item.kb, item.silent)
+        ? await editTextRaw(item.chatID, item.editId, sendText, item.kb, item.fallback)
+        : await sendTextRaw(item.chatID, sendText, item.kb, item.silent)
       if (r.r === "sent") {
         const id = r.id ?? item.editId
         // ── 重复发送自清理（at-least-once 的必然产物）─────────────────────
