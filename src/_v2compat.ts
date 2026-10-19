@@ -1180,6 +1180,36 @@ export const readRecentUserTexts = async (sessionID: string, limit = 60): Promis
   }
 }
 
+// 运营者指令（2026-10-19）：「循环注入提示词增加上次用户注入的内容，避免ai忘记」。
+// lastRealUserExcerpt：从会话行提取最近一条**真实（非合成注入）**用户消息原文，
+// 供 auto-continue.inject() 附在 ROUND/RECOVER 注入文本尾部；前缀保持不动 ⇒
+// isSyntheticPrompt（startsWith ROUND/RECOVER 前缀）判定与注入去重不受影响。
+// 跳过：合成注入（循环/恢复/自动恢复首行）、空文本；剥掉 TG 注入标记 `[TG …]` 头。
+export const LAST_USER_EXCERPT_MAX = 2000
+const SYNTHETIC_USER_PREFIXES = ["继续自动筛查循环", "上一轮自动筛查应答因可恢复错误中断", "自动恢复：上一轮 run"]
+const TG_PREFIX_RE = /^\[TG [^\]]*\]\s*/
+export const lastRealUserExcerpt = (rows: unknown[]): string => {
+  const list = Array.isArray(rows) ? rows : []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r: any = list[i]
+    const role = String(r?.info?.role ?? r?.role ?? "")
+    if (role !== "user") continue
+    const parts: any[] = Array.isArray(r?.parts) ? r.parts : Array.isArray(r?.info?.parts) ? r.info.parts : []
+    let txt = parts
+      .filter((p: any) => p?.type === "text")
+      .map((p: any) => String(p?.text ?? ""))
+      .join("")
+      .trim()
+    if (!txt) continue
+    if (SYNTHETIC_USER_PREFIXES.some((prefix) => txt.trimStart().startsWith(prefix))) continue
+    txt = txt.replace(TG_PREFIX_RE, "").trim()
+    if (!txt) continue
+    const excerpt = txt.length > LAST_USER_EXCERPT_MAX ? `${txt.slice(0, LAST_USER_EXCERPT_MAX)}……（截断）` : txt
+    return `\n\n【上次用户注入内容（原文摘录，自动附带避免遗忘）】\n${excerpt}`
+  }
+  return ""
+}
+
 const readSessionMessages = async (sessionID: string): Promise<any[]> => {
   const db = await openDb()
   if (!db) return []

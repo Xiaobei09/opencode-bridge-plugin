@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync, readdirSync } from "node:fs"
-import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn } from "./_v2compat"
+import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn, lastRealUserExcerpt } from "./_v2compat"
 // R2496：可选功能——网络类 provider 错误（ECONNRESET / 速率限制等）时，自动切换代理节点。
 import { maybeSwitchProxyNode } from "./proxy-switch"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
@@ -1460,10 +1460,23 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       // promptAsync 同样可能挂起 —— 一次挂起就会堵死该会话的整条评估链（见 evaluateQueued）。
       // R227：尾部附自动注入提示（不动前缀，SYNTHETIC_LOOP_MARKERS 的 startsWith 判定不受影响）。
+      // 运营者指令（2026-10-19）：「循环注入提示词增加上次用户注入的内容，避免ai忘记」——
+      // 注入文本尾部再附最近一条真实用户消息原文（best-effort；取不到就照常注入，不阻塞）。
+      let lastUserSection = ""
+      try {
+        const lres = await withTimeout(client.session.messages({ path: { id: sessionID } }), "session.messages")
+        const lrows = (lres as { data?: any[] })?.data
+        if (Array.isArray(lrows)) {
+          sortRowsByCreatedTime(lrows)
+          lastUserSection = lastRealUserExcerpt(lrows)
+        }
+      } catch {
+        /* 附带内容为增强项，缺失不影响循环注入 */
+      }
       await withTimeout(
         client.session.promptAsync({
           path: { id: sessionID },
-          body: { parts: [{ type: "text", text: `${text}${AUTO_INJECT_HINT}` }] },
+          body: { parts: [{ type: "text", text: `${text}${lastUserSection}${AUTO_INJECT_HINT}` }] },
         }),
         "session.promptAsync",
       )
