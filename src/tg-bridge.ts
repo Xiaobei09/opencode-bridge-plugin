@@ -65,7 +65,7 @@ const bgHttpPromote = async (sid: string): Promise<{ ok: boolean; text: string }
     if (!r.ok) return { ok: false, text: `✗ HttpApi 提升被拒：HTTP ${r.status}` }
     return { ok: true, text: `✓ 已请求转后台（直连宿主 HttpApi，HTTP ${r.status}）` }
   } catch (err) {
-    return { ok: false, text: `✗ 直连失败：${String(err).slice(0, 120)}` }
+    return { ok: false, text: `✗ 直连失败：${safeCut(String(err), 120)}` }
   }
 }
 // 直连宿主 HttpApi 是否可用（service.json 同时含 url 与 password）。手动提升与自动提升共用此判据。
@@ -1350,6 +1350,29 @@ export const planQueuePinCleanup = (current: number | undefined, hist: readonly 
   ...new Set([...(current !== undefined ? [current] : []), ...hist]),
 ]
 
+/**
+ * R249：UTF-16 安全截断（防乱码「�」）。
+ * 裸 `slice(0,n)` 若切在 emoji 等代理对中间会产生**孤立代理字符**，JSON→Telegram 渲染为 �。
+ * safeCut：头部截断；切点前一字符为高位代理 D800-DBFF 时回退 1（丢弃半个代理对）。
+ * safeTail：尾部截断（取末尾 n 字符）；起点字符为低位代理 DC00-DFFF 时前移 1。
+ */
+const safeCut = (s: string, n: number): string => {
+  if (s.length <= n) return s
+  let c = n
+  if (c > 0) {
+    const code = s.charCodeAt(c - 1)
+    if (code >= 0xd800 && code <= 0xdbff) c -= 1
+  }
+  return s.slice(0, c)
+}
+const safeTail = (s: string, n: number): string => {
+  if (s.length <= n) return s
+  let start = s.length - n
+  const code = s.charCodeAt(start)
+  if (code >= 0xdc00 && code <= 0xdfff) start += 1
+  return s.slice(start)
+}
+
 export const renderToolTerminalCard = (sessionID: string, part: any, status: string, mins: number): string => {
   const st = part?.state ?? {}
   const name = clean(part?.tool ?? "tool", 40)
@@ -1364,8 +1387,8 @@ export const renderToolTerminalCard = (sessionID: string, part: any, status: str
     `<blockquote><pre><code${lang ? ` class="language-${lang}"` : ""}>${htmlEsc(code)}</code></pre></blockquote>`
   const OUT_TAIL = 900
   const IN_TAIL = 600
-  const outTail = outText.length > OUT_TAIL ? outText.slice(0, 120) + "\n…（略）…\n" + outText.slice(-OUT_TAIL) : outText
-  const inTail = inText.length > IN_TAIL ? inText.slice(0, IN_TAIL) + "\n…（略）…" : inText
+  const outTail = outText.length > OUT_TAIL ? safeCut(outText, 120) + "\n…（略）…\n" + safeTail(outText, OUT_TAIL) : outText
+  const inTail = inText.length > IN_TAIL ? safeCut(inText, IN_TAIL) + "\n…（略）…" : inText
   const lines: string[] = [`<b>🔧 ${htmlEsc(disp)} 执行 · 开始 ${clock}${htmlEsc(ctxSuffix(sessionID))}</b>`]
   // ① edit 类工具补 diff 区（与事件路径 inputZone 的形状对齐：📥 变更 + language-diff）
   const rawInObj = (rawIn && typeof rawIn === "object" ? rawIn : {}) as Record<string, unknown>
@@ -1374,7 +1397,7 @@ export const renderToolTerminalCard = (sessionID: string, part: any, status: str
   const isEditLike = /^(edit|write|patch|multiedit|apply_patch|str_replace)$/i.test(name)
   const diffBody =
     isEditLike && (typeof oldStr === "string" || typeof newStr === "string")
-      ? `--- a\n${(oldStr ?? "").slice(0, 600)}\n+++ b\n${(newStr ?? "").slice(0, 600)}`
+      ? `--- a\n${safeCut(oldStr ?? "", 600)}\n+++ b\n${safeCut(newStr ?? "", 600)}`
       : ""
   // ② 语言标记：结构化入参/输出按 JSON 上色（原先三处 box("") → 高亮全丢，探针实测 language-* = 0）
   const looksJson = (t: string): boolean => /^[\s]*[[{]/.test(t)
@@ -1383,7 +1406,7 @@ export const renderToolTerminalCard = (sessionID: string, part: any, status: str
   if (diffBody) lines.push("\n📥 变更\n" + box("diff", diffBody))
   else if (inTail) lines.push("\n📥 入参\n" + box(inLang, inTail))
   if (outTail) lines.push("\n📤 输出\n" + box(outLang, outTail))
-  if (errText) lines.push("\n" + box("", errText.slice(0, 500)))
+  if (errText) lines.push("\n" + box("", safeCut(errText, 500)))
   // 与**正常卡**结构对齐（用户反馈过"格式完全坏掉"）：正常卡以 DIV + statusLine 收尾，
   // 这里用同样的分隔线与同样带 exit 的措辞，避免两条路径产出两种长相。
   const exit = st?.metadata?.exit
@@ -2332,7 +2355,7 @@ const savePersistedState = (): void => {
         // 而巡检是唯一能抓到真实格式缺陷的那一层（R1007 的真 bug 就是它抓到的）。
         // ROUND 10：先 protoRedact 再截断（截断会把 token 劈成两半而漏过正则），
         // 既保住上面的"标签安全"，又不让工具卡原文里的凭据落盘。
-        proto: [...protoMap.entries()].slice(-1000).map(([k, v]) => [k, v.id, v.fallback === true, v.runningAt ?? 0, v.text && k.includes(":tool:") ? balanceHtmlTags(protoRedact(v.text).slice(0, 1500)) : ""]),
+        proto: [...protoMap.entries()].slice(-1000).map(([k, v]) => [k, v.id, v.fallback === true, v.runningAt ?? 0, v.text && k.includes(":tool:") ? balanceHtmlTags(safeCut(protoRedact(v.text), 1500)) : ""]),
         hashes: [...sentHash].slice(-1500),
         rounds: Object.fromEntries([...lastRound.entries()].slice(-200)),
         // 只落盘真实 update_id（负数是菜单合成事件，见 handleUpdateInner）
@@ -2404,7 +2427,7 @@ const savePersistedState = (): void => {
 // "两个 Bot 都回同一条消息"。真正的加载由 configureBot() 在微任务里做（路径已就位）。
 if (!BOOTSTRAP_BOT) loadPersistedState()
 const clean = (s: unknown, n: number): string =>
-  String(s ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n)
+  safeCut(String(s ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim(), n)
 const POLL_MS = Number(process.env.TG_POLL_MS ?? "2000") || 2000
 // R1885：`/api/session` 的取回条数。实测服务端默认只给最近 50 个，而项目内实有 125 个 ——
 // 不显式要数量，会话选择闸口会把「排在 50 名之外但真实存在」的会话误判为不存在。
