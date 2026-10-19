@@ -5548,9 +5548,19 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     touchOwnSession(ownSessions, sid, 24)
   }
 
-  const protoPushAssistantMessage = async (sessionID: string, chatID: string, m: any, force = false, mode: 'full' | 'text' = 'full'): Promise<void> => {
+  const protoPushAssistantMessage = async (sessionID: string, chatID: string, m: any, force = false, mode: 'full' | 'text' = 'full', backfill = false): Promise<void> => {
     noteOwnSession(sessionID)   // R1054：走到这里 = 本 bot 真的要投递这个会话
     const msgKey = String(m?.id ?? m?.info?.id ?? "m").slice(0, 20)
+    // R276：补推（catchup 补扫 R1827）的时间-顺序一致性修复。catchup 最多在消息完成后
+    // ~25s 才补推，期间事件路径可能已把**更新的**卡片推到前面；补推卡若仍标注旧事件时刻，
+    // 用户就看到「签署时间与发送顺序不相符」（运营者实报）。判据：本实例已有更晚的发送
+    // （lastProtoSendAt > 本消息完成时刻）⇒ 聊天流时钟会倒挂。此时标题时钟改用**本次补推
+    // 时刻**、并把原时刻放进「补发 …」括注：时钟随发送顺序单调，且读者知道这是补发而非实时。
+    const doneAt = Number(m?.time?.completed ?? m?.info?.time?.completed ?? m?.time?.created ?? m?.info?.time?.created ?? 0)
+    const backfillLate = backfill && doneAt > 0 && lastProtoSendAt > doneAt
+    const backfillClock = backfillLate ? fmtClock(Date.now()) : ""
+    const lateTitle = (base: string, p: any): string =>
+      `${base} · ${backfillClock}（补发 ${fmtClock(partTime(p) || doneAt)}）${ctxSuffix(sessionID)}`
     // 附加镜像档：标题前加会话名，避免多会话正文混淆。
     const tag = mode === 'text' ? `📌 ${sessionTag(sessionID)}` : ''
     let idx = 0
@@ -5563,7 +5573,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const fm = filt("think")
         if (txt && !isInternalLog(txt) && fm > 0) {
           const body = fm === 1 ? "" : fenceSafe(txt)
-          await protoSend(`${sessionID}:thinking:${msgKey}:${pIdx}`, chatID, protoBlock(ptitle("🧠 思考", p, m, sessionID), body), true, undefined, undefined, undefined, force)
+          const tTitle = backfillLate ? lateTitle("🧠 思考", p) : ptitle("🧠 思考", p, m, sessionID)
+          await protoSend(`${sessionID}:thinking:${msgKey}:${pIdx}`, chatID, protoBlock(tTitle, body), true, undefined, undefined, undefined, force)
         }
       } else if (t === "text") {
         const txt = String(p.text ?? "").trim()
@@ -5576,7 +5587,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           }
           const rbody = rm0 === 1 ? "" : fenceSafe(mdTableToHtml(mdBoldToHtml(txt)))
           const base = tag ? `${tag} · 💬 回复` : "💬 回复"
-          await protoSend(`${sessionID}:message:${msgKey}:${pIdx}`, chatID, protoBlock(ptitle(base, p, m, sessionID), rbody), true, undefined, undefined, undefined, force)
+          const mTitle = backfillLate ? lateTitle(base, p) : ptitle(base, p, m, sessionID)
+          await protoSend(`${sessionID}:message:${msgKey}:${pIdx}`, chatID, protoBlock(mTitle, rbody), true, undefined, undefined, undefined, force)
         }
       } else if (t === "tool") {
         const st = p?.state ?? {}
@@ -10717,7 +10729,9 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
             k.startsWith(`${sid}:error:${msgKey}`)
         )
         if (seen) continue
-        await protoPushAssistantMessage(sid, String(chat), m, false, "full")
+        // R276：补扫路径必须传 backfill=true → 迟到的补推卡改用补推时刻+「补发」括注，
+        // 消除「签署时间与发送顺序不相符」；事件路径的实时推送（backfill 缺省 false）不受影响。
+        await protoPushAssistantMessage(sid, String(chat), m, false, "full", true)
         await log(
           "info",
           `proto catchup pushed (${sanitizeLog(sid).slice(0, 12)} msg=${sanitizeLog(mid).slice(0, 20)} parts=${content.length})`
