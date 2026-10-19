@@ -3044,6 +3044,14 @@ export const safeHtmlCut = (line: string, i: number, max: number): number => {
   const semi = line.lastIndexOf(";", end - 1)
   if (amp > semi) end = amp
   if (end <= i) end = Math.min(i + max, line.length) // 兜底：保证切片循环前进
+  // R343：UTF-16 安全 —— 切点若落在代理对中间（前一半高代理、后一半低代理），两块会各自
+  // 渲染成「�」。把低代理一起带上（end+1，最多超出 max 1 个单元；PUSH_MAX=3800 远小于 TG
+  // 4096 上限，安全），保证代理对永不被劈开。
+  if (end > i && end < line.length) {
+    const prev = line.charCodeAt(end - 1)
+    const next = line.charCodeAt(end)
+    if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end += 1
+  }
   return end
 }
 
@@ -3450,7 +3458,6 @@ export const buildMenuKeyboard = (
       [b("🔄 刷新状态", "ma:proxy"), b("📋 候选节点", "ma:proxylist")],
       [b("⏭ 切下一节点", "ma:proxynext"), b("🔐 锁定当前节点", "ma:proxylock")],
       [b("🔓 解锁回自动", "ma:proxyunlock"), b(pOn ? "🔄 自动切节点：开（点此关）" : "⭕ 自动切节点：关（点此开）", pOn ? "ma:proxyoff" : "ma:proxyon")],
-      [b("🧾 配置清单", "ma:config")],
       [b("⬅️ 返回", "m:root")],
     ]
   }
@@ -3468,7 +3475,7 @@ export const buildMenuKeyboard = (
       [b("🧽 清理旧按钮", "ma:stripall"), b("🩹 纠正卡住的工具卡", "ma:healcards")],
       [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
       [b("🧬 迁移到新会话", "ma:migrate"), b("🪪 我是谁", "ma:whoami")],
-      [b("👤 属主记录", "ma:owner"), b("🔢 桥版本", "ma:version")],
+      [b("👤 属主记录", "ma:owner"), b("🔢 桥版本", "ma:version"), b("🧾 配置清单", "ma:config")],
       [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute"), b("❓ 帮助", "ma:help")],
       [b("⬅️ 返回", "m:root")],
     ]
@@ -3478,12 +3485,13 @@ export const buildMenuKeyboard = (
   // R2231 「模型」入驻根菜单（等价 /model），帮助移入系统页（ma:help 仍在）。
   // R2498 根菜单：新增「代理/切节点」入口 + 配置清单按钮（第 4 行）。
   // R201（用户 2026-10-18）：「思考深度」与「模型」同行（同族设置，都在改会话的模型侧参数）。
+  // R343（UX 审计）：「配置清单」从根菜单移入「系统」页——根菜单末行不再孤悬单键（4×2 均齐），
+  // 同时消除与「代理」页的重复入口（/config 是全局配置总览，不专属代理）。
   return [
     [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
     [b("🔁 循环", "m:loop"), b("⚙️ 后台", "m:bg")],
     [b("🤖 模型", "ma:model"), b("🧠 思考深度", "ma:think")],
     [b("🛠 系统", "m:sys"), b("🌐 代理/切节点", "m:proxy")],
-    [b("🧾 配置清单", "ma:config")],
   ]
   }
 
@@ -6761,9 +6769,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "📚 [tg-bridge] 可用命令",
     "【会话管理】",
     "· /help — 显示本列表",
-    "· /loop on — 本会话（当前目标）加入自动循环",
-    "· /loop off — 本会话退出自动循环（其它会话不受影响）",
-    "· /addbot &lt;token&gt; [chatId] [标签] — 登记一个新机器人（登记后需你手动把它拉进会话）",
+    "· /loop on — 本会话加入自动继续（会话级；Bot 级开关见 /loop start|stop）",
+    "· /loop off — 本会话退出自动继续（其它会话不受影响）",
+    "· /addbot <token> [chatId] [标签] — 登记一个新机器人（登记后需你手动把它拉进会话）",
     "· /sessions — 列出会话，带 [切换] 按钮（别名 /s；之后直接回序号也可选）",
     "  (⭐前台=GUI当前 · ◎活跃=10分钟内有输出 · 📌钉选)",
     "· /use [序号|名称|前缀|ID] — 钉选会话（如：/use 3；别名 /u；空参看当前）",
@@ -6792,10 +6800,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /stop — 停自动循环＋中断当前回合（/loop start 恢复）",
     "· /undo — 只中断当前回合（不停循环；等同卡片 ⏹ 按钮）",
     "· /retry — 重发上一次注入（回复机器人消息发“重来”同效）",
-    "· /loop [start|stop|status] — 自动循环开关（默认一直跑，用户 /loop stop 才停）",
+    "· /loop [start|stop|status] — Bot 级自动循环开关（默认一直跑；会话级用 /loop on|off）",
     "· /autoguard [on|off|status|problem on|off|web on|off] — 自动停止守卫（检测到问题/网页搜索请求即停循环；菜单「🔁 循环」里也有开关）",
     "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
-    "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model &lt;名称&gt; 切换当前会话模型，下次生成生效）",
+    "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model <名称> 切换当前会话模型，下次生成生效）",
     "· /think [档位] — 选择思考深度（模型 variant/reasoningEffort；无参=打开档位列表，档位随模型不同：如 default/low/高/max；只接受清单内的值）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
