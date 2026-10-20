@@ -81,7 +81,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2234-stuck-compaction-escape"
+const VERSION = "r2236-completed-dead-turn-resume"
 // 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
 // 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
 // env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
@@ -808,6 +808,7 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const orphanLogged = new Set<string>()
   const pending = new Map<string, number>()
   const emptyStreak = new Map<string, number>()
+const completedDeadStreak = new Map<string, number>()
   // 已回源核对过的消息（避免同一条反复打 API）
   const refetchedEmpty = new Set<string>()
   // 粘性"这是循环会话"标志：此前循环资格只靠**用户消息里的关键字**（筛查循环 / [STATUS: /
@@ -2284,12 +2285,17 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         // 空转熔断：只有【已完成仍无文本】才计数；流式中一律视为瞬态（不计数、不熔断、不掐回合）。
         // 验尸 00:34:59：曾把首 token 到达 3 秒后的前台直播消息当空转掐掉（Step interrupted 误伤）。
         const completedTs = Number((msg as any)?.time?.completed ?? 0)
-        const workedAnyway = hasNonTextWork(msg)
+        // R2236：completed 且无 text/tool 的“死回合”也要走 workedAnyway 的有限续跑路径。
+        // 旧实现只认 parts 里的 reasoning；API parts 缺失时 workedAnyway=false，
+        // 会落入 empty-stall/GIVEUP 或永久等待（bot3 2026-10-20 02:52Z 复发的第二种形态）。
+        const completedDead = completedTs > 0 && !hasRealToolWork(msg) && len === 0
+        const workedAnyway = hasNonTextWork(msg) || completedDead
         if (attempts >= 2 && completedTs > 0 && !workedAnyway && !reasoningOnlyMsgs.has(String(msg.id))) {
           const n = (emptyStreak.get(sessionID) ?? 0) + 1
           emptyStreak.set(sessionID, n)
           if (n >= 5) {
             emptyStreak.delete(sessionID)
+            completedDeadStreak.delete(sessionID)
             pending.delete(msg.id)
             giveupCount.set(sessionID, (giveupCount.get(sessionID) ?? 0) + 1)
             skipState.set(sessionID, { lastId: msg.id, reason: "empty-stall-giveup", ts: Date.now() })
@@ -2299,18 +2305,28 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             return
           }
         }
+        let completedDeadTurn = false
         if (workedAnyway) {
+          // 真实文本/工具产出即恢复，清零连续 reasoning-only 计数。
+          if (len > 0 || hasRealToolWork(msg)) completedDeadStreak.delete(sessionID)
           if (!(await injectAllowed(sessionID, msg, "round:workedAnyway"))) return
           // R1092: 只有 reasoning 没有工具/文本 = 还在思考/被截断，不算"主动结束干活"，
           // 不注入（用户反馈「AI 没有输出时循环文本仍被注入」）；也不计空转（R1065 豁免）。
+          // R2235/R2236: completed>0 且无 text/tool 表示回合已结束，不是"还在思考"；
+          // 这是死回合，必须允许有限续跑，否则会像 bot3 2026-10-20 09:10 CST 那样静默 47 分钟。
+          // 即使 API parts 缺失、只剩 empty，也由上面的 completedDead 纳入本路径。
           if (!hasRealToolWork(msg) && len === 0) {
-            noteReasoningOnly(String(msg.id))
-            pending.delete(msg.id)
-            if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
-              throttleLogAt.set(sessionID, Date.now())
-              await log('info', `auto-continue: eval session=${sanitizeLog(sessionID).slice(0, 12)} msg=${String(msg.id).slice(0, 14)} -> reasoning-only(workedAnyway:无工具产出), 不注入`)
+            const __done = Number((msg as any)?.time?.completed ?? 0) > 0
+            if (!__done) {
+              noteReasoningOnly(String(msg.id))
+              pending.delete(msg.id)
+              if (Date.now() - (throttleLogAt.get(sessionID) ?? 0) > 60_000) {
+                throttleLogAt.set(sessionID, Date.now())
+                await log('info', `auto-continue: eval session=${sanitizeLog(sessionID).slice(0, 12)} msg=${String(msg.id).slice(0, 14)} -> reasoning-only(workedAnyway:无工具产出, in-flight), 不注入`)
+              }
+              return
             }
-            return
+            completedDeadTurn = true
           }
           // R1092: workedAnyway 注入也遵守 R1090 最小间隔（此前绕过节流）
           {
@@ -2322,6 +2338,22 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               }
               return
             }
+          }
+          if (completedDeadTurn) {
+            const n = (completedDeadStreak.get(sessionID) ?? 0) + 1
+            completedDeadStreak.set(sessionID, n)
+            if (n >= 3) {
+              completedDeadStreak.delete(sessionID)
+              pending.delete(msg.id)
+              giveupCount.set(sessionID, (giveupCount.get(sessionID) ?? 0) + 1)
+              skipState.set(sessionID, { lastId: msg.id, reason: "empty-stall-giveup", ts: Date.now() })
+              await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} -> GIVEUP(completed-dead x${n}, waiting for new activity)`)
+              return
+            }
+            await log(
+              "info",
+              `auto-continue: completed dead-turn x${n} -> resume loop (session=${sessionID}, msg=${String(msg.id).slice(0, 20)}, completed>0, no text/tool)`,
+            )
           }
           // 有工具产出 = 在干活：清空空转计数，按正常节奏续跑（不必等 10s+ 重试）
           emptyStreak.delete(sessionID)
@@ -2355,6 +2387,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       if (!(await injectAllowed(sessionID, msg, "round:normal"))) return
       emptyStreak.delete(sessionID)
+      completedDeadStreak.delete(sessionID)
       await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
 
       // 用户消息只影响当前回合；助手回合完成后仍继续自动循环。
