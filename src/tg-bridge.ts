@@ -945,7 +945,7 @@ let TURN_NOTE_OWNER_ONLY = process.env.TG_TURN_NOTE_OWNER_ONLY !== "0"
 // 「输出结束」）。40s 后仍无续跑提示才算真正停摆。env TG_TURN_NOTE_QUIET_MS 可调。
 const AC_MIN_ROUND_MS = Number(process.env.AC_MIN_ROUND_MS ?? 90_000) || 90_000
 const TURN_NOTE_QUIET_MS = Number(process.env.TG_TURN_NOTE_QUIET_MS ?? "") || AC_MIN_ROUND_MS + 30_000
-const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 12 // R1889 重试总额度（12 次 ≈ 退避累计 5 分钟）；理由见 run() 内 retry 分支的注释
+const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS ?? "") || 48 // R711 重试总额度（48 次 ≈ 22 分钟）：必须覆盖 Telegram 429 最长 900s 冷却；12 次会在冷却结束前丢消息
 // R431（「乱序消息再次出现」的传输层根因收敛）：瞬时失败（网络异常/5xx）首次重试从 5s 提前到
 // 0.6s —— 迟到窗口越小，期间新消息抢先送达造成的时钟倒挂越少。429 仍用原 5s 首拍（尊重
 // flood gate / retry_after）；后续退避不变（5s×attempt）。可用 TG_PROTO_RETRY_QUICK_MS 覆盖。
@@ -5113,7 +5113,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         // （cap 200，淘汰会 warn 但那条内容就此不再送达）。没有额度上限意味着"瞬时抖动"
         // 与"永久故障"在行为上**无法区分**：后者会一直占着一个队列位并持续刷网。
         // 定性诚实：**无线上实际复发证据**（可见日志只覆盖约 7.5 分钟、436 行，不足以判断），
-        // 故这是潜在面硬化。默认 12 次 ≈ 退避累计 5 分钟，足以扛过瞬时抖动；
+        // 故这是潜在面硬化。R711 实测：429 冷却可达 900s，旧默认 12 次（≈5 分钟）会在
+        // 冷却结束前把 bot3 的补发永久丢弃；默认改为 48 次（≈22 分钟），覆盖 900s 冷却。
         // 耗尽后走**与永久失败同一条** verdict（error 级 + noteDrop 语义的日志），
         // 于是"没送出去"在日志里始终有交代，不靠沉默。env TG_PROTO_RETRY_MAX_ATTEMPTS 可调。
         if (item.attempt >= PROTO_RETRY_MAX_ATTEMPTS) {
