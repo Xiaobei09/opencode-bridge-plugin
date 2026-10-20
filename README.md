@@ -43,9 +43,10 @@ bash install.sh
 
 ## 运行注意（R617）
 
-- **网页搜索**：宿主 `websearch` 工具可能被取消（实测返回 `Web search cancelled`）；fallback 用 `webfetch https://lite.duckduckgo.com/lite/?q=<urlencoded>`，已实测 200/真实结果。桥本身不代理 websearch，不要把它当搜索 provider。
+- **网页搜索**：宿主 `websearch` 工具可能被取消（R619 实测仍返回 `Web search cancelled`）；fallback 用 `webfetch https://www.bing.com/search?q=<urlencoded>`（R619 实测 200/真实结果）。`lite.duckduckgo.com` 可能返回 202 challenge，不能作为唯一 fallback。桥本身不代理 websearch，不要把它当搜索 provider。
 - **出站图片**：桥当前只有入站 `msg.photo` 分支，没有 `sendPhoto` / `sendDocument`；agent 生成的图不会自动发到 TG。若需要，显式文件发送是 backlog。
-- **菜单/乱码**：文本截断走 UTF-16 安全路径；根菜单 4×2，回调完整性有 `tests/menu-root.test.ts`；`bun` 不在当前 CI PATH 时测试未执行（静态审计，不等于运行通过）。
+- **菜单/乱码**：文本截断走 UTF-16 安全路径；根菜单 4×2，sys 页 9×2+返回（R619 移除与“我是谁”重叠的“属主记录”菜单按钮，`/owner` 命令仍保留）；回调完整性有 `tests/menu-root.test.ts`；R619 用 bun 1.4.3 跑 **192 tests 全 PASS**。
+- **R619 脱敏修复**：`src/tg-bridge.ts` 的 inject-card 路径和 `src/tg-bridge-v2.ts` 的 `tg-chats${sfx}` 状态路径曾因脱敏把反引号改成双引号，导致语法错误/字面量路径；已修为模板字面量，并新增 `tests/sanitized-template.test.ts`。
 
 ## 脱敏声明
 

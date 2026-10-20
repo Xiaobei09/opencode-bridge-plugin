@@ -66,5 +66,8 @@ test("补扫只推正文/思考，且走 full 档 protoPushAssistantMessage", ()
   const block = lines.slice(start, idx).join("\n")
   expect(block).toContain('"text"')
   expect(block).toContain('"reasoning"')
-  expect(block).toContain('protoPushAssistantMessage(sid, String(chat), m, false, "full")')
+  expect(block).toContain('protoPushAssistantMessage(sid, String(chat), m, false, "full"')
+  // R276：补扫必须带 backfill=true，迟到的卡才用补推时刻并加「补发」括注；
+  // 旧测试只写到第 6 个参数，会把正确的签署顺序修复误判为回归。
+  expect(block).toContain(", true)")
 })

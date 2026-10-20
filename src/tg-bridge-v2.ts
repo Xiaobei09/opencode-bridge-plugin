@@ -205,7 +205,7 @@ const botConfig = (bot: BotSpec, index: number) => {
     genKey: index === 0 ? undefined : `__tgBridgeGen_${bot.id}`,
     // 首个 Bot 沿用历史状态文件：auto-continue 的循环作用域读的是 tg-chats.json，
     // 换路径会让“当前循环会话”与桥接脱节。
-    statePath: index === 0 ? "REDACTED_ROOT/.config/opencode/tg-chats.json" : "REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json",
+    statePath: index === 0 ? "REDACTED_ROOT/.config/opencode/tg-chats.json" : `REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json`,
     // 首个 Bot 沿用历史 owner 文件名：既让既有租约检查/AC 写入指向同一处，
     // 也保证换代时旧实例的租约能被直接接管。
     ownerPath: index === 0 ? "/tmp/opencode/tg-poll-owner.json" : `/tmp/opencode/tg-poll-owner${sfx}.json`,
@@ -224,7 +224,7 @@ const botConfig = (bot: BotSpec, index: number) => {
     initialFront:
       index === 0
         ? undefined
-        : readFrontFrom("REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json"),
+        : readFrontFrom(`REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json`),
     // 队列置顶卡只有一个 owner（同一 chat 里 Telegram 不允许跨 Bot 编辑）
     queueCardOwner: index === 0,
     // 非主实例从空 watch 开始：避免镜像主会话造成两个 Bot 交叉发言

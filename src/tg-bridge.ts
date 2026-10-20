@@ -2510,7 +2510,7 @@ const htmlEsc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&
 export type InjectCardState = { msgID?: number; count: number; lastAt: number; lastKind: string; lastSid: string; avgGapMs: number }
 const INJECT_CARD_KEY_RE = /^[A-Za-z0-9_-]+$/
 export const injectCardStatePath = (bot: string): string =>
-  "REDACTED_ROOT/.config/opencode/inject-card-${INJECT_CARD_KEY_RE.test(bot) ? bot : "x"}.json"
+  `REDACTED_ROOT/.config/opencode/inject-card-${INJECT_CARD_KEY_RE.test(bot) ? bot : "x"}.json`
 export const readInjectCardState = (bot: string): InjectCardState => {
   try {
     const j = JSON.parse(readFileSync(injectCardStatePath(bot), "utf8")) as any
@@ -3483,7 +3483,7 @@ export const buildMenuKeyboard = (
       [b("🧽 清理旧按钮", "ma:stripall"), b("🩹 纠正卡住的工具卡", "ma:healcards")],
       [b("🗑 丢弃外发队列", "ma:drop"), b("🗑 丢弃注入队列", "ma:dropq")],
       [b("🧬 迁移到新会话", "ma:migrate"), b("🪪 我是谁", "ma:whoami")],
-      [b("👤 属主记录", "ma:owner"), b("🔢 桥版本", "ma:version"), b("🧾 配置清单", "ma:config")],
+      [b("🔢 桥版本", "ma:version"), b("🧾 配置清单", "ma:config")],
       [b(selfmute ? "🔊 本 Bot 应答：静默中（点此改为应答）" : "🤫 本 Bot 应答：开启（点此改为只答命令）", "ma:selfmute"), b("❓ 帮助", "ma:help")],
       [b("⬅️ 返回", "m:root")],
     ]
