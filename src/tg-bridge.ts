@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync, existsSync } from "node:fs"
-import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg, rewriteRetryClock } from "./_v2compat"
+import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
@@ -4965,6 +4965,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
 
   // 关键消息遇到 429/本地 flood gate 时保留并退避重试；思考/工具/状态卡仍按防洪策略舍弃。
+  // R568：同 chat 是否还有待重发的更早消息（发送顺序屏障用；不再改写标题时钟）。
+  const pendingProtoRetryForChat = (chatID: string): boolean => {
+    for (const it of protoRetry.values()) {
+      if (String(it.chatID) === String(chatID)) return true
+    }
+    return false
+  }
+
   const scheduleProtoRetry = (
     key: string,
     chatID: string,
@@ -5027,12 +5035,23 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return
       }
       item.timer = undefined
-      // R-2026-10-19（运营者实报「乱序消息再次出现」）：本函数=传输层重试路径，item.text 带的是
-      // **渲染时**标题时钟；迟到数秒~数分钟送达时，期间更新的消息可能已先行 ⇒ 聊天流时钟倒挂
-      // （与 R276 补推同源的观感问题）。发送时改写标题时钟为**本次发送时刻**；迟到 ≥
-      // LATE_NOTE_MIN_MS 时把原时刻放进「（补发 原时刻）」括注（幂等，只动首行第一个时钟）。
-      // 只改发送副本，item.text 保持原文 ⇒ 下方「重复发送自清理」的同文比对不受影响。
-      const sendText = rewriteRetryClock(item.text, fmtClock(Date.now()), Date.now() - (item.firstTryAt || Date.now()) >= LATE_NOTE_MIN_MS)
+      // R568：同 chat 串行重发——若还有 firstTryAt 更早的待重发项，先等它落地，
+      // 避免后发先到造成倒挂（顺序由屏障保证，不再改写表面时间）。
+      for (const [k2, it2] of protoRetry) {
+        if (k2 === key) continue
+        if (String(it2.chatID) !== String(item.chatID)) continue
+        const olderTs = it2.firstTryAt || 0
+        const myTs = item.firstTryAt || 0
+        if (olderTs < myTs || (olderTs === myTs && k2 < key)) {
+          item.timer = setTimeout(run, 1200)
+          return
+        }
+      }
+      // R568：原先在发送副本上改写标题时钟（R-2026-10-19 的止血）已移除——顺序由上面的
+      // 同 chat 屏障保证；item.text 保持原文，标题时钟即生成时刻，不再改动表面时间。
+      // R568：顺序由同 chat 屏障保证（更早的待重发未落地前本条不发、新消息也排队），
+      // 因此保留**原始标题时钟**，不再改写表面时间。
+      const sendText = item.text
       const r = item.editId > 0
         ? await editTextRaw(item.chatID, item.editId, sendText, item.kb, item.fallback)
         : await sendTextRaw(item.chatID, sendText, item.kb, item.silent)
@@ -5364,6 +5383,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       } else {
         rollback()
         await log("error", `proto edit failed (${sanitizeLog(key)}) → degrade send`)
+        if (pendingProtoRetryForChat(chatID)) {
+          scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true, PROTO_RETRY_QUICK_MS)
+          await log("info", `proto edit-degrade deferred behind pending retry (${sanitizeLog(key)})`)
+          return
+        }
         const n = await sendTextRaw(chatID, text, kb, silent)
         // R1877：降级新发也走**同一条送达判定**（`protoDeliveryVerdict`），不再手写 if/else。
         const ndv = protoDeliveryVerdict(n)
@@ -5397,6 +5421,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           await log("error", `proto edit-degrade dropped (${sanitizeLog(key)}) desc=${sanitizeLog((n as { desc?: string }).desc ?? "").slice(0, 120)}`)
         }
       }
+      return
+    }
+    if (pendingProtoRetryForChat(chatID)) {
+      scheduleProtoRetry(key, chatID, text, kb, silent, 0, false, PROTO_RETRY_QUICK_MS)
+      await log("info", `proto send deferred behind pending retry (${sanitizeLog(key)})`)
       return
     }
     const r = await sendTextRaw(chatID, text, kb, silent)
