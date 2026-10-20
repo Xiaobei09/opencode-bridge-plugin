@@ -823,6 +823,31 @@ export function protoDeliveryVerdict(r: { r: "sent" | "retry" | "drop"; id?: num
 }
 
 const PRIVATE_FILE_MODE = 0o600
+
+// R743: env-sync/tar restore can recreate these files with the runner umask (0644).
+// service.json contains the host API password, and the registry/loop files hold
+// bot metadata; normalize them at bridge load so a new run is secure even when
+// restore-env did not preserve modes. Idempotent and best-effort.
+const PRIVATE_CONFIG_PATHS = [
+  `REDACTED_ROOT/.local/state/opencode/service.json`,
+  `REDACTED_ROOT/.config/opencode/service.json`,
+  `REDACTED_ROOT/.config/opencode/tg-bots.json`,
+  `REDACTED_ROOT/.config/opencode/loop-ctl.json`,
+  `REDACTED_ROOT/.config/opencode/loop-marker.json`,
+  `REDACTED_ROOT/.config/opencode/loop-guard.json`,
+  `REDACTED_ROOT/.config/opencode/loop-sessions.json`,
+]
+function normalizePrivateConfigPerms(): void {
+  for (const path of PRIVATE_CONFIG_PATHS) {
+    try {
+      if (existsSync(path)) chmodSync(path, PRIVATE_FILE_MODE)
+    } catch {
+      /* best-effort: restore/read-only filesystems must not break plugin load */
+    }
+  }
+}
+normalizePrivateConfigPerms()
+
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
 const VERSION = "r1121-flood-cross-notice"
@@ -3517,6 +3542,9 @@ export const buildMenuKeyboard = (
   }
 
 export const TgBridgePlugin: Plugin = async ({ client }) => {
+  // service.json is created by the host after restore; re-run the normalizer here
+  // because the module-level call may have happened before the file existed.
+  normalizePrivateConfigPerms()
   // 横幅里的 fallback 必须与运行时一致：运行时用的是 fallbackApiBase（由
   // FALLBACK_TOKEN 推导）。此前横幅读的是别的字段，出现过"横幅 set、实际 no"的自相矛盾。
   const banner = `[tg-bridge] plugin loaded (bot=${BOT_ID}, ver=${VERSION}, token=${TOKEN ? "set" : "MISSING"}, fallback=${fallbackApiBase ? "set" : "none"}, allowed=${allowedNorm.size} chat(s), push=${PUSH_CHAT || "(none)"}, watch=${watchedSessions.size}, state=${STATE_PATH}, source=${SOURCE})`
