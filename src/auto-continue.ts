@@ -81,7 +81,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2236-completed-dead-turn-resume"
+const VERSION = "r2237-stale-generation-lease-guard"
 // 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
 // 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
 // env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
@@ -1540,6 +1540,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   }
 
   const evaluate = async (sessionID: string) => {
+    // R2237：热重载后旧实例仍可能收到 session.idle。若旧实例在 owner 租约
+    // 里抢赢新实例，会把 R2236 已能续跑的 completed-empty 重新打成
+    // GIVEUP(empty x5)（2026-10-20 03:08Z bot3 实证）。进入任何状态机前
+    // 先按代际短路，确保只有当前插件实例能评估/写租约。
+    if ((globalThis as Record<string, unknown>)[AC_GEN_KEY] !== myGenAc) return
     try {
       // 单会话作用域：TG 当前钉选/前台会话之外的任何事件都不得续跑。
       if (!isLoopTarget(sessionID)) {
@@ -1573,10 +1578,15 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           j = {}
         }
         try {
+          // R2237：owner 租约带代际；代际更大的实例持有时，旧实例不得覆盖。
+          // 这修的是 R2236 热重载后“旧插件收到 idle → 抢到租约 → 对 completed-empty
+          // 打 GIVEUP”的竞态；旧实例在 evaluate 入口已有代际短路。
+          const prevGen = Number(j?.ac?.gen ?? 0)
+          if (Number.isFinite(prevGen) && prevGen > myGenAc) return
           // R1849 同类缺口修复：tg-poll-owner.json 与 tg-bridge 的 claimPollOwner/amPollOwner
           // 跨进程（多 Bot 进程）读写；裸 writeFileSync 的 O_TRUNC 窗口会让并发读者 parse 失败
           // → 误判「无主」重复抢主 / 误判「无 ac 主」双实例各注入一次。改用 atomicWriteJson（tmp+rename）。
-          atomicWriteJson(ownerPath, { ...j, ac: { id: myAcId, ts: Date.now() } })
+          atomicWriteJson(ownerPath, { ...j, ac: { id: myAcId, gen: myGenAc, ts: Date.now() } })
         } catch {
           /* best-effort */
         }
