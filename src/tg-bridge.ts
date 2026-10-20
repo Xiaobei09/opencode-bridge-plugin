@@ -1360,8 +1360,8 @@ export const planQueuePinCleanup = (current: number | undefined, hist: readonly 
 ]
 
 /**
- * R249：UTF-16 安全截断（防乱码「�」）。
- * 裸 `slice(0,n)` 若切在 emoji 等代理对中间会产生**孤立代理字符**，JSON→Telegram 渲染为 �。
+ * R249：UTF-16 安全截断（防乱码「U+FFFD」）。
+ * 裸 `slice(0,n)` 若切在 emoji 等代理对中间会产生**孤立代理字符**，JSON→Telegram 渲染为 U+FFFD。
  * safeCut：头部截断；切点前一字符为高位代理 D800-DBFF 时回退 1（丢弃半个代理对）。
  * safeTail：尾部截断（取末尾 n 字符）；起点字符为低位代理 DC00-DFFF 时前移 1。
  */
@@ -3053,7 +3053,7 @@ export const safeHtmlCut = (line: string, i: number, max: number): number => {
   if (amp > semi) end = amp
   if (end <= i) end = Math.min(i + max, line.length) // 兜底：保证切片循环前进
   // R343：UTF-16 安全 —— 切点若落在代理对中间（前一半高代理、后一半低代理），两块会各自
-  // 渲染成「�」。把低代理一起带上（end+1，最多超出 max 1 个单元；PUSH_MAX=3800 远小于 TG
+  // 渲染成「U+FFFD」。把低代理一起带上（end+1，最多超出 max 1 个单元；PUSH_MAX=3800 远小于 TG
   // 4096 上限，安全），保证代理对永不被劈开。
   if (end > i && end < line.length) {
     const prev = line.charCodeAt(end - 1)
