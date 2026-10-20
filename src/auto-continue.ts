@@ -81,7 +81,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2237-stale-generation-lease-guard"
+const VERSION = "r2238-compact-on-completed-dead-turn"
 // 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
 // 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
 // env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
@@ -2320,6 +2320,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           // 真实文本/工具产出即恢复，清零连续 reasoning-only 计数。
           if (len > 0 || hasRealToolWork(msg)) completedDeadStreak.delete(sessionID)
           if (!(await injectAllowed(sessionID, msg, "round:workedAnyway"))) return
+          // R2238（用户实报「开启了自动压缩为什么没压缩」）：completed 且无 text/tool 的
+          // 死回合会从本分支续跑，旧代码在这里提前 return，绕过了正常路径的 maybeCompact；
+          // bot3 2026-10-20 03:50Z 在 82% 连续 text-empty 却不压缩即此因（primary 79% 正常路径
+          // 已自动压缩）。只在回合已完成后调用，绝不压缩生成中的活回合；压缩失败不阻断续跑。
+          if (completedTs > 0) await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
           // R1092: 只有 reasoning 没有工具/文本 = 还在思考/被截断，不算"主动结束干活"，
           // 不注入（用户反馈「AI 没有输出时循环文本仍被注入」）；也不计空转（R1065 豁免）。
           // R2235/R2236: completed>0 且无 text/tool 表示回合已结束，不是"还在思考"；
