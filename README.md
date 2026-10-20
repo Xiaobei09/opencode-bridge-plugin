@@ -49,7 +49,8 @@ bash install.sh
   ```
   `add-bots.sh` 会校验 id/username/env/token、按 id 幂等 upsert、原子写入 `tg-bots.json`（mode 600），输出只显示 `token=set(len=N)`，不打印 token；`--reload` 只 touch 插件入口触发重载。`id` 用小写字母/数字/`_`/`-`，env 路径支持 `~`。`username` 缺省时用 `id` 生成内部 id，`label` 自动为 `@username`。
 - **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡新增当前会话、推送状态、外发队列和注入队列。
-- 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。
+- **AI 改标题**：循环页与置顶循环状态卡提供「✍️ AI 改标题」按钮。桥调用宿主 `POST /api/session/{id}/generate` 根据当前会话上下文生成标题，再用 `PATCH /api/session/{id}` 落库；自动保留 `[LOOP]` / `[LOOP:OFF]` 循环标记，模型返回的引号/Markdown/解释行会被清洗。
+- 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。当前 **199 tests 全 PASS**（含 AI 标题清洗与菜单按钮回归）。
 
 ## 运行注意（R617）
 

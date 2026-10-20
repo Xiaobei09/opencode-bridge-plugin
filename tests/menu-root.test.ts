@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { buildMenuKeyboard, MENU_ACTION_TEXT } from "../src/tg-bridge"
+import { buildMenuKeyboard, injectCardKeyboard, MENU_ACTION_TEXT } from "../src/tg-bridge"
 
 type Btn = { text: string; callback_data: string }
 
@@ -68,12 +68,14 @@ describe("根菜单整理", () => {
     expect(r[dropRow].map((x) => x.callback_data)).toContain("ma:dropq") // 两个 🗑 同排
   })
 
-  // R234 子页整理小步4：loop 页 4 行无孤行（除返回）；bg 页由 6 竖排收敛为 4 行、前两行成对。
-  it("loop 页 4 行：前 3 行成对，仅返回独立；紧急动作在首行", () => {
+  // R234 子页整理小步4：loop 页 4 行无孤行；末行合并「AI 改标题」与返回。
+  // R756（用户「增加一个让ai修改标题的按钮」）把新动作放进末行，避免增加第五行。
+  it("loop 页 4 行：前 3 行成对，末行 AI 改标题+返回；紧急动作在首行", () => {
     const r = rows("loop")
     expect(r).toHaveLength(4)
     for (let i = 0; i < 3; i++) expect(r[i], `row ${i}`).toHaveLength(2)
-    expect(r[3]).toHaveLength(1)
+    expect(r[3]).toHaveLength(2)
+    expect(r[3].map((x) => x.callback_data)).toEqual(["title:ai", "m:root"])
     const first = r[0].map((x) => x.callback_data)
     expect(first).toContain("ma:stop")
     expect(first).toContain("ma:retry")
@@ -81,6 +83,14 @@ describe("根菜单整理", () => {
     const info = r.findIndex((row) => row.some((x) => x.callback_data === "ma:guardinfo"))
     const prob = r.findIndex((row) => row.some((x) => x.callback_data === "ma:guardprob"))
     expect(prob).toBe(info + 1)
+  })
+
+  it("循环页与置顶状态卡都提供 AI 改标题按钮", () => {
+    expect(flat("loop").some((x) => x.callback_data === "title:ai")).toBe(true)
+    const card = injectCardKeyboard()
+    expect(card).toHaveLength(1)
+    expect((card[0][0] as Btn).callback_data).toBe("title:ai")
+    expect((card[0][0] as Btn).text).toContain("AI 改标题")
   })
 
   it("bg 页 4 行：前两行成对（动作+状态、两个自动开关），阈值独占第三行", () => {
@@ -99,7 +109,7 @@ describe("根菜单整理", () => {
 describe("菜单回调完整性（R1908）", () => {
   const VIEWS = ["root", "sess", "push", "loop", "bg", "proxy", "sys"]
   // handleCallback(data.split(":")) 实际分派的前缀（见 tg-bridge.ts 的 parts[0] 分支）
-  const HANDLED_PREFIXES = new Set(["m", "ma", "flt", "use", "stop", "retry", "qpin", "full", "fold", "qa", "qfree", "q"])
+  const HANDLED_PREFIXES = new Set(["m", "ma", "title", "flt", "use", "stop", "retry", "qpin", "full", "fold", "qa", "qfree", "q"])
 
   it("每个视图的每个按钮前缀都有分派分支，m: 只跳已知视图", () => {
     for (const view of VIEWS) {

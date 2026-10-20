@@ -2605,6 +2605,42 @@ export const injectCardText = (o: {
   ].join("\n")
 }
 
+/**
+ * AI 改标题：提示词与结果清洗（纯函数，便于单测/复用）。
+ *
+ * 宿主 `POST /api/session/{id}/generate` 只返回临时文本，不会改历史；真正落标题由
+ * 桥接再调 `PATCH /api/session/{id}`。模型偶尔会带回引号、Markdown、`标题：` 前缀或
+ * 循环标记，这里统一洗掉，避免把解释段落/换行写进会话标题。
+ */
+export const AI_TITLE_PROMPT =
+  "请根据当前会话最近的上下文，生成一个简洁、具体的中文标题，最多 24 个汉字。" +
+  "只输出标题本身，不要引号、序号、解释、换行或 [LOOP] 标记。"
+
+export const sanitizeAiTitle = (raw: unknown, max = 48): string => {
+  // 只取第一条非空行：模型即使无视"只输出标题"，后续解释也不会被写进标题。
+  const firstLine = String(raw ?? "")
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .find((x) => x.length > 0) ?? ""
+  let s = firstLine
+    .replace(/<[^>]{0,200}>/g, " ")
+    .replace(/\[LOOP(?::OFF)?\]/gi, " ")
+    // 控制字符与零宽/方向控制字符：标题里只保留可见文本。
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\ufeff]+/g, " ")
+    .replace(/[*_`~]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  s = s.replace(/^["'“”‘’「」『』《》【】]+|["'“”‘’「」『』《》【】]+$/g, "").trim()
+  s = s.replace(/^(?:标题|会话标题|title)\s*[:：\-]\s*/i, "").trim()
+  s = s.replace(/^(?:[-–—•·]|\d+[.、)）])\s*/, "").trim()
+  return Array.from(s).slice(0, Math.max(1, max)).join("").trim()
+}
+
+/** 循环状态卡底部按钮：只放一个高频动作，避免把置顶卡变成第二套菜单。 */
+export const injectCardKeyboard = (): unknown[][] => [
+  [{ text: "✍️ AI 改标题", callback_data: "title:ai" }],
+]
+
 // 纯函数：HTML 消息卡片渲染（可单测，2026-09-29 抽出）。
 // 约定 = **调用方必须传未转义的原始文本**（title 与 body 都别预转义），本函数统一 htmlEsc 一次。
 // ⚠️ 踩坑实录（2026-09-29 用户实测）：曾有调用方把已转义的 "&lt;1%"（ctxSuffix 预转义产物）
@@ -3482,7 +3518,7 @@ export const buildMenuKeyboard = (
       [b("⏹ 停止当前回合", "ma:stop"), b("🔁 重试上一条", "ma:retry")],
       [b(stopped ? "▶️ 继续循环" : "⏹ 停止循环", stopped ? "ma:loopstart" : "ma:loopstop"), b("🛡 守卫详情/最近触发", "ma:guardinfo")],
       [b(gProblem ? "🛑 问题即停：开" : "🛑 问题即停：关", "ma:guardprob"), b(gWeb ? "🌐 搜索即停：开" : "🌐 搜索即停：关", "ma:guardweb")],
-      [b("⬅️ 返回", "m:root")],
+      [b("✍️ AI 改标题", "title:ai"), b("⬅️ 返回", "m:root")],
     ]
   }
   if (view === "bg") {
@@ -7139,6 +7175,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // R1646：每个 chat 当前打开的菜单视图（root/子页）。ma 动作执行后「原地刷新」当前视图，
   // 而不是拽回根页 —— 用户明确要"点按钮不回到主菜单"。sync 时保持与 card 一致。
   const menuViewNow = new Map<string, string>()
+  // R2452（用户「增加一个让ai修改标题的按钮」）：同一会话只允许一个标题生成在飞，
+  // 防止连点造成多次 /generate 与多次 PATCH 竞态。
+  const aiTitleBusy = new Set<string>()
 
   // ── R2231 模型选择：宿主直连 + 选择器缓存 ─────────────────────────────
   // 复用 R1881/R1399 的同源凭证（service.json + Basic encode("opencode:"+pw)）。
@@ -7249,6 +7288,101 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (r.r !== "sent") await sendTextRaw(target, text, kb, false)
       }
       await answer("菜单")
+      return
+    }
+    if (parts[0] === "title" && parts[1] === "ai") {
+      // 用户要求：在循环卡/循环菜单增加「让 AI 修改标题」按钮。
+      // 宿主 /generate 只根据当前会话上下文生成临时文本（不写历史），随后桥接用
+      // PATCH /api/session/{id} 真正落标题；循环标记 [LOOP]/[LOOP:OFF] 原样保留。
+      const target = fixedTarget ?? (await activeFront())
+      if (!target) {
+        await answer("未找到目标会话")
+        await reply(cchat, "⚠️ 找不到当前会话，无法改标题。")
+        return
+      }
+      if (aiTitleBusy.has(target)) {
+        await answer("AI 正在生成标题…")
+        return
+      }
+      await answer("AI 正在生成标题…")
+      aiTitleBusy.add(target)
+      try {
+        const curTitle = sessionNameOf(target) || ""
+        const gen = await modelHttp(`/api/session/${encodeURIComponent(target)}/generate`, {
+          method: "POST",
+          body: JSON.stringify({ prompt: AI_TITLE_PROMPT }),
+        })
+        if (!gen.ok) {
+          const why = clean(
+            String((gen.body as any)?.error ?? (gen.body as any)?.data?.error ?? gen.body ?? ""),
+            160,
+          )
+          await reply(
+            cchat,
+            `⚠️ AI 生成标题失败（HTTP ${gen.status || "网络错误"}）${why ? `：${htmlEsc(why)}` : ""}`,
+          )
+          return
+        }
+        const root = (gen.body && typeof gen.body === "object" ? ((gen.body as any).data ?? gen.body) : gen.body) as any
+        const rawTitle = typeof root === "string" ? root : String(root?.text ?? "")
+        const base = sanitizeAiTitle(rawTitle)
+        if (!base) {
+          await reply(cchat, "⚠️ AI 没有返回可用标题，请再点一次。")
+          return
+        }
+        const oldMark = (curTitle.match(/\[LOOP(?::OFF)?\]/g) ?? []).pop() ?? ""
+        const mark = oldMark || (loopGateInfo().stopped ? "[LOOP:OFF]" : "[LOOP]")
+        const finalTitle = `${base}${mark ? ` ${mark}` : ""}`
+        const patch = await modelHttp(`/api/session/${encodeURIComponent(target)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ title: finalTitle }),
+        })
+        if (!patch.ok) {
+          const why = clean(
+            String((patch.body as any)?.error ?? (patch.body as any)?.data?.error ?? patch.body ?? ""),
+            160,
+          )
+          await reply(
+            cchat,
+            `⚠️ 标题写入失败（HTTP ${patch.status || "网络错误"}）${why ? `：${htmlEsc(why)}` : ""}`,
+          )
+          return
+        }
+        sessionTitleCache.set(target, finalTitle)
+        void refreshSessionTitles()
+        void renameBotToSession(target)
+        // 若按钮来自置顶卡，立即回写卡片（会话名/标题可见）；来自菜单则保留菜单原样，
+        // 由命令回复告知结果，避免把菜单卡误编辑成状态卡。
+        const st = readInjectCardState(BOT_ID)
+        const mid = Number(cq?.message?.message_id ?? 0)
+        if (mid && st.msgID === mid) {
+          const cardText = injectCardText({
+            bot: BOT_LABEL,
+            lastAt: st.lastAt || Date.now(),
+            kind: st.lastKind,
+            sid: st.lastSid || target,
+            count: st.count,
+            avgGapMs: st.avgGapMs,
+            gate: loopGateInfo(),
+            now: Date.now(),
+            session: sessionTag(target),
+            queue: outQueue.length,
+            pinQueue: pinQueue.length,
+            paused: pausedMode,
+          })
+          try {
+            await editTextRaw(cchat, mid, cardText, injectCardKeyboard(), false)
+          } catch {
+            /* 卡片回写失败不阻断标题结果通知 */
+          }
+        }
+        await reply(cchat, `✅ AI 已修改会话标题：<b>${htmlEsc(finalTitle)}</b>`)
+      } catch (err) {
+        await log("warn", `ai title failed (sid=${target.slice(0, 12)}): ${sanitizeLog(err).slice(0, 120)}`)
+        await reply(cchat, "⚠️ AI 改标题失败，请稍后重试。")
+      } finally {
+        aiTitleBusy.delete(target)
+      }
       return
     }
     if (parts[0] === "ma") {
@@ -10990,8 +11124,9 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         "info",
         `inject card update (bot=${BOT_ID}, msg=${st.msgID ?? "new"}, kind=${kind}, count=${st.count}, session=${sanitizeLog(sessionID).slice(0, 12)})`,
       )
+      const cardKb = injectCardKeyboard()
       if (st.msgID) {
-        const r = await editTextRaw(chat, st.msgID, text)
+        const r = await editTextRaw(chat, st.msgID, text, cardKb)
         if (r.r === "sent") {
           writeInjectCardState(BOT_ID, st)
           await ensureInjectCardPin(chat, st.msgID, now)
@@ -11010,7 +11145,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         )
         st.msgID = undefined
       }
-      const s = await sendTextRaw(chat, text, undefined, true)
+      const s = await sendTextRaw(chat, text, cardKb, true)
       if (s.r === "sent" && typeof s.id === "number" && s.id > 0) {
         st.msgID = s.id
         writeInjectCardState(BOT_ID, st)
