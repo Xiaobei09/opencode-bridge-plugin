@@ -81,7 +81,7 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2238-compact-on-completed-dead-turn"
+const VERSION = "r2239-success-compact-cooldown"
 // 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
 // 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
 // env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
@@ -910,12 +910,14 @@ const completedDeadStreak = new Map<string, number>()
   const coldCompacted = new Set<string>()
   const lastCompactCount = new Map<string, number>()
   const lastCompactAttempt = new Map<string, number>()
+  const lastCompactSuccessAt = new Map<string, number>()
   // R-pending：宿主在部分事件里会把"会话生命周期累计 token"报成 input
   // （实测 f339 报 ~24.9M / 窗口 1M = 2490%，tg-bridge 的 ctxUsage 早已 reject 同族值）。
   // 误用累计值判压缩会**强压还有大量 headroom 的会话、清空其上下文** —— 用户视角就是
   // "这个 bot 的自动循环没了"。守卫：单次调用输入不可能超过窗口，超过即累计值，丢弃。
   let ctxLifetimeRejected = 0
   const COMPACT_RETRY_MS = 30 * 60_000
+  const COMPACT_SUCCESS_GAP_MS = 5 * 60_000
   // Per-invocation identity (module top-level may be shared across hot-reloads
   // via ESM cache): newest instantiation in this process wins.
   const GAC = globalThis as Record<string, unknown>
@@ -1214,11 +1216,18 @@ const completedDeadStreak = new Map<string, number>()
         return
       }
       const lastTry = lastCompactAttempt.get(sessionID) ?? 0
+      const lastOk = lastCompactSuccessAt.get(sessionID) ?? 0
+      // 30 分钟退避只约束失败尝试；成功后只保留 5 分钟防抖。
       if (Date.now() - lastTry < COMPACT_RETRY_MS) return
+      if (Date.now() - lastOk < COMPACT_SUCCESS_GAP_MS) return
       lastCompactAttempt.set(sessionID, Date.now())
       lastCompactCount.set(sessionID, assistantCount)
       const usagePct = Math.round((u / win) * 100)
-      if (await compactNow(sessionID, `ctx=${usagePct}% >= ${Math.round(TH * 100)}%`)) resetSessionTokens(sessionID)
+      if (await compactNow(sessionID, `ctx=${usagePct}% >= ${Math.round(TH * 100)}%`)) {
+        lastCompactSuccessAt.set(sessionID, Date.now())
+        lastCompactAttempt.delete(sessionID)
+        resetSessionTokens(sessionID)
+      }
       return
     }
     if (!coldCompacted.has(sessionID) && assistantCount >= STALL_SESSION_MSGS) {
