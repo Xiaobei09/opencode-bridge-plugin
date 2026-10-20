@@ -10840,12 +10840,41 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
             k.startsWith(`${sid}:thinking:${msgKey}:`) ||
             // R2451：报错卡（`:error:`）也是这条消息的"已推送"标志；否则每条无正文的
             // 报错消息会每 25s 被补扫重算一次（protoSend 去重能防重发，但白跑无害）。
-            k.startsWith(`${sid}:error:${msgKey}`)
+            k.startsWith(`${sid}:error:${msgKey}`) ||
+            // R750：只有被本桥过滤掉的 reasoning/tool 也在窗口里；没有可发送 part 时
+            // protoMap 不会新增键，补扫会每 25s 重复同一批消息。用 catchup 标记持久化
+            // “已处理”，避免空转；真实发送失败仍由 protoRetry 保留重试。
+            k.startsWith(`${sid}:catchup:${msgKey}`)
         )
         if (seen) continue
         // R276：补扫路径必须传 backfill=true → 迟到的补推卡改用补推时刻+「补发」括注，
         // 消除「签署时间与发送顺序不相符」；事件路径的实时推送（backfill 缺省 false）不受影响。
         await protoPushAssistantMessage(sid, String(chat), m, false, "full", true)
+        const pushed = [...protoMap.keys()].some(
+          (k) =>
+            k.startsWith(`${sid}:message:${msgKey}:`) ||
+            k.startsWith(`${sid}:thinking:${msgKey}:`) ||
+            k.startsWith(`${sid}:error:${msgKey}`)
+        )
+        if (!pushed) {
+          const retrying = [...protoRetry.keys()].some(
+            (k) => k.startsWith(`${sid}:`) && k.includes(msgKey)
+          )
+          if (retrying) {
+            await log(
+              "info",
+              `proto catchup retry-pending (${sanitizeLog(sid).slice(0, 12)} msg=${sanitizeLog(mid).slice(0, 20)})`
+            )
+            continue
+          }
+          protoMap.set(`${sid}:catchup:${msgKey}`, { id: 0, text: "", fallback: true })
+          savePersistedState()
+          await log(
+            "info",
+            `proto catchup marked (${sanitizeLog(sid).slice(0, 12)} msg=${sanitizeLog(mid).slice(0, 20)} parts=${content.length} no-visible-part-or-filtered)`
+          )
+          continue
+        }
         await log(
           "info",
           `proto catchup pushed (${sanitizeLog(sid).slice(0, 12)} msg=${sanitizeLog(mid).slice(0, 20)} parts=${content.length})`
