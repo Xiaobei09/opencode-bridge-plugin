@@ -24,6 +24,7 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | `src/turn-end-note.ts` | 轮末「AI 主动结束输出」短提示文案 |
 | `src/bg-hint.ts` | shell 后台运行提示卡（新鲜度判据 + 文案） |
 | `install.sh` | 一键安装：`REDACTED_ROOT` → `$HOME` 并铺到标准目录（可直接使用） |
+| `add-bots.sh` | 批量/幂等注册多个 bot：一次校验并合并 JSON，不改桥代码 |
 
 ## 使用方法
 
@@ -39,6 +40,14 @@ bash install.sh
 
 - 依赖：opencode（V2 插件宿主）。
 - Bot 配置：`~/.config/opencode/tg-bots.json`（每 Bot 一条：id + 各自的 token env 文件路径）；token 只放 env 文件，本仓库不含任何密钥。
+- **批量接入多个 Bot（不需要改代码）**：`tg-bridge-v2.ts` 的 `readRegistry()` 会动态读取 `bots[]`，`setup()` 对每个条目建立实例，没有 3 个上限。先为每个 bot 准备 env 文件（含非空 `TG_BOT_TOKEN`），再一次性提交一个 JSON：
+  ```bash
+  cp examples/tg-bots.batch.example.json /tmp/new-bots.json
+  # 编辑 /tmp/new-bots.json：可放任意 N 条 {id,label,envFile}
+  bash add-bots.sh --file /tmp/new-bots.json --dry-run
+  bash add-bots.sh --file /tmp/new-bots.json --reload
+  ```
+  `add-bots.sh` 会校验 id/env/token、按 id 幂等 upsert、原子写入 `tg-bots.json`（mode 600），输出只显示 `token=set(len=N)`，不打印 token；`--reload` 只 touch 插件入口触发重载。`id` 用小写字母/数字/`_`/`-`，env 路径支持 `~`。
 - 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。
 
 ## 运行注意（R617）

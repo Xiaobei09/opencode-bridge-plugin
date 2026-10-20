@@ -806,6 +806,10 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const decided = new Set<string>()
   // 重启孤儿只记一次日志（每个 msg.id）—— 必须与 decided 同处提前声明（闭包引用安全）
   const orphanLogged = new Set<string>()
+  // R704：重启后最后一条是 **preboot user 尾条**（如后台任务完成通知）而其后没有 assistant。
+  // 旧逻辑只解锁 preboot assistant，遇到 user 尾条会停在 decided/空闲复核，表现为 bot4
+  // 「有通知但永远不回复」。按 sid 记尾条 id，成功注入后删除，避免影响后续真实用户回合。
+  const preBootUserTail = new Map<string, string>()
   const pending = new Map<string, number>()
   const emptyStreak = new Map<string, number>()
   // R2235：已完成但只有 reasoning 的回合是“死回合”，不是仍在生成。
@@ -1387,6 +1391,18 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       return true
     }
+    // R704：preboot user 尾条（后台完成通知等）后没有 assistant，生成者已死；
+    // 它不是活回合，必须跳过 idle 闸，否则 bot4 会一直停在 user-active note。
+    if (preBootUserTail.has(sid)) {
+      if (!orphanLogged.has(`usertail:${sid}`)) {
+        orphanLogged.add(`usertail:${sid}`)
+        await log(
+          "info",
+          `auto-continue: preboot user-tail escaped idle gates (${tag}, session=${sanitizeLog(sid)}, tail=${String(preBootUserTail.get(sid) ?? "").slice(0, 20)})`,
+        )
+      }
+      return true
+    }
     const hold = async (why: string): Promise<boolean> => {
       heldInject.set(sid, Date.now())
       await log(
@@ -1897,6 +1913,34 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
       }
 
+      // R704：preboot user 尾条恢复。旧逻辑只覆盖 preboot assistant；若最后一条是
+      // 重启前产生的 user（典型：后台任务完成通知），其后没有 assistant，则 decided
+      // 仍锁住上一条 assistant，循环只打 user-active note 不注入。这里按“尾条 created
+      // 早于 boot”解锁一次；只影响 preboot 数据，post-boot 活回合不受影响。
+      {
+        const tail: any = messages[messages.length - 1]
+        const tailId = String(tail?.id ?? tail?.info?.id ?? "")
+        const tailRole = String(tail?.info?.role ?? tail?.role ?? "")
+        const tailCreated = Number(tail?.info?.time?.created ?? tail?.time?.created ?? 0)
+        if (
+          tailRole === "user" &&
+          tailId &&
+          tailId !== String(msg.id) &&
+          preBootDeadTurn({ created: tailCreated, bootAt: AC_BOOT_AT })
+        ) {
+          decided.delete(msg.id)
+          skipState.delete(sessionID)
+          preBootUserTail.set(sessionID, tailId)
+          if (!orphanLogged.has(`usertail:${tailId}`)) {
+            orphanLogged.add(`usertail:${tailId}`)
+            await log(
+              "info",
+              `auto-continue: preboot user tail detected (session=${sanitizeLog(sessionID)}, tail=${tailId.slice(0, 20)}, created=${new Date(tailCreated).toISOString()} before boot ${new Date(AC_BOOT_AT).toISOString()}) -> unlock decided, resume loop`,
+            )
+          }
+        }
+      }
+
       // ── 宿主侧回合挂起告警（只检测 + 如实上报，**不**擅自中断用户的会话） ──
       // 实测：备用会话最后一个工具 state=running 挂了 11 分钟、time.completed 一直为空，
       // 宿主不再发任何事件 → 桥没有卡可推、循环也不该往"活着的回合"里注入。
@@ -2160,7 +2204,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               return
             }
             // 取不到 id（API 异常/空数组）时也不放行：宁可下一拍再判，不做无证据注入。
-            if (newest !== String(msg.id)) return
+            // R704：若最新消息是 preboot user 尾条（后台通知），assistant 不是 newest，
+            // 但这正是需要恢复的空回合；preBootUserTail 已在 orphan 段校验过 created < boot。
+            if (newest !== String(msg.id) && !preBootUserTail.has(sessionID)) return
             if (!(await injectAllowed(sessionID, msg, "round:preboot-empty"))) return
             emptyStreak.delete(sessionID)
             pending.delete(msg.id)
@@ -2173,6 +2219,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               decided.delete(msg.id)
               return
             }
+            preBootUserTail.delete(sessionID)
             await log(
               "info",
               `auto-continue: preboot-empty dead turn -> inject (session=${sessionID}, msg=${msg.id}, created=${new Date(Number(t.created ?? 0)).toISOString()} < boot ${new Date(AC_BOOT_AT).toISOString()})`,
@@ -2426,6 +2473,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         decided.delete(msg.id)
         return
       }
+      preBootUserTail.delete(sessionID)
       // 有产出即清零熔断计数（会话恢复）
       giveupCount.delete(sessionID)
       lastRoundAt.set(sessionID, Date.now())
