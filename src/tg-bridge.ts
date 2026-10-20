@@ -3440,7 +3440,7 @@ export const buildMenuKeyboard = (
   }
   if (view === "push") {
     // R719 整合：压缩通知开关并入本页（与「暂停推送」同排，不新增孤行）；
-    // 「压缩是否发送」= 这个开关 + /quiet 菜单里的同款按钮（flt:compact:notice）。
+    // R736：/quiet 页不再重复放同一个开关，只显示状态并指向本页，避免两个入口改同一设置。
     return [
       [b("🔊 全部推送", "ma:loud"), b("🔇 推送设置", "ma:quiet")],
       [b(paused ? "▶️ 恢复推送" : "⏸ 暂停推送", paused ? "ma:resume" : "ma:pause"), b(cnoticeOn ? "🗜 压缩通知：发" : "🗜 压缩通知：不发", "ma:cnotice")],
@@ -6865,7 +6865,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "【推送控制】",
     "· /quiet — 推送过滤+压缩设置菜单（别名 /q；/loud 只恢复推送）",
     "· /loud — 恢复全部推送（别名 /l）",
-    "· /cnotice [on|off] — 压缩通知开关（「🗜 上下文已压缩」卡片是否发送；默认发；菜单「📣 推送」与 /quiet 里也有开关）",
+    "· /cnotice [on|off] — 压缩通知开关（「🗜 上下文已压缩」卡片是否发送；默认发；菜单「📣 推送」里也有开关）",
     "· /watch [会话] — 附加镜像该会话（只发最终回复正文，标题带会话名）",
     "· /unwatch [会话] — 取消附加镜像（不带参数=全部取消）",
     "【应答与独立】",
@@ -6997,10 +6997,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     kb.push([{ text: `🗜 自动压缩：${compactPrefs.auto ? "开" : "关"} ›`, callback_data: "flt:compact:auto" }])
     lines.push(`· 🗜 压缩阈值：${Math.round(compactPrefs.threshold * 100)}%`)
     kb.push([{ text: `🗜 压缩阈值：${Math.round(compactPrefs.threshold * 100)}% ›`, callback_data: "flt:compact:th" }])
-    // R719（用户点名新增）：压缩通知是否发送——关闭后不再把「🗜 上下文已压缩」卡片发到 TG，
-    // 但压缩事件本身仍会记录日志/更新水位状态（只省通知，不关功能）。
-    lines.push(`· 🗜 压缩通知：${compactPrefs.notice ? "发" : "不发"}（是否把「上下文已压缩」卡片发到 TG）`)
-    kb.push([{ text: `🗜 压缩通知：${compactPrefs.notice ? "发" : "不发"} ›`, callback_data: "flt:compact:notice" }])
+    // R736：压缩通知只在「📣 推送」页提供按钮；/quiet 保留只读状态并指路，避免重复控制。
+    lines.push(`· 🗜 压缩通知：${compactPrefs.notice ? "发" : "不发"}（在「📣 推送」页切换）`)
     lines.push(`· 💉 注入时机：${injectMode === "idle" ? "完成插入" : "立即插入"}`)
     kb.push([{ text: `💉 注入时机：${injectMode === "idle" ? "完成插入" : "立即插入"} ›`, callback_data: "flt:inject:mode" }])
     kb.push([
