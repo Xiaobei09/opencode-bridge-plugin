@@ -1486,7 +1486,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       await withTimeout(
         client.session.promptAsync({
           path: { id: sessionID },
-          body: { parts: [{ type: "text", text: `${text}${lastUserSection}${AUTO_INJECT_HINT}` }] },
+          body: { parts: [{ type: "text", text: `${text}${lastUserSection}${AUTO_INJECT_HINT}` }], resume: true, delivery: "queue" },
         }),
         "session.promptAsync",
       )

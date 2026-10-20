@@ -6072,7 +6072,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     try {
       await client.session.promptAsync({
         path: { id: target },
-        body: { parts: [{ type: "text", text: `[TG user message]${ctx ? ` (回复引用：${ctx})` : ""} ${text}` }] },
+        body: { parts: [{ type: "text", text: `[TG user message]${ctx ? ` (回复引用：${ctx})` : ""} ${text}` }], resume: true, delivery: "queue" },
       })
       const stopDuringPrompt = loopStopped() && (!wasAlreadyStopped || loopStopTimestamp() > startedAt)
       if (stopDuringPrompt) {
