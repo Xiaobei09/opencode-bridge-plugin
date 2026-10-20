@@ -167,7 +167,7 @@ export const LOOP_SESSIONS_CAP = 16
 // 记录“被本插件打过 [LOOP] 标记的会话”集合。热重载后内存态丢失，若不落盘，
 // 旧目标上的 [LOOP] 会永久残留成假标记。集合而非单值：历史上可能同时存在
 // 多个被标记会话，换目标后要把它们全部清掉。
-const MARKER_STATE_PATH = process.env.AC_MARKER_PATH ?? "REDACTED_ROOT/.config/opencode/loop-marker.json"
+const MARKER_STATE_PATH = process.env.AC_MARKER_PATH ?? `REDACTED_ROOT/.config/opencode/loop-marker.json`
 const MARKER_SET_MAX = 16
 const readMarkedSids = (): string[] => {
   try {
@@ -195,7 +195,7 @@ const writeMarkedSids = (sids: string[]): void => {
   }
 }
 
-const LOOP_CTL_PATH = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
+const LOOP_CTL_PATH = `REDACTED_ROOT/.config/opencode/loop-ctl.json`
 const LOOP_CTL_LEGACY = "/tmp/opencode/loop-ctl.json"
 // 能不能往"当前这条助手消息"注入下一轮 —— 判据，纯函数便于行为测试。
 // 背景：用户报「AI 明明没有主动结束，却已经注入循环了，这种情况经常发生」。
@@ -362,7 +362,7 @@ const writeCtlStopped = (stopped: boolean, by: string, reason = ""): void => {
   }
 }
 // /quiet 压缩设置（tg-bridge 写入 tg-chats.json，本侧 10 秒 TTL 读取）：auto=false 停掉一切自动压缩
-const TG_STATE_PATH = process.env.AC_TG_STATE_PATH ?? "REDACTED_ROOT/.config/opencode/tg-chats.json"
+const TG_STATE_PATH = process.env.AC_TG_STATE_PATH ?? `REDACTED_ROOT/.config/opencode/tg-chats.json`
 
 // ── 桥的"死人开关"（2026-09-26）────────────────────────────────────────────
 // 缺口：桥若整个挂掉，**它自己的心跳也没了** —— `state save heartbeat` 是桥写的，
@@ -458,7 +458,7 @@ const readLoopTarget = (): string => {
 export const resolveExtraTargetPaths = (
   envVal: string | undefined,
   registryJson: string | null,
-  root = "REDACTED_ROOT",
+  root = `REDACTED_ROOT`,
 ): string[] => {
   const fromEnv = (envVal ?? "")
     .split(",")
@@ -487,7 +487,7 @@ const EXTRA_TARGET_PATHS = resolveExtraTargetPaths(
   process.env.AC_EXTRA_TARGETS,
   (() => {
     try {
-      return readFileSync(process.env.TG_BOTS_PATH ?? "REDACTED_ROOT/.config/opencode/tg-bots.json", "utf8")
+      return readFileSync(process.env.TG_BOTS_PATH ?? `REDACTED_ROOT/.config/opencode/tg-bots.json`, "utf8")
     } catch {
       return null
     }
@@ -590,7 +590,7 @@ const haltedSessions = (): string[] => {
   let rel: Record<string, unknown> = {}
   try {
     const rj = JSON.parse(
-      readFileSync("REDACTED_ROOT/.config/opencode/halt-release.json", "utf8"),
+      readFileSync(`REDACTED_ROOT/.config/opencode/halt-release.json`, "utf8"),
     ) as unknown
     if (rj && typeof rj === "object") rel = rj as Record<string, unknown>
   } catch {
@@ -615,7 +615,7 @@ const haltedSessions = (): string[] => {
 const primaryFront = (): string => {
   if (AC_SCOPE === "primary") return ""
   try {
-    const j = JSON.parse(readFileSync("REDACTED_ROOT/.config/opencode/tg-chats.json", "utf8")) as any
+    const j = JSON.parse(readFileSync(`REDACTED_ROOT/.config/opencode/tg-chats.json`, "utf8")) as any
     return typeof j?.front === "string" && j.front.startsWith("ses_") ? j.front : ""
   } catch {
     return ""
@@ -646,7 +646,7 @@ const readCompactPrefs = (): { auto: boolean; threshold: number } => {
 // 此前 maybeCompact 一律除以硬编码 1M：200k/262k 模型的 70% 阈值被算松 5 倍
 // （真实 140k 只算 13.4%），自动压缩形同虚设 —— 与 tg-bridge 界面「窗口未知就显示 ?」
 // 的诚实口径直接矛盾。表不可用时回退 1M（保持旧行为，避免误压还有 headroom 的会话）。
-const MODEL_WINDOWS_PATH = "REDACTED_ROOT/.config/opencode/model-windows.json"
+const MODEL_WINDOWS_PATH = `REDACTED_ROOT/.config/opencode/model-windows.json`
 export const resolveContextWindow = (modelID: string, providerID: string): number | null => {
   const mid = String(modelID ?? "")
   const pid = String(providerID ?? "")
@@ -808,7 +808,10 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   const orphanLogged = new Set<string>()
   const pending = new Map<string, number>()
   const emptyStreak = new Map<string, number>()
-const completedDeadStreak = new Map<string, number>()
+  // R2235：已完成但只有 reasoning 的回合是“死回合”，不是仍在生成。
+  // 连续完成仍无文本/工具时允许有限续跑，超过 3 次再走 empty-stall 退避，
+  // 避免 2026-10-20 09:10 CST 的 47 分钟零注入重现，同时不无限空转。
+  const completedDeadStreak = new Map<string, number>()
   // 已回源核对过的消息（避免同一条反复打 API）
   const refetchedEmpty = new Set<string>()
   // 粘性"这是循环会话"标志：此前循环资格只靠**用户消息里的关键字**（筛查循环 / [STATUS: /
@@ -816,7 +819,7 @@ const completedDeadStreak = new Map<string, number>()
   // "不是循环会话"→不再续跑，表现为"另一个会话总是不循环"。
   // 安全性：isLoopTarget 已把范围限制在"各 Bot 自己的 front/pinned"，粘性标志不可能
   // 让循环去驱动无关会话；停止仍走 /loop stop（全局闸）。
-  const LOOP_SESSIONS_PATH = "REDACTED_ROOT/.config/opencode/loop-sessions.json"
+  const LOOP_SESSIONS_PATH = `REDACTED_ROOT/.config/opencode/loop-sessions.json`
   const loopSessions = new Set<string>()
   try {
     const arr = JSON.parse(readFileSync(LOOP_SESSIONS_PATH, "utf8"))
@@ -828,7 +831,7 @@ const completedDeadStreak = new Map<string, number>()
   // 为什么必须单独一张清单：`persistLoopSessions` 会把 `currentLoopTargets()`
   // （各 Bot 的 front/pinned）**重新并回** loop-sessions —— 所以"从正向名单里删掉"
   // 对当前 front 会话**无效**，下一次落盘又回来了。关闭必须是**显式否定**。
-  const LOOP_OFF_PATH = "REDACTED_ROOT/.config/opencode/loop-sessions-off.json"
+  const LOOP_OFF_PATH = `REDACTED_ROOT/.config/opencode/loop-sessions-off.json`
   const loopOffSessions = new Set<string>()
   try {
     const arr = JSON.parse(readFileSync(LOOP_OFF_PATH, "utf8"))
@@ -1218,6 +1221,7 @@ const completedDeadStreak = new Map<string, number>()
       const lastTry = lastCompactAttempt.get(sessionID) ?? 0
       const lastOk = lastCompactSuccessAt.get(sessionID) ?? 0
       // 30 分钟退避只约束失败尝试；成功后只保留 5 分钟防抖。
+      // 否则一次成功的 73%→38% 会让会话在随后 30 分钟内即使重新涨到 86% 也不能再压缩。
       if (Date.now() - lastTry < COMPACT_RETRY_MS) return
       if (Date.now() - lastOk < COMPACT_SUCCESS_GAP_MS) return
       lastCompactAttempt.set(sessionID, Date.now())
@@ -2410,8 +2414,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
       }
       if (!(await injectAllowed(sessionID, msg, "round:normal"))) return
-      emptyStreak.delete(sessionID)
       completedDeadStreak.delete(sessionID)
+      emptyStreak.delete(sessionID)
       await maybeCompact(sessionID, usageOf(sessionID, msg), assistantCount)
 
       // 用户消息只影响当前回合；助手回合完成后仍继续自动循环。

@@ -34,11 +34,11 @@ const diag = (msg: string): void => {
   console.error(msg)
 }
 
-const REGISTRY_PATH = process.env.TG_BOTS_PATH ?? "REDACTED_ROOT/.config/opencode/tg-bots.json"
-const BRIDGE_SRC = "REDACTED_ROOT/.opencode/v2lib/tg-bridge.ts"
-const V2LIB_DIR = "REDACTED_ROOT/.opencode/v2lib"
+const REGISTRY_PATH = process.env.TG_BOTS_PATH ?? `REDACTED_ROOT/.config/opencode/tg-bots.json`
+const BRIDGE_SRC = `REDACTED_ROOT/.opencode/v2lib/tg-bridge.ts`
+const V2LIB_DIR = `REDACTED_ROOT/.opencode/v2lib`
 /** 快照根目录：必须在项目树内，裸包（@opencode-ai/*）靠向上找 node_modules 解析。 */
-const LIVE_ROOT = "REDACTED_ROOT/.opencode/.v2lib-live"
+const LIVE_ROOT = `REDACTED_ROOT/.opencode/.v2lib-live`
 
 /** 快照总数上限 3 份（**含本次**）：每份 ~536K，不清会随装载次数无限涨。 */
 const gcLive = (tag: string, keepName: string): void => {
@@ -102,7 +102,7 @@ const snapshotV2lib = (tag: string): string => {
     return V2LIB_DIR
   }
 }
-const COMPAT_SRC = "REDACTED_ROOT/.opencode/v2lib/_v2compat.ts"
+const COMPAT_SRC = `REDACTED_ROOT/.opencode/v2lib/_v2compat.ts`
 
 type BotSpec = {
   id: string
@@ -165,13 +165,13 @@ let primarySpec = bots[0] ?? { id: "primary" }
 // D4 诊断（R1）：模块求值即打印注册表读取结果——用于区分「入口被缓存只重跑 setup
 // （旧 bots）」与「setup 循环卡死」两种「新 bot 不上线」故障（2026-10-17 实测排查）。
 diag(`[tg-bridge-v2] module eval: registry ids=${bots.map((b) => b.id).join(",")}`)
-let primaryEnv = readEnvFile(primarySpec.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env")
+let primaryEnv = readEnvFile(primarySpec.envFile ?? `REDACTED_ROOT/.config/opencode/tg.env`)
 
 /** 重读注册表 + 重算 primary 派生值。必须在 setup() 开头调用（见上方注释）。 */
 const refreshRegistry = (): void => {
   bots = readRegistry()
   primarySpec = bots[0] ?? { id: "primary" }
-  primaryEnv = readEnvFile(primarySpec.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env")
+  primaryEnv = readEnvFile(primarySpec.envFile ?? `REDACTED_ROOT/.config/opencode/tg.env`)
 }
 
 /** 读某个状态文件的 front（只读，不修改任何实例状态）。 */
@@ -205,7 +205,7 @@ const botConfig = (bot: BotSpec, index: number) => {
     genKey: index === 0 ? undefined : `__tgBridgeGen_${bot.id}`,
     // 首个 Bot 沿用历史状态文件：auto-continue 的循环作用域读的是 tg-chats.json，
     // 换路径会让“当前循环会话”与桥接脱节。
-    statePath: index === 0 ? "REDACTED_ROOT/.config/opencode/tg-chats.json" : `REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json`,
+    statePath: index === 0 ? `REDACTED_ROOT/.config/opencode/tg-chats.json` : `REDACTED_ROOT/.config/opencode/tg-chats${sfx}.json`,
     // 首个 Bot 沿用历史 owner 文件名：既让既有租约检查/AC 写入指向同一处，
     // 也保证换代时旧实例的租约能被直接接管。
     ownerPath: index === 0 ? "/tmp/opencode/tg-poll-owner.json" : `/tmp/opencode/tg-poll-owner${sfx}.json`,
@@ -213,7 +213,7 @@ const botConfig = (bot: BotSpec, index: number) => {
     stripStatePath: `/tmp/opencode/strip-run${sfx}.json`,
     stripFailPath: `/tmp/opencode/stripfail${sfx}.json`,
     tapPath: `/tmp/opencode/tg${sfx}.log`,
-    configPath: bot.envFile ?? "REDACTED_ROOT/.config/opencode/tg.env",
+    configPath: bot.envFile ?? `REDACTED_ROOT/.config/opencode/tg.env`,
     fallbackEnvPath: bot.noFallback ? null : bot.fallbackEnvFile ?? null,
     token,
     // 新实例没有自己的 front 时继承主实例当前目标（之后各自独立）

@@ -80,7 +80,7 @@ const ABORT_EVENTS_CAP = 200
 /** 遥测文件路径：默认生产路径，可用 AC_ABORT_EVENTS_PATH 覆盖（测试隔离用）；
  *  惰性读取以支持测试运行时覆盖。 */
 const abortEventsPath = (): string =>
-  process.env.AC_ABORT_EVENTS_PATH ?? "REDACTED_ROOT/.config/opencode/abort-events.json"
+  process.env.AC_ABORT_EVENTS_PATH ?? `REDACTED_ROOT/.config/opencode/abort-events.json`
 
 export interface AbortEvent {
   ts: number

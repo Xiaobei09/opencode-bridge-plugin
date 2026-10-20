@@ -94,9 +94,9 @@ export interface ProxySwitchCfg {
   probe: ProxyProbeCfg
 }
 
-export const CFG_PATH = "REDACTED_ROOT/.config/opencode/proxy-switch.json"
+export const CFG_PATH = `REDACTED_ROOT/.config/opencode/proxy-switch.json`
 /** 最近一次切换记录（供 TG /proxy status 展示；跨实例共享）。 */
-export const STATE_PATH = "REDACTED_ROOT/.config/opencode/proxy-switch-state.json"
+export const STATE_PATH = `REDACTED_ROOT/.config/opencode/proxy-switch-state.json`
 
 export const defaultProxySwitchCfg: ProxySwitchCfg = {
   enabled: false,

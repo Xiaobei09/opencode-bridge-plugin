@@ -19,7 +19,7 @@
  */
 import { readFileSync, writeFileSync, renameSync } from "node:fs"
 
-export const BG_PATH = process.env.AC_BG_PATH ?? "REDACTED_ROOT/.config/opencode/background-mode.json"
+export const BG_PATH = process.env.AC_BG_PATH ?? `REDACTED_ROOT/.config/opencode/background-mode.json`
 const PRIVATE_FILE_MODE = 0o600
 export const BG_ENV_VAR = "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
 

@@ -33,7 +33,7 @@ export const TAP_PATH = process.env.AC_TAP_PATH ?? (process.env.NODE_ENV === "te
 const TAP_MAX = 2000000
 /** R1736：轮转时把被丢弃的部分 gzip 存这里（不丢证据）。R1735 已手工验证过这条路可行。 */
 export const LOG_ARCHIVE_DIR =
-  process.env.AC_LOG_ARCHIVE_DIR ?? (process.env.NODE_ENV === "test" ? TEST_ARCHIVE_DIR : "REDACTED_ROOT/.opencode/log-archive")
+  process.env.AC_LOG_ARCHIVE_DIR ?? (process.env.NODE_ENV === "test" ? TEST_ARCHIVE_DIR : `REDACTED_ROOT/.opencode/log-archive`)
 const PRIVATE_FILE_MODE = 0o600
 // 插件日志含会话 ID、chat ID 与工具摘要；启动时修复旧文件权限，重建时沿用 0600。
 try {
@@ -851,7 +851,7 @@ const numOrZero = (v: unknown): number => (typeof v === "number" && Number.isFin
 // context, not history), so read the local opencode.db (readonly), same
 // technique the v1 era used for diagnostics.
 // ---------------------------------------------------------------------------
-const DB_PATH = "REDACTED_ROOT/.local/share/opencode/opencode.db"
+const DB_PATH = `REDACTED_ROOT/.local/share/opencode/opencode.db`
 const HISTORY_LIMIT = 200
 
 let dbHandle: any = null

@@ -88,7 +88,7 @@ const bgHttpAvail = (): boolean => {
   }
   if (typeof process.env.OPENCODE_PASSWORD === "string" && process.env.OPENCODE_PASSWORD) return true
   try {
-    const reg = JSON.parse(readFileSync("REDACTED_ROOT/.local/state/opencode/service.json", "utf8")) as {
+    const reg = JSON.parse(readFileSync(`REDACTED_ROOT/.local/state/opencode/service.json`, "utf8")) as {
       url?: string
       password?: string
     }
@@ -120,7 +120,7 @@ export const windowKnown = (modelID: string, providerID: string): boolean =>
 // R2607（用户指令：纠正会话长度计算与自动压缩）：窗口表共享给 auto-continue
 // （同进程不同模块实例 + 独立服务场景，不能直接 import）：globalThis + 文件双通道。
 // auto-continue 的压缩阈值/口径守卫需要每模型**真实窗口**（此前硬编码 1M，200k 模型算松 5 倍）。
-const MODEL_WINDOWS_PATH = "REDACTED_ROOT/.config/opencode/model-windows.json"
+const MODEL_WINDOWS_PATH = `REDACTED_ROOT/.config/opencode/model-windows.json`
 const publishModelWindows = (): void => {
   try {
     if (!modelWindows.size) return
@@ -480,7 +480,7 @@ const ctxSuffix = (sessionID: string): string => {
 }
 
 // 关键约束：LOOP_CTL_PATH 必须**保持共享**（自动循环总闸是全局的，两个 Bot 共用）。
-const LOOP_CTL_PATH = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
+const LOOP_CTL_PATH = `REDACTED_ROOT/.config/opencode/loop-ctl.json`
 // R1724（用户指令「不同机器人的循环设置要求单独」）：本 Bot 是否处于循环停止态。
 // 纯函数 —— 桥侧 20 处 loopStopped() 判定全走它，单测可直接钉行为（不必起桥）。
 //   * 顶层 stopped=true = 全局闸（守卫 PROBLEM/WEBSEARCH、/loop stop all）→ 一律停；
@@ -629,7 +629,7 @@ export const mutateLoopCtlFile = (mutate: (j: any) => void): "wrote" | "same" | 
 // 读写，R1891 起按读旧值合并），把 15s 一拍的瞬时限流状态混进去等于让热路径污染总闸；
 // 且标记写失败只应损失"提醒"这个增值功能，绝不能连累总闸。独立文件 + atomicWrite，
 // 失败即忽略（best-effort）。
-export const FLOOD_FLAG_PATH = "REDACTED_ROOT/.config/opencode/bot-flood.json"
+export const FLOOD_FLAG_PATH = `REDACTED_ROOT/.config/opencode/bot-flood.json`
 
 export type FloodFlagEntry = { since: number; until: number }
 export type FloodFlagDisk = Record<string, FloodFlagEntry | undefined>
@@ -868,13 +868,13 @@ export type BotConfig = {
   turnNoteOwnerOnly?: boolean
 }
 
-let CONFIG_PATH = "REDACTED_ROOT/.config/opencode/tg.env"
+let CONFIG_PATH = `REDACTED_ROOT/.config/opencode/tg.env`
 // 默认**关闭**备用投递通道（fail-closed）。
 // 此前默认值就是那个 env 路径，于是"配置里没显式关掉"就等于"通道开着" —— 启动自检
 // 实测主 Bot 的 fallbackApiBase=set，而用户明确要求过关闭备份发送机制。
 // 现在只有入口显式传入 fallbackEnvPath 才会打开；两个 Bot 默认都只用自己的 token。
 let FALLBACK_ENV_PATH: string | null = null
-let STATE_PATH = "REDACTED_ROOT/.config/opencode/tg-chats.json"
+let STATE_PATH = `REDACTED_ROOT/.config/opencode/tg-chats.json`
 let OWNER_PATH = "/tmp/opencode/tg-poll-owner.json"
 let COMMAND_CACHE_PATH = "/tmp/opencode/tg-command-cache.json"
 let STRIP_STATE_PATH = "/tmp/opencode/strip-run.json"
@@ -1819,7 +1819,7 @@ const haltedSet = new Set<string>()
 // 读 halted 时都按它做差集。
 //   * 解除（新消息投递成功 / /loop start）→ 写入 sid
 //   * 重新停机（doStop）→ **抹除** sid 条目（否则新停机会被旧解除吃掉，时序错乱）
-const HALT_RELEASE_PATH = "REDACTED_ROOT/.config/opencode/halt-release.json"
+const HALT_RELEASE_PATH = `REDACTED_ROOT/.config/opencode/halt-release.json`
 export const readHaltRelease = (): Record<string, number> => {
   try {
     const j = JSON.parse(readFileSync(HALT_RELEASE_PATH, "utf8")) as unknown
@@ -4215,7 +4215,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 名字没变也会在启动后立刻重打一次 setMyName（实测 15:26:28 刚成功、15:26:58
   // 重启后 15:27:05 再打即撞 429，retry_after≈21.5h）。持久化后重启/热重载
   // 不再发无谓请求。
-  const RENAME_SIG_PATH = "REDACTED_ROOT/.config/opencode/botname-sig.json"
+  const RENAME_SIG_PATH = `REDACTED_ROOT/.config/opencode/botname-sig.json`
   try {
     const sj = JSON.parse(readFileSync(RENAME_SIG_PATH, "utf8")) as Record<string, string>
     if (typeof sj?.[BOT_ID] === "string") lastRenameSig = sj[BOT_ID]
@@ -4243,7 +4243,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     //   * 检查 HTTP status 与响应体 {ok:false, error_code, parameters.retry_after}；
     //   * 429 时把冷却截止时间按 BOT_ID 写入 botname-429.json（reload 后仍记得，防再打 429）；
     //   * lastRenameSig 仅在**两请求都成功**后推进，失败留空 → 下轮 poll 自动重试。
-    const RENAME_429_PATH = "REDACTED_ROOT/.config/opencode/botname-429.json"
+    const RENAME_429_PATH = `REDACTED_ROOT/.config/opencode/botname-429.json`
     let rename429Until = 0
     {
       try {
@@ -6565,8 +6565,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
 
 
   /** 机器人注册表（与 plugins/tg-bridge-v2.ts 的 REGISTRY_PATH 保持一致）。 */
-  const BOT_REGISTRY_PATH = "REDACTED_ROOT/.config/opencode/tg-bots.json"
-  const BOT_ENV_DIR = "REDACTED_ROOT/.config/opencode"
+  const BOT_REGISTRY_PATH = `REDACTED_ROOT/.config/opencode/tg-bots.json`
+  const BOT_ENV_DIR = `REDACTED_ROOT/.config/opencode`
   const MAX_BOTS = 8
   const TG_TOKEN_RE = /^\d{6,12}:[A-Za-z0-9_-]{30,}$/
 
@@ -6649,12 +6649,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
    * v2lib 源文件 mtime 重新快照并动态 import 新实例（generation gating 接管）。
    *
    * R1906 修正：入口真实路径是 `<config>/opencode/plugins/tg-bridge-v2.ts`
-   * （"REDACTED_ROOT/.config/opencode/plugins/…"），此前误写成
-   * "REDACTED_ROOT/.opencode/plugins/…"（该目录不存在）→ `/addbot` 的重载
+   * （`REDACTED_ROOT/.config/opencode/plugins/…`），此前误写成
+   * `REDACTED_ROOT/.opencode/plugins/…`（该目录不存在）→ `/addbot` 的重载
    * 常年静默失败（appendFileSync 抛 ENOENT 被吞成"失败：…"）。
    */
   const triggerBridgeReload = (): string => {
-    const entry = "REDACTED_ROOT/.config/opencode/plugins/tg-bridge-v2.ts"
+    const entry = `REDACTED_ROOT/.config/opencode/plugins/tg-bridge-v2.ts`
     const note = `\n// addbot reload ${new Date().toISOString()}\n`
     try {
       appendFileSync(entry, note, { encoding: "utf8", mode: PRIVATE_FILE_MODE })
@@ -6748,9 +6748,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
 
 
   /** 循环会话名单（与 auto-continue 的 LOOP_SESSIONS_PATH 一致）。 */
-  const LOOP_SESSIONS_FILE = "REDACTED_ROOT/.config/opencode/loop-sessions.json"
+  const LOOP_SESSIONS_FILE = `REDACTED_ROOT/.config/opencode/loop-sessions.json`
   /** 显式关闭的会话（`/loop off`）—— 必须独立于正向名单，见 auto-continue 里的原因。 */
-  const LOOP_OFF_FILE = "REDACTED_ROOT/.config/opencode/loop-sessions-off.json"
+  const LOOP_OFF_FILE = `REDACTED_ROOT/.config/opencode/loop-sessions-off.json`
 
   const readIdList = (path: string): string[] => {
     try {
@@ -8294,7 +8294,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     }
     if (text === "/loop" || text.startsWith("/loop ") || cmd === "loop") {
       const arg = commandArg(text).toLowerCase()
-      const ctlPath = "REDACTED_ROOT/.config/opencode/loop-ctl.json"
+      const ctlPath = `REDACTED_ROOT/.config/opencode/loop-ctl.json`
       const ctlLegacy = "/tmp/opencode/loop-ctl.json"
       const readCtl = (): any => {
         for (const p of [ctlPath, ctlLegacy]) {
@@ -8380,13 +8380,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         // 循环资格（粘性标志，与 auto-continue 同一份文件）
         const sticky = new Set<string>()
         try {
-          const arr = JSON.parse(readFileSync("REDACTED_ROOT/.config/opencode/loop-sessions.json", "utf8"))
+          const arr = JSON.parse(readFileSync(`REDACTED_ROOT/.config/opencode/loop-sessions.json`, "utf8"))
           if (Array.isArray(arr)) for (const x of arr) if (typeof x === "string") sticky.add(x)
         } catch {
           /* 无粘性文件 = 尚未识别 */
         }
         const seen = new Set<string>()
-        for (const f of globSync("REDACTED_ROOT/.config/opencode/tg-chats*.json")) {
+        for (const f of globSync(`REDACTED_ROOT/.config/opencode/tg-chats*.json`)) {
           try {
             const j = JSON.parse(readFileSync(f, "utf8")) as any
             const sid = typeof j?.front === "string" ? j.front : typeof j?.pinned === "string" ? j.pinned : ""
@@ -8547,7 +8547,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const proxySt = await readProxyStatus()
       // 全局闸 + 各 Bot 闸（读共享 loop-ctl.json）
       const ctl = ((): any => {
-        for (const p of ["REDACTED_ROOT/.config/opencode/loop-ctl.json", "/tmp/opencode/loop-ctl.json"]) {
+        for (const p of [`REDACTED_ROOT/.config/opencode/loop-ctl.json`, "/tmp/opencode/loop-ctl.json"]) {
           try {
             const j = JSON.parse(readFileSync(p, "utf8")) as any
             if (j && typeof j === "object") return j
@@ -8562,7 +8562,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // Bot 注册表
       const botRows: string[] = (() => {
         try {
-          const j = JSON.parse(readFileSync("REDACTED_ROOT/.config/opencode/tg-bots.json", "utf8")) as any
+          const j = JSON.parse(readFileSync(`REDACTED_ROOT/.config/opencode/tg-bots.json`, "utf8")) as any
           const arr = Array.isArray(j?.bots) ? j.bots : []
           return arr.map((b: any) => {
             const id = String(b?.id ?? "?")
@@ -9683,7 +9683,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const siblingBaseline = (): number | null => {
     if (lastRealUpdateId > 0) return null
     let best = 0
-    for (const f of globSync("REDACTED_ROOT/.config/opencode/tg-chats*.json")) {
+    for (const f of globSync(`REDACTED_ROOT/.config/opencode/tg-chats*.json`)) {
       if (f === STATE_PATH) continue
       try {
         const j = JSON.parse(readFileSync(f, "utf8")) as any
@@ -11065,7 +11065,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   // ≤5 分钟；release 资产保持兜底）。仅 primary 触发（三实例重复同步无意义）；
   // detached 子进程 + 脚本自持锁 ⇒ 热重载/重叠触发安全，不占事件循环。
   if (BOT_ID === "primary") {
-    const envSyncScript = process.env.ENV_SYNC_SCRIPT ?? "REDACTED_ROOT/work/sessions/opencode/config/scripts/env-sync.sh"
+    const envSyncScript = process.env.ENV_SYNC_SCRIPT ?? `REDACTED_ROOT/work/sessions/opencode/config/scripts/env-sync.sh`
     const envSyncEveryMs = Math.min(3_600_000, Math.max(60_000, Number(process.env.ENV_SYNC_INTERVAL_MS ?? 300_000) || 300_000))
     const runEnvSyncTick = (why: string) => {
       try {

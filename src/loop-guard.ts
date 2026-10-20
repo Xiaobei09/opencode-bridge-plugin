@@ -16,7 +16,7 @@
  */
 import { readFileSync, writeFileSync, renameSync } from "node:fs"
 
-export const GUARD_PATH = process.env.AC_GUARD_PATH ?? "REDACTED_ROOT/.config/opencode/loop-guard.json"
+export const GUARD_PATH = process.env.AC_GUARD_PATH ?? `REDACTED_ROOT/.config/opencode/loop-guard.json`
 const PRIVATE_FILE_MODE = 0o600
 
 export type GuardCfg = {
