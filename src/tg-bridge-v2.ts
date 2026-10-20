@@ -200,6 +200,8 @@ const botConfig = (bot: BotSpec, index: number) => {
   const push = bot.pushChat ?? own.TG_PUSH_CHAT ?? primaryEnv.TG_PUSH_CHAT ?? ""
   return {
     id: bot.id,
+    // 用户可见名（@username）由注册表 label 提供；状态文件/租约仍用稳定 id。
+    label: bot.label,
     // 首个 Bot 沿用历史代号 __tgBridgeGen：这样它能接管（判过期）升级前遗留的旧实例，
     // 否则新旧实例会并存抢同一个 token → getUpdates 409 风暴。
     genKey: index === 0 ? undefined : `__tgBridgeGen_${bot.id}`,

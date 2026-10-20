@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 批量/幂等注册 TG bot（不需要修改桥代码）。
 #
-# 输入：JSON 数组，或 {"bots":[...]}。每个 bot 至少需要 id + envFile；
+# 输入：JSON 数组，或 {"bots":[...]}。每个 bot 至少需要 envFile，以及 id 或 username；
+# username 会作为用户可见 label（@username），缺省 id 时也用它生成稳定内部 id。
 # envFile 必须存在且含非空 TG_BOT_TOKEN。脚本一次性校验并合并多条记录，
 # 原子写入 tg-bots.json（默认 $HOME/.config/opencode/tg-bots.json）。
 #
@@ -85,8 +86,12 @@ for b in new:
     if not isinstance(b, dict):
         die("every bot entry must be an object")
     bid = str(b.get("id", "")).strip()
+    username = str(b.get("username", "")).strip().lstrip("@")
+    if not bid and username:
+        bid = username.lower()
+        b["id"] = bid
     if not ID_RE.match(bid):
-        die(f"invalid bot id: {bid!r} (use lowercase letters, digits, _ or -; 2-32 chars)")
+        die(f"invalid bot id: {bid!r} (use lowercase letters, digits, _ or -; 2-32 chars; or provide username)")
     env = str(b.get("envFile", "")).strip()
     if not env:
         die(f"bot {bid}: envFile is required")
@@ -99,7 +104,10 @@ for b in new:
     if n < 20:
         die(f"bot {bid}: TG_BOT_TOKEN missing or too short in {env}")
     b["envFile"] = env
-    b.setdefault("label", bid)
+    if username:
+        b.setdefault("label", f"@{username}")
+    else:
+        b.setdefault("label", bid)
     print(f"  {'+' if all(x.get('id') != bid for x in existing) else '='} {bid}  label={b['label']}  env={env}  token=set(len={n})")
 
 by_id = {str(b.get("id")): i for i, b in enumerate(existing)}

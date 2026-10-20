@@ -839,6 +839,8 @@ const VERSION = "r1121-flood-cross-notice"
 // ---------------------------------------------------------------------------
 export type BotConfig = {
   id?: string
+  /** 用户可见名（通常是 @username）；只用于菜单/状态卡，不参与状态文件命名。 */
+  label?: string
   token?: string
   fallbackToken?: string
   allowedChats?: string
@@ -890,6 +892,8 @@ let PUSH_RAW = ""
 let PUSH_NORM = ""
 let PUSH_CHAT = ""
 let BOT_ID = "primary"
+/** 用户可见名（registry label / @username）。内部状态文件仍用 BOT_ID，避免破坏已有会话绑定。 */
+let BOT_LABEL = "primary"
 // tool/shell part 停在 running 的时间戳（key → 首次进入 running 的时间）
 const staleToolBorn = new Map<string, number>()
 /**
@@ -1012,6 +1016,7 @@ export const unownedFrontOwner = (queueCardOwner: boolean): boolean => queueCard
 
 export const configureBot = (cfg: BotConfig, opts: { deferLoad?: boolean } = {}): void => {
   if (cfg.id) BOT_ID = cfg.id
+  BOT_LABEL = cfg.label?.trim() || BOT_ID
   if (typeof cfg.queueCardOwner === "boolean") QUEUE_CARD_OWNER = cfg.queueCardOwner
   if (typeof cfg.turnEndNotify === "boolean") TURN_END_NOTIFY = cfg.turnEndNotify
   if (typeof cfg.turnNoteLoopSkip === "boolean") TURN_NOTE_LOOP_SKIP = cfg.turnNoteLoopSkip
@@ -2548,6 +2553,11 @@ export const injectCardText = (o: {
   avgGapMs: number
   gate: { stopped: boolean; by: string; reason: string }
   now: number
+  /** 可选：当前会话/队列状态；旧调用不传时保持原卡片文案不变（兼容单测）。 */
+  session?: string
+  queue?: number
+  pinQueue?: number
+  paused?: boolean
 }): string => {
   const d = new Date(o.lastAt > 0 ? o.lastAt : o.now)
   const pad = (n: number): string => String(n).padStart(2, "0")
@@ -2560,6 +2570,9 @@ export const injectCardText = (o: {
     : "▶ 循环运行中"
   return [
     `🔁 循环注入状态卡 · ${htmlEsc(o.bot)}`,
+    ...(o.session
+      ? [`会话: ${htmlEsc(o.session)} · ${o.paused ? "推送暂停" : "推送中"} · 外发队列 ${o.queue ?? 0} · 注入队列 ${o.pinQueue ?? 0}`]
+      : []),
     `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
     `累计: ${o.count} 次 · 平均间隔 ${gap}`,
     gateLine,
@@ -6066,7 +6079,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // "AI 没结束就注入"重新引回来。要"立刻注入"的语义请走队列并把 injectMode 设为相应值，
   // 不要新写直注函数。
   const doPrompt = async (target: string, text: string, ctx: string, allowStopped = false): Promise<string> => {
-    if (loopStopped() && !allowStopped) return `loop stopped（本 Bot=${BOT_ID} 已暂停注入；/loop start 恢复本 Bot，其它 Bot 不受影响）`
+    if (loopStopped() && !allowStopped) return `loop stopped（本 Bot=${sanitizeLog(BOT_LABEL)} 已暂停注入；/loop start 恢复本 Bot，其它 Bot 不受影响）`
     const startedAt = Date.now()
     const wasAlreadyStopped = loopStopped()
     try {
@@ -7004,7 +7017,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const menuText = (view: string): string => {
     const t = fixedTarget ?? frontSessionID ?? persistedFront
     const nm = t ? sessionTag(t) : "(未确定)"
-    const head = `<b>🎛 控制台</b> · ${sanitizeLog(BOT_ID)}`
+    const head = `<b>🎛 控制台</b> · ${sanitizeLog(BOT_LABEL)}`
     if (view === "sess") {
       return [
         head,
@@ -7028,7 +7041,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return [
         head,
         loopStopped() ? "⏹ 自动循环：本 Bot 已停止（点“继续循环”恢复；其它 Bot 不受影响）" : "🔁 自动循环：本 Bot 运行中（ESC 或点“停止循环”仅停本 Bot）",
-        `注入队列：${pinQueue.length} · 外发队列：${outQueue.length}`,
+        `会话：<b>${htmlEsc(nm)}</b> · ${pausedMode ? "推送暂停" : "推送中"} · 注入队列 ${pinQueue.length} · 外发队列 ${outQueue.length}`,
         "",
         "只放循环/回合/守卫。后台相关在「后台」页。",
       ].join("\n")
@@ -7049,7 +7062,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return [
         head,
         `版本 ${VERSION}`,
-        `bot=${sanitizeLog(BOT_ID)}`,
+        `bot=${sanitizeLog(BOT_LABEL)}`,
         `状态文件 ${sanitizeLog(STATE_PATH)}`,
         `本 Bot 应答：${selfMute ? "只答命令" : "开启"}`,
         "",
@@ -8319,7 +8332,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           chatID,
           scopeAll
             ? "[tg-bridge] loop stopped（**全部 Bot** 已停：全局闸写入，仅 /loop start all 恢复）"
-            : `[tg-bridge] loop stopped（本 Bot=${BOT_ID} 已停循环；其它 Bot 不受影响。/loop start 恢复本 Bot，/loop stop all 可停全部）`
+            : `[tg-bridge] loop stopped（本 Bot=${sanitizeLog(BOT_LABEL)} 已停循环；其它 Bot 不受影响。/loop start 恢复本 Bot，/loop stop all 可停全部）`
         )
         return
       }
@@ -8344,7 +8357,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           chatID,
           all
             ? "[tg-bridge] loop armed（全部 Bot 已恢复循环）"
-            : `[tg-bridge] loop armed（本 Bot=${BOT_ID} 已恢复循环；其它 Bot 保持各自状态。/loop start all 可恢复全部）`
+            : `[tg-bridge] loop armed（本 Bot=${sanitizeLog(BOT_LABEL)} 已恢复循环；其它 Bot 保持各自状态。/loop start all 可恢复全部）`
         )
         // 显式 start 后才恢复停止期间挂起的注入队列。
         for (const sid of new Set(pinQueue.map((qq) => qq.sid))) void pumpInject(sid)
@@ -8451,7 +8464,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       if (!arg || lower === "status") {
         const st = await readProxyStatus()
-        const lines: string[] = [`[tg-bridge] 🌐 代理切节点 · bot=${sanitizeLog(BOT_ID)}`]
+        const lines: string[] = [`[tg-bridge] 🌐 代理切节点 · bot=${sanitizeLog(BOT_LABEL)}`]
         lines.push(`自动切节点：${cfg.enabled ? "✅ 开" : "❌ 关（/proxy on 开启）"}`)
         lines.push(
           `方式：${cfg.mode === "command" ? "命令" : "Clash 外部控制"} · 分组「${cfg.group}」${cfg.setRoot ? ` · 顶层「${cfg.setRoot}」` : ""}`,
@@ -8575,7 +8588,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           return ["· （读取 tg-bots.json 失败）"]
         }
       })()
-      const lines: string[] = [`[tg-bridge] 🧾 配置清单 · bot=${sanitizeLog(BOT_ID)} · v${VERSION}`]
+      const lines: string[] = [`[tg-bridge] 🧾 配置清单 · bot=${sanitizeLog(BOT_LABEL)} · v${VERSION}`]
       lines.push("")
       lines.push("【本 Bot】")
       lines.push(`· 目标会话：${t ? `${sessionTag(t)} (${t.slice(0, 12)})` : "（未确定）"}`)
@@ -8980,7 +8993,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       savePersistedState()
       await reply(
         chatID,
-        `[tg-bridge] 本 Bot 应答：${selfMute ? "只答命令（普通文本不再自动注入）" : "开启（普通文本照常自动注入）"} · bot=${sanitizeLog(BOT_ID)}`,
+        `[tg-bridge] 本 Bot 应答：${selfMute ? "只答命令（普通文本不再自动注入）" : "开启（普通文本照常自动注入）"} · bot=${sanitizeLog(BOT_LABEL)}`,
       )
       return
     }
@@ -8992,7 +9005,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       savePersistedState()
       await reply(
         chatID,
-        `[tg-bridge] 🗜 压缩通知（「上下文已压缩」卡片）：${compactPrefs.notice ? "发" : "不发"} · 关掉后压缩事件仍记录日志，只是不发卡 · bot=${sanitizeLog(BOT_ID)}`,
+        `[tg-bridge] 🗜 压缩通知（「上下文已压缩」卡片）：${compactPrefs.notice ? "发" : "不发"} · 关掉后压缩事件仍记录日志，只是不发卡 · bot=${sanitizeLog(BOT_LABEL)}`,
       )
       return
     }
@@ -9369,7 +9382,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // 只答命令模式：普通文本不自动注入。**必须明确回执**，否则用户在 Telegram 上
     // 发了半天没反应，会以为 Bot 挂了。
     if (selfMute) {
-      await log("info", `selfmute ignored plain text (bot=${sanitizeLog(BOT_ID)}, len=${text.length})`)
+      await log("info", `selfmute ignored plain text (bot=${sanitizeLog(BOT_LABEL)}, len=${text.length})`)
       await reply(chatID, "🤫 本 Bot 当前是「只答命令」：这条没注入。恢复自动应答：/selfmute off")
       return
     }
@@ -10904,7 +10917,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       st.lastKind = kind
       st.lastSid = sessionID
       const text = injectCardText({
-        bot: BOT_ID,
+        bot: BOT_LABEL,
         lastAt: now,
         kind,
         sid: sessionID,
@@ -10912,6 +10925,10 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         avgGapMs: st.avgGapMs,
         gate: loopGateInfo(),
         now,
+        session: sessionTag(sessionID),
+        queue: outQueue.length,
+        pinQueue: pinQueue.length,
+        paused: pausedMode,
       })
       await log(
         "info",

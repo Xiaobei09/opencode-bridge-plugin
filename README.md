@@ -39,15 +39,16 @@ bash install.sh
 `install.sh` 会：模块（非 `*-v2.ts`）→ `~/.opencode/v2lib/` 与 `~/.config/opencode/v2lib/`（入口的相对 import 依赖后者）；两个入口 → `~/.config/opencode/plugins/`；并把路径占位符 `REDACTED_ROOT` 替换为本机 `$HOME`。装完重启 `opencode serve`（或 `touch ~/.config/opencode/plugins/tg-bridge-v2.ts` 触发热重载）生效。
 
 - 依赖：opencode（V2 插件宿主）。
-- Bot 配置：`~/.config/opencode/tg-bots.json`（每 Bot 一条：id + 各自的 token env 文件路径）；token 只放 env 文件，本仓库不含任何密钥。
+- Bot 配置：`~/.config/opencode/tg-bots.json`（每 Bot 一条：稳定内部 `id` + token env 文件路径；用户可见名用 `label`，推荐直接写 `@username`）；token 只放 env 文件，本仓库不含任何密钥。
 - **批量接入多个 Bot（不需要改代码）**：`tg-bridge-v2.ts` 的 `readRegistry()` 会动态读取 `bots[]`，`setup()` 对每个条目建立实例，没有 3 个上限。先为每个 bot 准备 env 文件（含非空 `TG_BOT_TOKEN`），再一次性提交一个 JSON：
   ```bash
   cp examples/tg-bots.batch.example.json /tmp/new-bots.json
-  # 编辑 /tmp/new-bots.json：可放任意 N 条 {id,label,envFile}
+  # 可放任意 N 条；username 可直接代替 id，label 会自动成为 @username
   bash add-bots.sh --file /tmp/new-bots.json --dry-run
   bash add-bots.sh --file /tmp/new-bots.json --reload
   ```
-  `add-bots.sh` 会校验 id/env/token、按 id 幂等 upsert、原子写入 `tg-bots.json`（mode 600），输出只显示 `token=set(len=N)`，不打印 token；`--reload` 只 touch 插件入口触发重载。`id` 用小写字母/数字/`_`/`-`，env 路径支持 `~`。
+  `add-bots.sh` 会校验 id/username/env/token、按 id 幂等 upsert、原子写入 `tg-bots.json`（mode 600），输出只显示 `token=set(len=N)`，不打印 token；`--reload` 只 touch 插件入口触发重载。`id` 用小写字母/数字/`_`/`-`，env 路径支持 `~`。`username` 缺省时用 `id` 生成内部 id，`label` 自动为 `@username`。
+- **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡新增当前会话、推送状态、外发队列和注入队列。
 - 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。
 
 ## 运行注意（R617）
