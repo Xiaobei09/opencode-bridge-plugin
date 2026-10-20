@@ -41,6 +41,12 @@ bash install.sh
 - Bot 配置：`~/.config/opencode/tg-bots.json`（每 Bot 一条：id + 各自的 token env 文件路径）；token 只放 env 文件，本仓库不含任何密钥。
 - 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。
 
+## 运行注意（R617）
+
+- **网页搜索**：宿主 `websearch` 工具可能被取消（实测返回 `Web search cancelled`）；fallback 用 `webfetch https://lite.duckduckgo.com/lite/?q=<urlencoded>`，已实测 200/真实结果。桥本身不代理 websearch，不要把它当搜索 provider。
+- **出站图片**：桥当前只有入站 `msg.photo` 分支，没有 `sendPhoto` / `sendDocument`；agent 生成的图不会自动发到 TG。若需要，显式文件发送是 backlog。
+- **菜单/乱码**：文本截断走 UTF-16 安全路径；根菜单 4×2，回调完整性有 `tests/menu-root.test.ts`；`bun` 不在当前 CI PATH 时测试未执行（静态审计，不等于运行通过）。
+
 ## 脱敏声明
 
 - 所有 Bot token / API key 均从环境变量读取，**源码不含任何密钥**（发布前已扫描 + 断言双保险）。
