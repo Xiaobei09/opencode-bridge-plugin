@@ -2580,6 +2580,8 @@ export const injectCardText = (o: {
   now: number
   /** 可选：当前会话/队列状态；旧调用不传时保持原卡片文案不变（兼容单测）。 */
   session?: string
+  /** R923：会话实时状态（运行中 / outcome（空闲 Nm）），置顶循环卡也显示。 */
+  sessionState?: string
   queue?: number
   pinQueue?: number
   paused?: boolean
@@ -2596,7 +2598,7 @@ export const injectCardText = (o: {
   return [
     `🔁 循环注入状态卡 · ${htmlEsc(o.bot)}`,
     ...(o.session
-      ? [`会话: ${htmlEsc(o.session)} · ${o.paused ? "推送暂停" : "推送中"} · 外发队列 ${o.queue ?? 0} · 注入队列 ${o.pinQueue ?? 0}`]
+      ? [`会话: ${htmlEsc(o.session)}${o.sessionState ? ` · 状态=${htmlEsc(o.sessionState)}` : ""} · ${o.paused ? "推送暂停" : "推送中"} · 外发队列 ${o.queue ?? 0} · 注入队列 ${o.pinQueue ?? 0}`]
       : []),
     `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
     `累计: ${o.count} 次 · 平均间隔 ${gap}`,
@@ -4182,6 +4184,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   const sessionTitleCache = new Map<string, string>()
   // R921：状态卡需要「会话最近结果 / 空闲时刻 / 模型」，一并缓存，避免状态命令再打一次 HTTP。
   const cachedSessionList: Array<{ id: string; title?: string; outcome?: string; idle?: number; model?: string }> = []
+  // R923：置顶循环卡也显示会话实时状态；与 /loop status 使用同一份缓存/活动时间。
+  const sessionStateLabel = (sid: string): string => {
+    const info = cachedSessionList.find((x) => x.id === sid)
+    const act = lastActivity.get(sid)
+    const mins = act ? Math.max(0, Math.round((Date.now() - act) / 60000)) : -1
+    const idleMin = info?.idle ? Math.max(0, Math.round((Date.now() - info.idle) / 60000)) : -1
+    const running = mins >= 0 && mins <= 2
+    return running ? "运行中" : `${info?.outcome ?? "未知"}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
+  }
   // R1884：上次记进日志的条数（-1 = 还没记过）。仅用于"变化才记"，避免刷屏。
   let lastLoggedSessionCount = -1
   // R1885：裸 HTTP 取**全量**会话列表。凭证与 `/api/model`（R1881）同源。
@@ -7388,6 +7399,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             gate: loopGateInfo(),
             now: Date.now(),
             session: sessionTag(target),
+            sessionState: sessionStateLabel(target),
             queue: outQueue.length,
             pinQueue: pinQueue.length,
             paused: pausedMode,
@@ -11148,6 +11160,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         gate: loopGateInfo(),
         now,
         session: sessionTag(sessionID),
+        sessionState: sessionStateLabel(sessionID),
         queue: outQueue.length,
         pinQueue: pinQueue.length,
         paused: pausedMode,
