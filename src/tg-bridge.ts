@@ -3462,6 +3462,22 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   quiet: "/quiet",
 }
 
+/**
+ * R921：用户可见的 Bot 名。注册表 label（@username）优先，**绝不把内部 id 暴露到界面**
+ *（用户明确要求「不要搞 bot 代号，直接用用户名」）。内部状态文件仍用 id，避免破坏绑定。
+ */
+export const botDisplayName = (id: string, registryPath?: string): string => {
+  try {
+    const p = registryPath ?? `REDACTED_ROOT/.config/opencode/tg-bots.json`
+    const j = JSON.parse(readFileSync(p, "utf8")) as any
+    const hit = (Array.isArray(j?.bots) ? j.bots : []).find((b: any) => String(b?.id ?? "") === id)
+    const label = String(hit?.label ?? "").trim().replace(/^@+/, "")
+    return label ? `@${label}` : id
+  } catch {
+    return id
+  }
+}
+
 export const buildMenuKeyboard = (
   view: string,
   opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number; proxyEnabled?: boolean; cnotice?: boolean } = {},
@@ -4164,7 +4180,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     lastActivity.set(sid, Date.now())
   }
   const sessionTitleCache = new Map<string, string>()
-  const cachedSessionList: Array<{ id: string; title?: string }> = []
+  // R921：状态卡需要「会话最近结果 / 空闲时刻 / 模型」，一并缓存，避免状态命令再打一次 HTTP。
+  const cachedSessionList: Array<{ id: string; title?: string; outcome?: string; idle?: number; model?: string }> = []
   // R1884：上次记进日志的条数（-1 = 还没记过）。仅用于"变化才记"，避免刷屏。
   let lastLoggedSessionCount = -1
   // R1885：裸 HTTP 取**全量**会话列表。凭证与 `/api/model`（R1881）同源。
@@ -4233,7 +4250,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const id = String(s?.id ?? "")
           if (!id) continue
           const title = String(s?.title ?? s?.info?.title ?? "").slice(0, 60)
-          cachedSessionList.push({ id, title: title || undefined })
+          const outcome = typeof s?.outcome === "string" ? s.outcome : undefined
+          const idle = Number(s?.time?.idle) || 0
+          const mdl = s?.model && typeof s.model === "object"
+            ? `${String(s.model.providerID ?? "")}/${String(s.model.id ?? "")}`.replace(/^\/|\/$/g, "")
+            : ""
+          cachedSessionList.push({ id, title: title || undefined, outcome, idle: idle || undefined, model: mdl || undefined })
           if (title) sessionTitleCache.set(id, title)
         }
         // R1884：把"存在性判据"的**规模**变成可观测量。这份列表是
@@ -8538,7 +8560,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             const e = bots[k] ?? {}
             const st = e.stopped === true ? "停" : "运行"
             const sid0 = Array.isArray(e.sids) && typeof e.sids[0] === "string" ? (e.sids[0] as string).slice(0, 12) : "-"
-            return `${k}=${st}${sid0}`
+            // R921：界面只用 @username，不显示 primary/bot3/bot4 这类内部代号。
+            return `${botDisplayName(k)}=${st}${sid0}`
           })
         } catch {
           return []
@@ -8550,6 +8573,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         `[tg-bridge] loop status: ${stopped ? `stopped${by}（全局闸，/loop start all 恢复）` : "running（用户主动停止前一直循环）"}`,
       ]
       if (botGates.length > 0) lines.push(`· 逐 Bot 闸：${botGates.join("  ")}`)
+      // R921：状态卡要求显示会话状态；复用存在性列表的 HTTP 结果（含 outcome/time.idle），
+      // 失败时 refreshSessionTitles 保留上一份好缓存，状态行退化为「未知」而不是整卡报错。
+      await refreshSessionTitles()
       try {
         // 循环资格（粘性标志，与 auto-continue 同一份文件）
         const sticky = new Set<string>()
@@ -8571,8 +8597,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             const act = lastActivity.get(sid)
             const mins = act ? Math.max(0, Math.round((Date.now() - act) / 60000)) : -1
             const mine = sid === (fixedTarget ?? frontSessionID ?? persistedFront) ? "（本 Bot）" : ""
+            const info = cachedSessionList.find((x) => x.id === sid)
+            const idleMin = info?.idle ? Math.max(0, Math.round((Date.now() - info.idle) / 60000)) : -1
+            const running = mins >= 0 && mins <= 2
+            const state = running
+              ? "运行中"
+              : `${info?.outcome ?? "未知"}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
             lines.push(
-              `· ${tag} ${sid.slice(0, 12)}${mine} 循环=${sticky.has(sid) ? "是" : "未登记"}` +
+              `· ${tag} ${sid.slice(0, 12)}${mine} 状态=${state} 循环=${sticky.has(sid) ? "是" : "未登记"}` +
                 ` 最近轮次=${rnd ?? "?"} 活动=${mins >= 0 ? `${mins} 分钟前` : "未知"}`,
             )
           } catch {
@@ -8740,10 +8772,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const arr = Array.isArray(j?.bots) ? j.bots : []
           return arr.map((b: any) => {
             const id = String(b?.id ?? "?")
-            const label = b?.label ? String(b.label) : ""
             const gate = (ctl?.bots ?? {})[id]?.stopped === true ? "停" : "运行"
             const me = id === BOT_ID ? "（本 Bot）" : ""
-            return `· ${id}${me} ${label ? `@${label}` : ""} 循环=${gate}`
+            // R921：label 本身已带 @；旧代码再拼一个 @ 会显示成 @@username。
+            return `· ${botDisplayName(id)}${me} 循环=${gate}`
           })
         } catch {
           return ["· （读取 tg-bots.json 失败）"]

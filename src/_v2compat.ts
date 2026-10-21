@@ -1350,16 +1350,41 @@ export const hostServiceReg = async (): Promise<{ url: string; password: string 
   const port = await findLocalServerPort()
   const url = port ? `http://127.0.0.1:${port}` : fileUrl
   const password = pwSelf || pwParent || pwJs || filePw
-  // 自愈：拿到的实时密码与文件不一致 = 文件已过期 → 回写到**仓库外**的那份，
-  // 让其它直读该文件的消费点也拿到当前值。（不写 ~/.config/opencode/ 那条：它经符号
-  // 链接落在 sessions 仓库内，曾被并发会话按密钥清理删除，保持不落盘。）
-  if (password && password !== filePw && url) {
+  // 自愈：拿到的实时密码与文件不一致 = 文件已过期 → 回写实时值，让其它直读该文件的
+  // 消费点也拿到当前值。R921：同时补齐 ~/.config/opencode/service.json（用户报「TG 桥配置
+  // 没有还原！环境不完整」）。**仅当该目录是真实目录时写**；若它是符号链接（可能指向
+  // sessions 仓库），跳过，避免把宿主密码写进仓库。两处都只在内容不同时写，幂等。
+  if (password && url) {
+    const want = JSON.stringify({ url, password })
     try {
       const dir = `${home}/.local/state/opencode`
       fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(`${dir}/service.json`, JSON.stringify({ url, password }), { mode: 0o600 })
+      const localFile = `${dir}/service.json`
+      let cur = ""
+      try {
+        cur = fs.readFileSync(localFile, "utf8")
+      } catch {
+        /* 缺失 = 需要写 */
+      }
+      if (cur !== want) fs.writeFileSync(localFile, want, { mode: 0o600 })
     } catch {
       /* 只读或并发：忽略，本函数已返回实时值 */
+    }
+    try {
+      const cfgDir = `${home}/.config/opencode`
+      const st = fs.lstatSync(cfgDir)
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        const cfgFile = `${cfgDir}/service.json`
+        let cur = ""
+        try {
+          cur = fs.readFileSync(cfgFile, "utf8")
+        } catch {
+          /* 缺失 = 需要写 */
+        }
+        if (cur !== want) fs.writeFileSync(cfgFile, want, { mode: 0o600 })
+      }
+    } catch {
+      /* 目录缺失/只读/符号链接：忽略 */
     }
   }
   return { url, password }
