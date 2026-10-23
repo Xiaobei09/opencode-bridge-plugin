@@ -20,7 +20,7 @@
  *   specifier 带 v2lib 源文件 mtime：改源码 → 新模块实例 → 新实例用同一个 Bot
  *   的代号把旧实例判成过期并接管，旧实例自行退出（generation gating）。
  */
-import { readFileSync, statSync, appendFileSync, cpSync, rmSync, readdirSync, mkdirSync } from "node:fs"
+import { readFileSync, writeFileSync, renameSync, statSync, appendFileSync, cpSync, rmSync, readdirSync, mkdirSync } from "node:fs"
 
 /** 诊断写文件：插件的 console.error 会进 server 的 stderr（socket），日志里看不到。
  *  可用 TG_BRIDGE_DIAG_LOG 改写：隔离回归测试要写自己的日志，不能污染生产 diag（R-round2）。 */
@@ -212,6 +212,73 @@ const readEnvFile = (path?: string): Record<string, string> => {
   return out
 }
 
+/**
+ * 启动前 token 鉴权（R2507）。
+ *
+ * 只按形状校验会放过“格式合法但已被 Telegram 吊销”的 token：桥会启动，然后每 2 秒
+ * getUpdates 一次 401，日志被同一签名刷屏，用户却收不到任何消息。这里在实例化前
+ * 调一次 getMe，**只对确定性鉴权失败（400/401/403 / Unauthorized）跳过该 Bot**；
+ * 网络超时、429、5xx 等瞬时错误仍放行，交给 poll 重试，避免误杀。
+ *
+ * token 只存在内存 Map 的 key 里，不写日志、不落盘。
+ */
+type TokenCheck = { ok: boolean; definitive: boolean; desc?: string; at: number }
+const TOKEN_CHECK_TTL_MS = 10 * 60_000
+const tokenCheckCache = new Map<string, TokenCheck>()
+const checkBotToken = async (token: string): Promise<TokenCheck> => {
+  const now = Date.now()
+  const cached = tokenCheckCache.get(token)
+  if (cached && now - cached.at < TOKEN_CHECK_TTL_MS) return cached
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+      method: "GET",
+      signal: AbortSignal.timeout(10_000),
+    })
+    const j = (await res.json().catch(() => null)) as any
+    const desc = String(j?.description ?? `HTTP ${res.status}`).slice(0, 120)
+    if (res.ok && j?.ok) {
+      const ok: TokenCheck = { ok: true, definitive: true, at: now }
+      tokenCheckCache.set(token, ok)
+      return ok
+    }
+    const authRejected =
+      res.status === 400 || res.status === 401 || res.status === 403 ||
+      /unauthorized|not found|invalid.*token/i.test(desc)
+    const out: TokenCheck = { ok: !authRejected, definitive: authRejected, desc, at: now }
+    tokenCheckCache.set(token, out)
+    return out
+  } catch (err) {
+    // 无法判断（断网/超时）→ 放行，不能因为一次网络抖动把 Bot 永久跳过。
+    const out: TokenCheck = { ok: true, definitive: false, desc: String(err).slice(0, 120), at: now }
+    tokenCheckCache.set(token, out)
+    return out
+  }
+}
+
+/** 跳过某个 Bot 时必须显式退休它的旧实例，否则旧 poll 循环会继续 401。 */
+const retireBotInstance = (id: string): void => {
+  const key = `__tgBridgeGen_${id}`
+  const g = globalThis as Record<string, unknown>
+  g[key] = (typeof g[key] === "number" ? (g[key] as number) : 0) + 1
+  diag(`[tg-bridge-v2] retired skipped instance ${key}`)
+}
+
+/** 记录被跳过的 Bot，供 /info 与人工排查；不含 token。 */
+const writeTokenStatus = (invalid: Array<{ id: string; desc: string }>): void => {
+  const path = `REDACTED_ROOT/.config/opencode/tg-token-invalid.json`
+  try {
+    if (invalid.length === 0) {
+      rmSync(path, { force: true })
+      return
+    }
+    const tmp = `${path}.tmp-${process.pid}`
+    writeFileSync(tmp, `${JSON.stringify({ updatedAt: new Date().toISOString(), bots: invalid }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 })
+    renameSync(tmp, path)
+  } catch {
+    /* 诊断文件失败不影响桥启动 */
+  }
+}
+
 // R-round2（2026-10-17 根因修复）：这里读到的是**模块顶层一次性常量**。
 // 热重载只对缓存模块重调 setup()、不重求值顶层 → 顶层 bots 会永远停在进程启动时的
 // 注册表，/addbot 新增的 bot 因此「登记了却不上线」（13:49:15 对照实验证明）。
@@ -351,6 +418,7 @@ export default {
       // 保全失败绝不能挡住启动：日志是诊断材料，不是命脉
       diag(`[tg-bridge-v2] 启动日志保全失败（不影响启动）: ${String(e).slice(0, 140)}`)
     }
+    const invalidBots: Array<{ id: string; desc: string }> = []
     for (const [idx, bot] of bots.entries()) {
       diag(`[tg-bridge:${bot.id}] loading (idx=${idx})`)
       try {
@@ -362,6 +430,27 @@ export default {
           continue
         }
         const cfg: any = botConfig(bot, idx)
+        if (!cfg.token) {
+          diag(`[tg-bridge:${bot.id}] skipped: token missing`)
+          invalidBots.push({ id: bot.id, desc: "token missing" })
+          if (idx > 0) retireBotInstance(bot.id)
+          continue
+        }
+        // 鉴权失败的非主 Bot 直接跳过：启动它只会每 2s 刷一次 401，且永远收不到消息。
+        // 主 Bot 即使鉴权失败也启动（否则连通知/修复入口都没有），由 poll 的鉴权熔断兜底。
+        const tokenCheck = await checkBotToken(cfg.token)
+        if (!tokenCheck.ok) {
+          if (tokenCheck.definitive && idx > 0) {
+            diag(`[tg-bridge:${bot.id}] skipped: Telegram rejected token (${tokenCheck.desc ?? "unauthorized"})`)
+            invalidBots.push({ id: bot.id, desc: tokenCheck.desc ?? "unauthorized" })
+            retireBotInstance(bot.id)
+            continue
+          }
+          diag(
+            `[tg-bridge:${bot.id}] token check warning (${tokenCheck.definitive ? "rejected" : "transient"}): ` +
+              `${tokenCheck.desc ?? "unknown"}; starting anyway`,
+          )
+        }
         configure(cfg)
         const plugin: any = v2Bridge(`tg-bridge-v2:${bot.id}`, (client) => factory({ client } as any))
         disposers.push(await plugin.setup?.(context))
@@ -372,6 +461,7 @@ export default {
         diag(`[tg-bridge:${bot.id}] instance failed: ${String(err).slice(0, 300)}`)
       }
     }
+    writeTokenStatus(invalidBots)
     return () => {
       for (const d of disposers) {
         try {
@@ -387,5 +477,3 @@ export default {
 // addbot reload 2026-10-17T13:32:56Z
 
 // addbot reload 2026-10-17T13:40:39Z (round1 verify)
-
-// reload trigger 2026-10-23T03:22:28Z (repo->live sync)

@@ -4124,6 +4124,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   }
   let offset = persistedOffset
   let polling = false
+  // R2507：鉴权熔断。401/400/403 是确定性配置错误（token 被吊销/写错），不是网络抖动；
+  // 每 2 秒重试只会把同一签名刷满日志。连续 3 次后停掉本实例的 poll，并留一条明确
+  // error（不含 token），等人工更新 token + reload 桥。
+  let authFailStreak = 0
+  let authDisabled = false
   // 自愈请求挂起位：轮询在飞时不能发 getUpdates（见 sanityCheckOffset 注释）
   let sanityPendingReason: string | null = null
   // 在飞的长轮询句柄：新实例在 setup 里抢占租约后，旧实例必须在几秒内**主动中断**
@@ -9648,6 +9653,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
 
   const poll = async (): Promise<void> => {
     if (polling) return
+    if (authDisabled) return
     // R1870：`polling` 必须在进入本函数的**第一个 await 之前**置位。它一身两职：
     //   (a) setInterval(POLL_MS=2s) 的防重入闸；
     //   (b) sanityCheckOffset / peekLatestUpdateId 判定"轮询在飞"（否则并发 getUpdates → 409）。
@@ -9739,6 +9745,22 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           /* unreadable */
         }
         const detail = `getUpdates failed: ${res.status} (status=${res.status}, holder=${holder.slice(0, 8)}, me=${shortId}, gen=${myGen}, pid=${process.pid})`
+        const authRejected = res.status === 400 || res.status === 401 || res.status === 403
+        if (authRejected) {
+          authFailStreak++
+          if (authFailStreak >= 3) {
+            authDisabled = true
+            await log(
+              "error",
+              `getUpdates auth rejected ${authFailStreak}x; polling stopped (bot=${BOT_ID}). ` +
+                `Update the token and reload the bridge. ${detail}`,
+            )
+            stopPolling()
+            return
+          }
+        } else {
+          authFailStreak = 0
+        }
         if (isRoutinePollStatus(res.status)) {
           // R1861：5xx 是服务端瞬时（本轮未消费 update、offset 不变，下一轮自愈）。
           // 降级 info + 节流（复用 pollTimeoutLogAt），不再污染健康信号；409/4xx 仍走 error。
@@ -9764,6 +9786,22 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const detail =
           `getUpdates not ok: status=200 error_code=${shown} ${desc} ` +
           `(me=${shortId}, gen=${myGen}, pid=${process.pid})`
+        const authRejected = code === 400 || code === 401 || code === 403
+        if (authRejected) {
+          authFailStreak++
+          if (authFailStreak >= 3) {
+            authDisabled = true
+            await log(
+              "error",
+              `getUpdates auth rejected ${authFailStreak}x; polling stopped (bot=${BOT_ID}). ` +
+                `Update the token and reload the bridge. ${detail}`,
+            )
+            stopPolling()
+            return
+          }
+        } else {
+          authFailStreak = 0
+        }
         // 429（限流）与 5xx 属瞬时：降级 info + 节流，不让上游抖动冒充 poll error。
         if (code === 429 || isRoutinePollStatus(code)) {
           if (Date.now() - pollTimeoutLogAt > 5 * 60_000) {
@@ -9776,6 +9814,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return // 关键：不走 touchPeer、不推进 offset、不 noteInbound
       }
       const result = Array.isArray(j?.result) ? j.result : []
+      authFailStreak = 0
       // R1758：每次 poll 返回都刷新同伴账本（**含空数组**），否则没收到消息的 bot
       // 永远读不到同伴领先 → 落 no-peer → 不报警（自我抑制死结，见 touchPeer 注释）。
       touchPeer()

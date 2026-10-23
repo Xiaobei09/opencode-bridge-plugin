@@ -12,5 +12,3 @@ import { AutoContinuePlugin } from "../v2lib/auto-continue.ts"
 export default v2Bridge("auto-continue", (client) =>
   AutoContinuePlugin({ client } as any)
 )
-
-// reload trigger 2026-10-23T03:22:28Z (repo->live sync)
