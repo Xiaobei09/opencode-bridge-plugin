@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
-import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync, existsSync } from "node:fs"
+import { chmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, appendFileSync, globSync, statfsSync, existsSync, readdirSync } from "node:fs"
 import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailableNow, offsetRewindTarget, registerInjectNotifier, idleVerdict, hostServiceReg } from "./_v2compat"
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
@@ -25,9 +25,11 @@ import {
 // R1565：「AI 主动结束输出」短提示文案（纯函数 + 单测），见 turn-end-note.ts 头注。
 import { turnEndLine, extractRound, noteSkipped, SYNTHETIC_LOOP_MARKERS, noteOwnerOnlySkipped } from "./turn-end-note"
 import { appendShellBgHint, hasShellBgHint, isFreshRunningCard, HINT_FRESH_MS_DEFAULT } from "./bg-hint"
-// R2498：可选功能「网络错误自动切节点」的 TG 集成（/proxy）。配置在 proxy-switch.json，
-// 默认关闭不影响行为；本模块读取/切换/开关/通知都走这里，避免与 auto-continue 侧判据漂移。
-import { readProxySwitchCfg, readStatus as readProxyStatus, readLastSwitch, switchProxyNode, switchToNode, setEnabled as setProxyEnabled, setNodeLock, registerProxyNotifier, maybeSwitchProxyNode, watchLockedQuality } from "./proxy-switch"
+// R942：出口代理（每轮 CI 一个正向代理 → provider 流量走另一个出口 IP）。
+// 旧的「切 mihomo 节点」方案已下线：节点/DNS 级切换不改变源站看到的客户端 IP，
+// 额度照样被卡；且 Bun 启动时解析一次代理，运行期换不了隧道 ⇒ 出口只能**按轮换**。
+// 本模块只读状态（exit-proxy.json + 进程代理环境），供 /proxy 面板与状态页展示。
+import { readExitProxy, exitProxySummary, exitProxyPanel, isExitProxyActive, EXIT_PROXY_STATE_PATH } from "./exit-proxy"
 
 // R208（D7 根因）：宿主跨进程重启后，会话消息 seq 可能从 0 重计（实测 bot4 目标：新消息
 // seq=6..40、旧行 935..1035）⇒ 宿主 API 行序 ≠ 会话时序，新消息被排到旧消息之前。
@@ -2563,6 +2565,11 @@ export const writeInjectCardState = (bot: string, st: InjectCardState): void => 
     writeFileSync(
       injectCardStatePath(bot),
       JSON.stringify({ msgID: st.msgID, count: st.count, lastAt: st.lastAt, lastKind: st.lastKind, lastSid: st.lastSid, avgGapMs: st.avgGapMs }),
+      // R941 (D3): create the card state 0600 like every other runtime state
+      // file. The default umask made it 0644 on create (observed after the
+      // 2026-10-21 factory reset); the boot-time normalization now covers
+      // restored files, this covers files created during a run.
+      { encoding: "utf8", mode: PRIVATE_FILE_MODE },
     )
   } catch {
     /* best-effort：落盘失败只影响重载后的卡 id 复用，下次创建会自愈 */
@@ -3451,13 +3458,9 @@ export const MENU_ACTION_TEXT: Record<string, string> = {
   model: "/model",
   // R201（用户 2026-10-18）：思考深度选择（等价 /think，thk: 回调驱动）。
   think: "/think",
-  // R2498 代理切节点：面板 + 切下一节点 / 开-关自动切 / 列候选 / 配置清单。
+  // R942 出口代理：面板 + 换出口（结束本轮，下一轮换新代理）。
   proxy: "/proxy",
   proxynext: "/proxy next",
-  proxylock: "/proxy lock",
-  proxyunlock: "/proxy unlock",
-  proxyon: "/proxy on",
-  proxyoff: "/proxy off",
   proxylist: "/proxy list",
   config: "/config",
   loud: "/loud",
@@ -3482,7 +3485,7 @@ export const botDisplayName = (id: string, registryPath?: string): string => {
 
 export const buildMenuKeyboard = (
   view: string,
-  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number; proxyEnabled?: boolean; cnotice?: boolean } = {},
+  opts: { paused?: boolean; stopped?: boolean; selfmute?: boolean; guard?: GuardCfg; bgAuto?: boolean; bgShellAuto?: boolean; bgPromoteMs?: number; cnotice?: boolean } = {},
 ): unknown[][] => {
   const paused = Boolean(opts.paused)
   const stopped = Boolean(opts.stopped)
@@ -3497,8 +3500,6 @@ export const buildMenuKeyboard = (
   const bgShellAuto = Boolean(opts.bgShellAuto)
   // 插件层 shell>N 秒转后台阈值（R1505 起可调；缺省 60s）。
   const bgMs = Number.isFinite(Number(opts.bgPromoteMs)) ? Number(opts.bgPromoteMs) : 60_000
-  // R2498 自动切节点开关（运行期状态，由调用方现读传入；缺省按关显示）。
-  const pOn = Boolean(opts.proxyEnabled)
   // R719：压缩通知开关（缺省按开显示——默认行为就是发）。
   const cnoticeOn = opts.cnotice !== false
   // 菜单阈值按钮：轮切到下一档，按钮文案带目标档，回调把目标秒数带给命令。
@@ -3551,13 +3552,11 @@ export const buildMenuKeyboard = (
       [b("⬅️ 返回", "m:root")],
     ]
   }
-  // R2498 代理/切节点页：状态/动作为主（查看状态、切下一节点、开关自动切、列候选）。
-  // R719b：新增「🔐 锁定当前节点 / 🔓 解锁回自动」（mihomo 内置锁定；PUT=锁、DELETE=解锁）。
+  // R942 出口代理页：本轮出口 + 「换出口」（= 结束本轮，relay 起新 run 重新挑代理）。
   if (view === "proxy") {
     return [
-      [b("🔄 刷新状态", "ma:proxy"), b("📋 候选节点", "ma:proxylist")],
-      [b("⏭ 切下一节点", "ma:proxynext"), b("🔐 锁定当前节点", "ma:proxylock")],
-      [b("🔓 解锁回自动", "ma:proxyunlock"), b(pOn ? "🔄 自动切节点：开（点此关）" : "⭕ 自动切节点：关（点此开）", pOn ? "ma:proxyoff" : "ma:proxyon")],
+      [b("🔄 刷新状态", "ma:proxy"), b("📄 出口详情", "ma:proxylist")],
+      [b("♻️ 换出口（重启本轮）", "ma:proxynext")],
       [b("⬅️ 返回", "m:root")],
     ]
   }
@@ -3591,7 +3590,7 @@ export const buildMenuKeyboard = (
     [b("🗂 会话", "m:sess"), b("📣 推送", "m:push")],
     [b("🔁 循环", "m:loop"), b("⚙️ 后台", "m:bg")],
     [b("🤖 模型", "ma:model"), b("🧠 思考深度", "ma:think")],
-    [b("🛠 系统", "m:sys"), b("🌐 代理/切节点", "m:proxy")],
+    [b("🛠 系统", "m:sys"), b("🌐 出口代理", "m:proxy")],
   ]
   }
 
@@ -5037,6 +5036,42 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     await sendQueued(chatID, htmlEsc(text), kb, quote)
   }
 
+  // ── R942：结束本轮以更换出口（/proxy next）────────────────────────────────
+  // 出口代理**按轮换**：Bun 在进程启动时解析一次代理，运行期改 env 也不换隧道
+  // （实测），所以"换出口"只能靠**结束本轮** → workflow relay 起新 run → 新 run
+  // 重新挑一个代理（新出口 IP ⇒ 不再撞同一个额度）。
+  // 桥就住在将被杀的 opencode 进程里 ⇒ 必须**先回 TG、再延迟杀**（1.5s）。
+  const endRunForNewExit = (): void => {
+    if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") !== "1") {
+      void log("info", "exit-proxy: end-run requested outside CI (TG_BRIDGE_FORCE_SERVE!=1); ignored")
+      return
+    }
+    setTimeout(() => {
+      try {
+        for (const name of readdirSync("/proc")) {
+          if (!/^\d+$/.test(name)) continue
+          const pid = Number(name)
+          if (pid === process.pid) continue
+          let comm = ""
+          try {
+            comm = readFileSync(`/proc/${name}/comm`, "utf8").trim()
+          } catch {
+            continue
+          }
+          if (comm === "opencode") {
+            try {
+              process.kill(pid, "SIGKILL")
+            } catch {
+              /* 已退出/无权限：忽略 */
+            }
+          }
+        }
+      } catch {
+        /* /proc 不可读：忽略 */
+      }
+    }, 1500)
+  }
+
   // 只有最新回复保留按钮：新回复落地即扒掉上一条同会话回复的键
   const trackReplyButtons = async (sess: string, chatID: string, msgID: number, kb: unknown[][] | undefined, key: string): Promise<void> => {
     if (!sess || !kb) return
@@ -5999,18 +6034,22 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const eText = (eMsg || (eType ? "" : JSON.stringify(mErr))).slice(0, 900)
       const title = `❌ 生成失败${eType ? ` · ${eType}` : ""}`
       const body = [eType && !eMsg ? eType : "", eText].filter(Boolean).join("\n") || "(无错误详情)"
-      // R2501（用户实报「这种频繁出现也应该切换吧」）：网络类 provider 错误（ECONNRESET /
-      // 速率限制 / 配额等）→ 尝试自动切代理节点。
-      // 为什么补在这里：此前唯一触发点是 auto-continue 的 eval，而它只在**循环目标会话**、
-      // 且可能被 gating（skip/waiting/HUNG）吞掉；而「❌ 生成失败」卡是 tg-bridge 侧**对所有
-      // 会话即时**渲染的 —— 在这里补触发，覆盖面才完整。与 auto-continue 触发点共用
-      // cooldownMs（含跨实例落盘闸，见 proxy-switch.ts），重复触发会被去重。
-      // 新鲜度闸：只对「刚发生」的错误触发，避免热重载回放历史消息时对陈旧错误误切。
+      // R942：不再在这里切代理节点（节点级切换不改变源站看到的客户端 IP，额度照样被卡）。
+      // 改为在报错卡里**显示本轮出口**——运营者一眼能看出是不是同一个出口在反复失败，
+      // 处置是「结束本轮 → relay 起新 run → 新 run 重新挑出口代理」。
       const mAt = Number((m as any)?.info?.time?.completed ?? (m as any)?.time?.completed ?? (m as any)?.info?.time?.created ?? 0)
-      if (mAt <= 0 || Date.now() - mAt < 300_000) {
-        void maybeSwitchProxyNode({ name: eType, message: eText, sessionID, log })
-      }
-      await protoSend(`${sessionID}:error:${msgKey}`, chatID, protoBlock(ptitle(title, m, m, sessionID), body), true, undefined, undefined, undefined, force)
+      const ep = exitProxySummary()
+      // R942：认出 opencode 的免费额度提示，给运营者一条**可执行**的结论
+      // （额度按出口 IP 计 ⇒ 换出口 = 换额度），而不是一句干巴巴的"生成失败"。
+      const quotaHit = /free usage limit|usage limit reached|connect a provider|switch models|\b429\b|rate[\s_-]?limit|provider\.quota|\bquota\b/i.test(
+        `${eType} ${eText}`,
+      )
+      const epLine = ep.includes("none") ? "" : `（本轮出口：${ep}）`
+      const quotaLine = quotaHit
+        ? "\n↻ 免费额度/限流：本轮结束后由 workflow 起新 run，新 run 重挑出口代理（新出口 IP ⇒ 新额度）"
+        : ""
+      const body2 = `${body}${epLine}${quotaLine}`
+      await protoSend(`${sessionID}:error:${msgKey}`, chatID, protoBlock(ptitle(title, m, m, sessionID), body2), true, undefined, undefined, undefined, force)
     }
   }
 
@@ -6806,6 +6845,36 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       )
       return
     }
+    // 一个 token 只能有一个轮询者：重复登记会让两个实例抢 getUpdates（409），
+    // 后登记的那个永远收不到消息（2026-10-23 bot4 实况）。先查全部已有 env。
+    try {
+      for (const f of readdirSync(BOT_ENV_DIR)) {
+        if (!/^tg(-bot[a-z0-9_-]+)?\.env$/i.test(f)) continue
+        const p = `${BOT_ENV_DIR}/${f}`
+        let tok = ""
+        try {
+          for (const line of readFileSync(p, "utf8").split("\n")) {
+            if (line.startsWith("TG_BOT_TOKEN=")) {
+              tok = line.slice("TG_BOT_TOKEN=".length).trim()
+              break
+            }
+          }
+        } catch {
+          continue
+        }
+        if (tok && tok === tokenForNewBot) {
+          await reply(
+            chatID,
+            `❌ 这个 token 已经被 <code>${htmlEsc(f)}</code> 使用。\n` +
+              "同一个 Bot 只能有一个轮询者：再登记会和它抢消息（409），两边都收不全。\n" +
+              "请在 BotFather 为**另一个**机器人取 token 后再登记。",
+          )
+          return
+        }
+      }
+    } catch {
+      /* 目录读不到：交给下面正常流程 */
+    }
     const targetChat = (args[1] ?? "").trim().replace(/^@/, "") || String(chatID).replace(/^@/, "")
     const label = (args.slice(2).join(" ") || "").trim() || `Bot ${new Date().toISOString().slice(0, 16).replace("T", " ")}`
 
@@ -6945,6 +7014,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /loop on — 本会话加入自动继续（会话级；Bot 级开关见 /loop start|stop）",
     "· /loop off — 本会话退出自动继续（其它会话不受影响）",
     "· /addbot <token> [chatId] [标签] — 登记一个新机器人（登记后需你手动把它拉进会话）",
+    "· /addbots <token1> <token2> … — 一条消息批量登记多个机器人（免改代码；token 各不同）",
     "· /sessions — 列出会话，带 [切换] 按钮（别名 /s；之后直接回序号也可选）",
     "  (⭐前台=GUI当前 · ◎活跃=10分钟内有输出 · 📌钉选)",
     "· /use [序号|名称|前缀|ID] — 钉选会话（如：/use 3；别名 /u；空参看当前）",
@@ -6978,6 +7048,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     "· /background [auto on|off|status] — 转后台（把阻塞中的同步子代理转后台；/background 立刻提升，整体自动配置用 auto）",
     "· /model [模型名|id] — 选择模型（无参=打开选择列表；点按钮或 /model <名称> 切换当前会话模型，下次生成生效）",
     "· /think [档位] — 选择思考深度（模型 variant/reasoningEffort；无参=打开档位列表，档位随模型不同：如 default/low/高/max；只接受清单内的值）",
+    "· /proxy [next|list] — 出口代理（本轮 provider 流量走的代理；/proxy next = 结束本轮换新出口，新一轮重挑代理）",
     "· /botname [名称] — 查看/设置 Bot 显示名（空参只读；自动改名为当前会话）",
     "· /botdesc [小字] — 查看/设置 Bot 小字简介（空参只读；自动改为会话短号）",
     "· /compact — 手动触发压缩（本宿主构建不可用时改用 /migrate）",
@@ -7137,7 +7208,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return [
         head,
         loopStopped() ? "⏹ 自动循环：本 Bot 已停止（点“继续循环”恢复；其它 Bot 不受影响）" : "🔁 自动循环：本 Bot 运行中（ESC 或点“停止循环”仅停本 Bot）",
-        `会话：<b>${htmlEsc(nm)}</b> · ${pausedMode ? "推送暂停" : "推送中"} · 注入队列 ${pinQueue.length} · 外发队列 ${outQueue.length}`,
+        `会话：<b>${htmlEsc(nm)}</b>${t ? ` · 状态 ${htmlEsc(sessionStateLabel(t))}` : ""} · ${pausedMode ? "推送暂停" : "推送中"} · 注入队列 ${pinQueue.length} · 外发队列 ${outQueue.length}`,
         "",
         "只放循环/回合/守卫。后台相关在「后台」页。",
       ].join("\n")
@@ -7166,18 +7237,22 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       ].join("\n")
     }
     if (view === "proxy") {
-      const pCfg = readProxySwitchCfg()
-      const pLast = readLastSwitch()
+      const ep = readExitProxy()
+      const env = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? ""
       return [
         head,
-        `自动切节点：${pCfg.enabled ? "✅ 开" : "❌ 关"}`,
-        `方式：${pCfg.mode === "command" ? "命令" : "Clash 外部控制"} · 分组「${htmlEsc(pCfg.group)}」${pCfg.setRoot ? ` · 顶层「${htmlEsc(pCfg.setRoot)}」` : ""}`,
-        pLast ? `最近切换：${htmlEsc(pLast.from || "?")} → ${htmlEsc(pLast.to)}（${pLast.via === "auto" ? "自动" : "手动"}）` : "最近切换：（无记录）",
+        ep
+          ? `本轮出口：${htmlEsc(ep.scheme)}://${htmlEsc(ep.proxy)}`
+          : "本轮出口：无（直连 runner）",
+        ep?.egress_ip ? `出口 IP：${htmlEsc(ep.egress_ip)}（provider 看到的客户端 IP）` : "出口 IP：?",
+        ep?.direct_ip ? `直连 IP：${htmlEsc(ep.direct_ip)}` : "",
+        `生效中：${isExitProxyActive() ? "是" : "否"}${env ? "" : "（进程无代理变量）"}`,
         "",
-        "只放代理/切节点。出现网络类错误（ECONNRESET / 速率限制）时自动切下一个节点。",
-        "🔐 锁定 = 「手动选择」选中即锁定（粘滞不漂移）；URLTest 组用内置 fixed 锁定。🔓 解锁仅对 fixed 型有意义。",
-        "点按钮切换；候选清单与指定节点见 /proxy list、/proxy &lt;名字&gt;。",
-      ].join("\n")
+        "出口代理**按轮换**：额度耗尽或代理失效 → 本轮结束 → 新一轮重新挑代理（新出口 IP）。",
+        "♻️ 换出口 = 立刻结束本轮并由 workflow relay 起新 run。",
+      ]
+        .filter(Boolean)
+        .join("\n")
     }
     return [
       head,
@@ -7201,7 +7276,6 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       bgAuto: readBg().enabled,
       bgShellAuto: readBg().shellPromo !== false,
       bgPromoteMs: readBg().promoteMs,
-      proxyEnabled: readProxySwitchCfg().enabled,
       // R719：压缩通知开关（用户新增选项）
       cnotice: compactPrefs.notice,
     })
@@ -8376,6 +8450,33 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // 只有 /addbot 漏了空格 → `/addbotx`、`/addbots` 等**前缀相同的误敲命令**会被吞进 addbot 分支
     // （args[0] 成垃圾 token），而不是回「❓ 未知命令」。`cmd === "addbot"` 已覆盖正常拼写，
     // 前缀仅用于"命令带参数"这一情形。
+    // 批量接入：/addbots <token1> <token2> …（空格/换行分隔）。一次消息登记多个 Bot，
+    // 不必改代码、不必为每个 Bot 单独跑命令。单个失败不影响其余；逐个回执。
+    if (text === "/addbots" || text.startsWith("/addbots ") || cmd === "addbots") {
+      const rest = text.slice("/addbots".length).trim()
+      const tokens = rest.split(/\s+/).filter((x) => TG_TOKEN_RE.test(x))
+      if (tokens.length === 0) {
+        await reply(
+          chatID,
+          "用法：/addbots &lt;token1&gt; &lt;token2&gt; …\n（空格或换行分隔；每个 token 必须是不同机器人的）\n⚠️ 消息会在登记前尽量删除，但请仍按泄露处理并择机 revoke。",
+        )
+        return
+      }
+      if (inboundMsgID > 0) {
+        try {
+          await tgFetch("deleteMessage", { chat_id: Number(chatID) || chatID, message_id: inboundMsgID })
+        } catch {
+          /* best-effort */
+        }
+      }
+      let n = 0
+      for (const tok of tokens) {
+        n += 1
+        await handleAddBot([tok, String(chatID), `批量 ${n}`], chatID)
+      }
+      await reply(chatID, `📦 批量登记结束：提交 ${tokens.length} 个 token（逐个结果见上）。`)
+      return
+    }
     if (text === "/addbot" || text.startsWith("/addbot ") || cmd === "addbot") {
       const rest = text.slice("/addbot".length).trim()
       const args = rest ? rest.split(/\s+/) : []
@@ -8630,130 +8731,48 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(chatID, lines.join("\n"))
       return
     }
-    // ── R2498：/proxy —— 网络错误自动切节点的 TG 面板（可选功能，默认关）──────────
-    // 查看状态 / 切下一节点 / 切指定节点 / 列候选 / 开-关自动切。
-    // 手动切换不经冷却与频率闸（那是给"自动"用的）；自动切换只由 auto-continue 触发。
+    // ── R942：/proxy —— 出口代理面板（每轮 CI 一个正向代理）──────────────────
+    // 状态（当前出口/出口 IP/直连 IP/是否生效）/ 详情 / 换出口（= 结束本轮）。
+    // 旧的「切 mihomo 节点」面板已下线：节点级与 DNS 级切换都不改变源站看到的客户端 IP，
+    // 免费额度照样被卡；而 Bun 启动时解析一次代理、运行期换不了隧道 ⇒ 出口只能按轮换。
     if (text === "/proxy" || text.startsWith("/proxy ") || cmd === "proxy") {
       const arg = commandArg(text)
       const lower = arg.toLowerCase()
-      const cfg = readProxySwitchCfg()
-      const resultText = (res: string): string => {
-        if (res.startsWith("switched:")) {
-          // R719b：rest 里除节点名外还可能有多个分号旗标（root-failed / skipped=n /
-          // verify-failed / lock-ok / lock-missing …）。旧解析只取到第 2 段 →
-          // 会把 "lock-ok" 当告警显示。这里逐段分类：lock-ok 是正面信息，其余旗标进告警。
-          const parts2 = res.slice("switched:".length).split(";")
-          const node = parts2[0] ?? ""
-          const flags = parts2.slice(1).filter(Boolean)
-          const lockOk = flags.includes("lock-ok")
-          // R722：;now-ok@Ns = 已确认实际生效（正面旗标）；;now-pending:… / ;now-abort:… 不冒充成功。
-          const nowOk = flags.some((f) => f.startsWith("now-ok"))
-          const warn = flags.filter((f) => f !== "lock-ok" && !f.startsWith("now-ok"))
-          return `[tg-bridge] ✅ 已切换节点：${node}${lockOk ? " · 🔐 已锁定" : ""}${nowOk ? " · 已确认生效" : ""}${warn.length ? `（⚠️ ${warn.join(" · ")}）` : ""}`
-        }
-        if (res.startsWith("already:")) return `[tg-bridge] ℹ️ 已经是该节点：${res.slice("already:".length)}`
-        if (res.startsWith("not-found:")) return `[tg-bridge] ❌ 未找到节点：${res.slice("not-found:".length)}（/proxy list 查看候选）`
-        if (res.startsWith("ambiguous(")) return `[tg-bridge] ❌ 节点名匹配到多个：${res}`
-        if (res === "unsupported-in-command-mode") return "[tg-bridge] ⚠️ 当前为命令模式（mode=command），无节点清单：只能 /proxy next（循环执行 command）或 /proxy on|off"
-        // R719b 锁定/解锁结果
-        if (res.startsWith("locked:")) return `[tg-bridge] 🔐 已锁定当前节点：${res.slice("locked:".length)}（Clash 内置锁定：健康检查不再改选、不漂移；/proxy unlock 解锁）`
-        if (res === "unlocked") return "[tg-bridge] 🔓 已解锁：回到「延迟选优」自动模式（节点可能随自动选优变化）"
-        if (res.startsWith("lock-verify-failed:")) return `[tg-bridge] ⚠️ 锁定读回校验失败：目标 ${res.slice("lock-verify-failed:".length)}（PUT 成功但 fixed 未落下，请在 Clash 面板确认）`
-        if (res === "unlock-verify-failed") return "[tg-bridge] ⚠️ 解锁读回校验失败：fixed 仍非空，请重试或到 Clash 面板手动解锁"
-        // R832：Selector 型组（手动选择）—— 选中即锁定；无 fixed 字段。
-        if (res.startsWith("locked-selector:")) return `[tg-bridge] 🔐 已锁定/保持：${res.slice("locked-selector:".length)}（手动选择组：选中即锁定，无独立 fixed 字段）`
-        if (res.startsWith("unlock-na-selector:")) return `[tg-bridge] ℹ️ 当前分组为「手动选择」：选中即保持，无"解锁回自动"概念（未做改动；当前：${res.slice("unlock-na-selector:".length)}）`
-        if (res === "lock-unsupported") return "[tg-bridge] ⚠️ 该分组无独立锁定字段（旧内核/非 Selector 组）：不支持锁定"
-        if (res === "no-current") return "[tg-bridge] ⚠️ 当前没有可锁定的节点（分组尚未选择任何节点）"
-        return `[tg-bridge] ⚠️ 切换未完成：${res}`
-      }
       if (!arg || lower === "status") {
-        const st = await readProxyStatus()
-        const lines: string[] = [`[tg-bridge] 🌐 代理切节点 · bot=${sanitizeLog(BOT_LABEL)}`]
-        lines.push(`自动切节点：${cfg.enabled ? "✅ 开" : "❌ 关（/proxy on 开启）"}`)
-        lines.push(
-          `方式：${cfg.mode === "command" ? "命令" : "Clash 外部控制"} · 分组「${cfg.group}」${cfg.setRoot ? ` · 顶层「${cfg.setRoot}」` : ""}`,
-        )
-        if (cfg.mode !== "clash") {
-          lines.push("当前为命令模式（mode=command）：无节点清单，/proxy next 循环执行 command。")
-        } else if (st.ok) {
-          lines.push(`当前节点：${st.now || "(未知)"}`)
-          // R719b：mihomo 内置锁定状态（PUT=锁定、DELETE=解锁；用户点名的 🔐 功能）
-          lines.push(
-            `锁定：${
-              st.locked === undefined
-                ? st.groupType === "Selector"
-                  ? "—（手动选择型分组：选中即锁定，无独立字段）"
-                  : "（本内核不暴露 fixed 字段，不支持查询）"
-                : st.locked
-                  ? `🔐 已锁定到 ${st.fixed}`
-                  : "🔓 未锁定（延迟选优自动模式）"
-            }`,
-          )
-          lines.push(`候选节点：${(st.cands ?? []).length} 个${cfg.nodes.length ? `（配置固定 ${cfg.nodes.length} 个）` : "（分组全部非直连）"}`)
+        const st = readExitProxy()
+        const lines: string[] = [`[tg-bridge] 🌐 出口代理 · bot=${sanitizeLog(BOT_LABEL)}`]
+        if (st) {
+          lines.push(`本轮出口：${st.scheme}://${st.proxy}`)
+          lines.push(`出口 IP：${st.egress_ip || "?"}（provider 看到的客户端 IP）`)
+          lines.push(`直连 IP：${st.direct_ip || "?"}（额度被耗尽的那一个）`)
+          if (st.latency_s) lines.push(`探测时延：${st.latency_s}s`)
+          if (st.picked_at) lines.push(`挑选时间：${st.picked_at}`)
+          lines.push(`生效中：${isExitProxyActive() ? "是" : "否（状态与进程环境不一致）"}`)
         } else {
-          lines.push(`⚠️ 读取分组失败：${st.reason ?? "未知"}`)
-        }
-        if (st.last) {
-          const ago = Math.max(0, Math.round((Date.now() - st.last.at) / 60000))
-          lines.push(
-            `最近切换：${st.last.from || "?"} → ${st.last.to}（${st.last.via === "auto" ? "自动" : "手动"}，${ago} 分钟前${st.last.reason ? `，因 ${st.last.reason}` : ""}）`,
-          )
-        } else {
-          lines.push("最近切换：（无记录）")
+          lines.push("本轮出口：无（provider 流量走 runner 直连 IP）")
         }
         lines.push("")
-        lines.push("命令：/proxy next 切下一节点 · /proxy list 列候选 · /proxy <节点名或片段> 切指定 · /proxy lock|unlock 锁定/解锁当前节点 · /proxy on|off 开/关自动切")
+        lines.push("出口按轮换：额度耗尽/代理失效 → 本轮结束 → workflow relay 起新 run → 新 run 重挑出口（新 IP ⇒ 新额度）。")
+        lines.push("命令：/proxy next 换出口（重启本轮） · /proxy list 出口详情")
         await reply(chatID, lines.join("\n"))
-        return
-      }
-      if (lower === "on" || lower === "off") {
-        const on = lower === "on"
-        const ok = setProxyEnabled(on)
-        await reply(
-          chatID,
-          ok
-            ? `[tg-bridge] 🌐 自动切节点已${on ? "开启" : "关闭"}（写入 proxy-switch.json，立即生效）`
-            : "[tg-bridge] ✗ 写入 proxy-switch.json 失败，请检查文件权限",
-        )
         return
       }
       if (lower === "list") {
-        if (cfg.mode !== "clash") {
-          await reply(chatID, "[tg-bridge] ⚠️ 当前为命令模式（mode=command），无节点清单；/proxy next 循环执行 command")
-          return
-        }
-        const st = await readProxyStatus()
-        if (!st.ok) {
-          await reply(chatID, `[tg-bridge] ⚠️ 读取节点失败：${st.reason ?? "未知"}`)
-          return
-        }
-        const cands = st.cands ?? []
-        const MAX = 60
-        const lines: string[] = [`[tg-bridge] 🌐 候选节点 ${cands.length} 个（当前：${st.now || "?"}）`]
-        for (let i = 0; i < Math.min(cands.length, MAX); i++) {
-          const n = cands[i]!
-          lines.push(`${i + 1}. ${n}${n === st.now ? " ←当前" : ""}`)
-        }
-        if (cands.length > MAX) lines.push(`…（省略 ${cands.length - MAX} 个；用 /proxy <片段> 直接切）`)
-        await reply(chatID, lines.join("\n"))
+        await reply(chatID, `[tg-bridge] 🌐 出口详情\n${exitProxyPanel().join("\n")}`)
         return
       }
-      if (lower === "next") {
-        await reply(chatID, resultText(await switchProxyNode(cfg, "manual")))
+      if (lower === "next" || lower === "rotate" || lower === "switch") {
+        await reply(
+          chatID,
+          `[tg-bridge] ♻️ 正在结束本轮以更换出口：\n${exitProxySummary()}\n新一轮会重新挑选出口代理（新的出口 IP ⇒ 不再撞同一个额度）。`,
+        )
+        endRunForNewExit()
         return
       }
-      // R719b：内置锁定/解锁（用户指令「切换节点应该使用锁定🔐（clash内置功能）」）
-      if (lower === "lock" || lower === "lock on") {
-        await reply(chatID, resultText(await setNodeLock(cfg, true)))
-        return
-      }
-      if (lower === "unlock" || lower === "lock off") {
-        await reply(chatID, resultText(await setNodeLock(cfg, false)))
-        return
-      }
-      // 其余参数一律当作「切到指定节点」（精确名 → 唯一片段）。
-      await reply(chatID, resultText(await switchToNode(cfg, arg, "manual")))
+      await reply(
+        chatID,
+        "[tg-bridge] ℹ️ 用法：/proxy（状态） · /proxy list（详情） · /proxy next（换出口 = 重启本轮）",
+      )
       return
     }
     // ── R2498：/config —— 在 TG 里查看配置清单（本 Bot / 循环 / 切节点 / Bot 注册表）──
@@ -8761,8 +8780,6 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const t = fixedTarget ?? frontSessionID ?? persistedFront
       const guard = readGuard()
       const bg = readBg()
-      const proxyCfg = readProxySwitchCfg()
-      const proxySt = await readProxyStatus()
       // 全局闸 + 各 Bot 闸（读共享 loop-ctl.json）
       const ctl = ((): any => {
         for (const p of [`REDACTED_ROOT/.config/opencode/loop-ctl.json`, "/tmp/opencode/loop-ctl.json"]) {
@@ -8806,21 +8823,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       lines.push(`· 守卫：问题=${guard.problem !== false ? "开" : "关"} · 联网搜索=${guard.websearch !== false ? "开" : "关"}`)
       lines.push(`· 后台：自动转后台=${bg.enabled ? "开" : "关"} · shell 自动后台=${bg.shellPromo !== false ? "开" : "关"} · 阈值=${Math.round(bg.promoteMs / 1000)}s`)
       lines.push("")
-      lines.push("【切节点】")
-      lines.push(`· 自动切：${proxyCfg.enabled ? "开" : "关"} · 方式：${proxyCfg.mode === "command" ? "命令" : "Clash"} · 分组：「${proxyCfg.group}」`)
-      if (proxyCfg.mode !== "clash") {
-        lines.push("· 命令模式：无节点清单")
-      } else if (proxySt.ok) {
-        lines.push(`· 候选：${(proxySt.cands ?? []).length} 个 · 当前：${proxySt.now || "?"}`)
-        // R719b：锁定状态（🔐=已锁定到 fixed 节点；🔓=自动）
-        lines.push(`· 锁定：${proxySt.locked === undefined ? "（内核不支持查询）" : proxySt.locked ? `🔐 ${proxySt.fixed}` : "🔓 未锁定（自动）"}`)
+      lines.push("【出口代理】")
+      const ep = readExitProxy()
+      if (ep) {
+        lines.push(`· 本轮出口：${ep.scheme}://${ep.proxy} · 生效中=${isExitProxyActive() ? "是" : "否"}`)
+        lines.push(`· 出口 IP：${ep.egress_ip || "?"} · 直连 IP：${ep.direct_ip || "?"}`)
+        if (ep.latency_s) lines.push(`· 时延：${ep.latency_s}s · 挑选：${ep.picked_at || "?"}`)
       } else {
-        lines.push(`· ⚠️ 读取失败：${proxySt.reason ?? "未知"}`)
+        lines.push("· 本轮出口：无（直连）")
       }
-      if (proxySt.last) {
-        const ago = Math.max(0, Math.round((Date.now() - proxySt.last.at) / 60000))
-        lines.push(`· 最近：${proxySt.last.from || "?"} → ${proxySt.last.to}（${ago} 分钟前）`)
-      }
+      lines.push(`· 状态文件：${EXIT_PROXY_STATE_PATH}`)
       lines.push("")
       lines.push("【Bot 注册表】")
       lines.push(...botRows)
@@ -9572,7 +9584,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await log("info", `healcards: checked=${checked} fixed=${fixed}`)
       return
     }
-    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "cnotice", "addbot", "botname", "botdesc", "autoguard", "background", "model", "proxy", "config"])
+    const KNOWN_CMDS = new Set(["menu", "watch", "unwatch", "help", "start", "sessions", "use", "clear", "tgping", "ping", "replay", "reload", "compaction", "digest", "queue", "version", "info", "quiet", "loud", "stop", "compact", "new", "migrate", "sendto", "raw", "drops", "undo", "retry", "recents", "alias", "loop", "pause", "resume", "flush", "drop", "dropq", "inject", "owner", "offset", "logs", "errors", "whoami", "stripall", "selfmute", "healcards", "cnotice", "addbot", "addbots", "botname", "botdesc", "autoguard", "background", "model", "proxy", "config"])
     if (text.startsWith("/")) {
       if (!KNOWN_CMDS.has(cmd)) {
         await reply(chatID, `❓ 未知命令 /${clean(cmd || text.slice(1).split(/\s/)[0], 30)}（发送 /help 查看列表）`)
@@ -11210,105 +11222,49 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     await log("warn", `inject-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
   }
 
-  // ── R2498：自动切节点成功后 → 推送 TG 通知（best-effort，绝不阻塞切换主链路）──────
-  // 三个 Bot 实例都注册；只有「错误所在会话归属于本 Bot」的实例才发消息（ownsLoopSession
-  // 过滤），因此一次全局切换只会产生一条通知。sessionID 为空（罕见）时由 primary 兜底。
-  try {
-    registerProxyNotifier(BOT_ID, async (e) => {
-      if (e.sessionID) {
-        if (!ownsLoopSession(e.sessionID)) return
-      } else if (BOT_ID !== "primary") {
-        return
-      }
+  // R? (2026-10-23): 置顶循环卡以前只在「注入」时刷新，轮次间隔 5–10 分钟时
+  // 会话状态/队列数字会整轮停在旧值（运营者：状态卡要有会话状态并且记得更新）。
+  // 60s 拍：复用 poll 已维护的 cachedSessionList / lastActivity，仅在文案变化时
+  // edit（避免无意义编辑触发 TG 限流）；换代后自动停。
+  let lastLiveCardText = ""
+  let cardLiveBusy = false
+  setInterval(() => {
+    void (async () => {
+      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+      if (cardLiveBusy) return
       const chat = pushChatResolve()
       if (!chat) return
-      // R720：双管齐下 —— 锁定质量监控触发的切换（reason=lock-quality）用不同文案
-      const quality = e.reason === "lock-quality"
-      // R722：按「锁定是否已确认生效」如实描述（detail 来自切换结果：;lock-ok;now-ok@Ns /
-      // ;now-pending:… / ;now-abort:…）——用户实报「锁定之后其实并没有实际切换」，卡片不能再
-      // 在未确认时声称已切换。
-      const detail = e.detail ?? ""
-      const nowOk = detail.includes("now-ok")
-      const nowPending = detail.includes("now-pending") || detail.includes("now-abort")
-      const lockLine = nowOk
-        ? "🔐 已锁定并确认生效（流量已走新节点）；/proxy unlock 可解锁回自动"
-        : nowPending
-          ? "🔐 已锁定新节点（mihomo 需跑完一轮健康检查才会切过去，最长约 10 分钟自动生效）；/proxy unlock 可解锁"
-          : "🔐 已用 Clash 内置锁定钉住新节点（不再自动改选）；/proxy unlock 可解锁回自动"
-      const lines = [
-        quality ? "🔀 <b>代理已自动切节点</b>（锁定节点质量下降）" : "🔀 <b>代理已自动切节点</b>（网络类错误触发）",
-        `${htmlEsc(e.from || "?")} → <b>${htmlEsc(e.to)}</b>`,
-        lockLine,
-        quality
-          ? "触发：原锁定节点失活/延迟超阈（400ms），或锁定长时间未生效"
-          : e.reason
-            ? `触发错误：<code>${htmlEsc(e.reason)}</code>`
-            : "",
-        e.sessionID ? `会话：${sessionTag(e.sessionID)}` : "",
-      ].filter(Boolean)
-      await sendTextRaw(chat, lines.join("\n"), undefined, false)
-      await log("info", `proxy auto-switch notified (bot=${BOT_ID}, ${sanitizeLog(e.from)} -> ${sanitizeLog(e.to)})`)
-    })
-  } catch (err) {
-    await log("warn", `proxy-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
-  }
-
-  // ── R720（用户指令「…似乎不会自动切换到锁定的，应该双管齐下」）：锁定质量监控 ──────
-  // 双管齐下 = 内置锁定（🔐 钉住当前节点）＋ 自动切换（节点掉质量仍会换到更优节点并重锁）。
-  // 仅 primary 实例跑（三实例重复探测无意义；切换本身另有跨实例落盘冷却闸）；
-  // 首次 90s 后、此后每 180s 一次。常态（health/未锁定/冷却）静默，只有真切换或异常才记一行。
-  if (BOT_ID === "primary") {
-    const lockWatchTick = async () => {
+      const st = readInjectCardState(BOT_ID)
+      if (!st.msgID) return
+      const sid = fixedTarget ?? frontSessionID ?? persistedFront
+      if (!sid) return
+      cardLiveBusy = true
       try {
-        const res = await watchLockedQuality()
-        // R807：补推（无效警示）与外部锁状态也留痕（此前只记 quality->/error → 静默补推不可见）。
-        if (
-          res.startsWith("quality->") ||
-          res.startsWith("error") ||
-          res.startsWith("group-failed") ||
-          res.startsWith("ineffective-nudge") ||
-          res.startsWith("ext-nudge") ||
-          res.startsWith("ext-ineffective")
-        ) {
-          await log("info", `proxy-lock-watch: ${res}`)
-        }
+        const text = injectCardText({
+          bot: BOT_LABEL,
+          lastAt: st.lastAt || Date.now(),
+          kind: st.lastKind,
+          sid: st.lastSid || sid,
+          count: st.count,
+          avgGapMs: st.avgGapMs,
+          gate: loopGateInfo(),
+          now: Date.now(),
+          session: sessionTag(sid),
+          sessionState: sessionStateLabel(sid),
+          queue: outQueue.length,
+          pinQueue: pinQueue.length,
+          paused: pausedMode,
+        })
+        if (text === lastLiveCardText) return
+        const r = await editTextRaw(chat, st.msgID, text, injectCardKeyboard(), false)
+        if (r.r === "sent") lastLiveCardText = text
       } catch {
-        /* 永不抛 */
+        /* 卡片刷新是附赠，失败下一拍再来 */
+      } finally {
+        cardLiveBusy = false
       }
-    }
-    // R721：热重载护栏 —— 旧实例闭包不会自动消亡（全靠 GEN_KEY 换代检查自灭）。
-    // 无护栏时每次重载残留一个 180s 空转 ticker（今天多轮重载 → 重复探测/切换风险）。
-    // 与 leaseWatch 同套路：发现自己已被取代就清掉自己的两个句柄。
-    let lwBoot: ReturnType<typeof setTimeout> | null = null
-    let lwTimer: ReturnType<typeof setInterval> | null = null
-    const lwGuard = (): boolean => {
-      if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) {
-        if (lwBoot) {
-          try {
-            clearTimeout(lwBoot)
-          } catch {
-            /* ignore */
-          }
-        }
-        if (lwTimer) {
-          try {
-            clearInterval(lwTimer)
-          } catch {
-            /* ignore */
-          }
-        }
-        return false
-      }
-      return true
-    }
-    lwBoot = setTimeout(() => {
-      if (lwGuard()) void lockWatchTick()
-    }, 90_000)
-    lwTimer = setInterval(() => {
-      if (lwGuard()) void lockWatchTick()
-    }, 180_000)
-    await log("info", "proxy-lock-watch: enabled (locked-node quality guard, every 180s; R807 materialize-window)")
-  }
+    })()
+  }, 60_000)
 
   // ── R277（运营者 R276 指令）：快照交接优化 save 侧 ──────────────────────────────
   // primary 实例周期性（默认 300s，1-10 分钟可调）把 $HOME 载荷同步到会话仓库孤儿
@@ -11318,7 +11274,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
   // ≤5 分钟；release 资产保持兜底）。仅 primary 触发（三实例重复同步无意义）；
   // detached 子进程 + 脚本自持锁 ⇒ 热重载/重叠触发安全，不占事件循环。
   if (BOT_ID === "primary") {
-    const envSyncScript = process.env.ENV_SYNC_SCRIPT ?? `REDACTED_ROOT/work/sessions/opencode/config/scripts/env-sync.sh`
+    const envSyncScript = process.env.ENV_SYNC_SCRIPT ?? `REDACTED_ROOT/.config/opencode/scripts/env-sync.sh`
     const envSyncEveryMs = Math.min(3_600_000, Math.max(60_000, Number(process.env.ENV_SYNC_INTERVAL_MS ?? 300_000) || 300_000))
     const runEnvSyncTick = (why: string) => {
       try {

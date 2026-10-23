@@ -2,14 +2,14 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync, readdirSync } from "node:fs"
 import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn, lastRealUserExcerpt } from "./_v2compat"
-// R2496：可选功能——网络类 provider 错误（ECONNRESET / 速率限制等）时，自动切换代理节点。
-import { maybeSwitchProxyNode } from "./proxy-switch"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
 import { classifyAbort, noteAbortEvent } from "./abort-classify"
 // R227：自动循环注入提示 —— 每次注入文本尾部统一附带，单一常量防三处漂移。
 import { AUTO_INJECT_HINT } from "./turn-end-note"
+// R942：出口代理状态（只读）——本轮 provider 流量走哪个出口，坏了要靠换轮解决。
+import { exitProxySummary } from "./exit-proxy"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
@@ -81,10 +81,17 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // eval 看到的仍是同一条（含 [STATUS: STOP]）→ 立刻又停 → 用户永远恢复不了（永动机）。
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
-const VERSION = "r2239-success-compact-cooldown"
-// 用户指令（2026-10-18）：连续出现 N 次错误提示后「结束本轮 CI」——即结束本次 run，
-// 让 iterate.yml 的 relay 步自动重启一个新的 run（= 重启 CI）。默认 N=5，可用
-// env AC_ERR_STREAK_LIMIT 覆盖。计数按 distinct msg.id，成功注入一轮后清零。
+const VERSION = "r942-exit-proxy-per-round"
+// 错误策略（现行）：「全部会话连续 2 次错误 → 结束本轮」。
+// 语义：
+//   · 连续 = 中间没有一次成功的正常回合（非错误 assistant 消息 / 成功注入 round）。
+//   · 第 1 次连续错误 → recover（照常恢复/续跑）；第 2 次 → END-ROUND-CI（exit 0），
+//     由 workflow relay 起新 run：新 run 会重新挑一个**出口代理**（新出口 IP ⇒ 新额度）。
+//   · R942 变更：旧实现在本轮内「切 IP」（force-resolve 改 /etc/hosts + mihomo 切节点）
+//     再切最多 5 次。实测那类 DNS/节点级切换**不改变源站看到的客户端 IP**，额度照样被卡；
+//     而 Bun 在进程启动时解析一次代理、运行期改 env 也不换隧道 ⇒ 本轮内本来就没有
+//     可切换的出口。现在改为「按轮换」：坏出口的唯一出路是换一轮。
+// 计数按 distinct msg.id，避免同一错误被每拍重复计数。
 // R204（D4）：**陈旧认领逃生**阈值（ms）。末条错误消息比这还老、空闲复核已过、且 recover
 // 注入被判去重命中时，判定 claim 为陈旧（宿主从未产出回合），释放后改注入 ROUND_PROMPT。
 // 实测场景：bot4 的 front 目标末条是 12h 前的 abort，每拍 `recover-inject duplicate
@@ -93,12 +100,46 @@ const STALE_CLAIM_MS = (() => {
   const v = Number(process.env.AC_STALE_CLAIM_MS ?? "1800000")
   return Number.isFinite(v) && v >= 0 ? v : 1800000
 })()
-const ERR_STREAK_LIMIT = (() => {
-  const v = Number(process.env.AC_ERR_STREAK_LIMIT ?? "5")
-  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 5
+const ERR_CONSECUTIVE_LIMIT = (() => {
+  const v = Number(process.env.AC_ERR_CONSECUTIVE_LIMIT ?? "2")
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 2
 })()
+export type ErrorPolicyAction = "recover" | "end"
+// 纯函数（可单测）：全局连续错误计数。同 key 去重；reset=true 表示一次正常回合。
+export const nextErrorStreak = (
+  state: { streak: number; seen: readonly string[] },
+  key: string,
+  reset = false,
+): { streak: number; seen: string[]; added: boolean } => {
+  if (reset) return { streak: 0, seen: [], added: false }
+  if (state.seen.includes(key)) return { streak: state.streak, seen: [...state.seen], added: false }
+  const seen = [...state.seen, key].slice(-128)
+  return { streak: state.streak + 1, seen, added: true }
+}
+// 纯函数（可单测）：给定连续错误数，决定下一步。
+// R942：出口代理**按轮换**（每轮 CI 一个代理，见 exit-proxy.ts），本轮内没有可切换的
+// 出口 ⇒ 连续错误的唯一正确处置是**结束本轮**，让 workflow relay 起新 run（新出口 IP、
+// 新额度），而不是在坏代理上继续消耗。
+export const errorPolicyAction = (args: {
+  streak: number
+  limit?: number
+}): ErrorPolicyAction => {
+  const lim = Math.max(1, Math.floor(Number(args.limit ?? ERR_CONSECUTIVE_LIMIT) || ERR_CONSECUTIVE_LIMIT))
+  return args.streak < lim ? "recover" : "end"
+}
+// 纯函数（可单测）：429/限流识别。error.name 可能是 provider.quota，message 里也可能带 429。
+export const isRateLimitError = (name: string, message: string, status = 0): boolean => {
+  if (Number(status) === 429) return true
+  // R942：把 opencode 自己的免费额度提示也认出来（实测原文）：
+  //   "Free usage limit reached. Connect a provider or subscribe to OpenCode Go
+  //    to keep going, or switch models."
+  // 旧正则只认 429 / rate limit / quota，认不出这句话 → 额度耗尽被当成普通错误。
+  return /\b429\b|rate[\s_-]?limit|too many requests|provider\.quota|\bquota\b|free usage limit|usage limit|connect a provider|switch models/i.test(
+    `${name} ${message}`,
+  )
+}
 // R210（运营者 2026-10-18 指令：连续错误提示 → 结束本轮 CI + 自动重启）：**墙钟停滞**判据。
-// 实证缺口：abort 类错误不计入 errStreak，且同一条错误消息按 distinct msg.id 去重后永远只算 1 次
+// 实证缺口：abort 类错误不计入全局错误窗口，且同一条错误消息按 distinct msg.id 去重后永远只算 1 次
 // ⇒ bot4 16:18–16:53 每分钟评估同一 abort、循环停滞，却从不触发 END-ROUND-CI，只能人工取消。
 // 语义：会话尾条消息**持续是错误**（≥ 阈值无更新消息 = 宿主无推进）→ 与 5 连错同一出口（exit 0 → relay 重启）。
 // 非错误评估 / 成功注入 round / PAUSE / SKIP 时清零。
@@ -738,6 +779,11 @@ const errorText = (m: AssistantMessage): string => {
   if (typeof e === "string") return e
   return String(e.message ?? e.data?.message ?? "")
 }
+const errorStatus = (m: AssistantMessage): number => {
+  const e = m?.error as any
+  if (!e || typeof e !== "object") return 0
+  return Number(e.statusCode ?? e.status ?? e.data?.statusCode ?? e.data?.status ?? 0) || 0
+}
 
 const isAbortSignal = (e: any): boolean => {
   if (!e) return false
@@ -901,9 +947,21 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // 被注入闸拦下的时刻（诊断用：连续拦多久 = 宿主侧回合卡了多久）
   const heldInject = new Map<string, number>()
   const fatalStreak = new Map<string, number>()
-  // 连续可恢复错误计数（按 distinct msg.id）；达 ERR_STREAK_LIMIT 则结束本轮 CI（exit 0 → relay 重启）。
-  const errStreak = new Map<string, number>()
-  const errStreakSeen = new Map<string, string>()
+  // R941：全局连续错误计数（跨全部会话）。成功回合 reset；同一 msg.id 只计一次。
+  let errStreak = 0
+  let errSeen: string[] = []
+  const noteErrorStreak = (sessionID: string, msgID: string): { streak: number; added: boolean } => {
+    const next = nextErrorStreak({ streak: errStreak, seen: errSeen }, `${sessionID}:${msgID}`)
+    errStreak = next.streak
+    errSeen = next.seen
+    return { streak: next.streak, added: next.added }
+  }
+  const noteHealthyRound = (): void => {
+    if (errStreak !== 0 || errSeen.length !== 0) {
+      errStreak = 0
+      errSeen = []
+    }
+  }
   // R210：错误停滞墙钟表（见 AC_ERR_STALL_MS 注释）。返回 true = 持续错误已超过阈值。
   const errStallSince = new Map<string, number>()
   const stallExceeded = (sid: string): boolean => {
@@ -1524,10 +1582,9 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       // R2228 循环注入提醒：注入成功后 fire（由拥有该会话的 Bot 侧发送；
       // fire-and-forget，通知失败/挂起绝不影响循环主链路）。
       fireInjectNotices(sessionID, kind)
-      // 成功注入一轮 = 会话已恢复推进 → 清空连续错误计数（用户指令 2026-10-18）。
+      // 成功注入一轮 = 会话已恢复推进 → 清空该会话的停滞计时；
+      // R923 的全局 5min 错误窗口故意不清空，旧错误按时间自然过期。
       if (kind === "round") {
-        errStreak.delete(sessionID)
-        errStreakSeen.delete(sessionID)
         errStallSince.delete(sessionID)
       }
       return "ok"
@@ -2002,6 +2059,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
 
       if (!msg.error) {
         errStallSince.delete(sessionID)
+        // R941：正常 assistant 消息 = 一次成功回合，打断「连续错误」链。
+        noteHealthyRound()
       } else if (stallExceeded(sessionID)) {
         // R210（运营者指令）：错误停滞 ≥ 阈值（5 连错的墙钟等价物）→ 结束本轮 CI。
         await log(
@@ -2015,9 +2074,40 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       }
       if (msg.error) {
         settle(msg)
-        // R2496：可选功能——网络类 provider 错误（ECONNRESET/速率限制等）时自动切换代理节点。
-        // 默认关闭（proxy-switch.json enabled:false）；fire-and-forget，绝不阻塞本判定路径。
-        void maybeSwitchProxyNode({ name: errorName(msg), message: errorText(msg), sessionID, log })
+        // R942：出口代理**按轮换**（见 exit-proxy.ts）——本轮内没有可切换的出口，
+        // Bun 启动时解析一次代理，运行期改 env 也不换隧道（实测）。
+        // 429/配额类错误的正解是**换一轮**（新代理 ⇒ 新出口 IP ⇒ 新额度），
+        // 这里只做记录，处置交给下面的"连续错误 → END-ROUND-CI"。
+        if (isRateLimitError(errorName(msg), errorText(msg), errorStatus(msg))) {
+          await log(
+            "info",
+            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, ${exitProxySummary()}) -> the round ends on the next consecutive error`,
+          )
+        }
+        // R942：全部会话连续 2 次错误 → END-ROUND-CI（exit 0）→ workflow relay 起新 run
+        // → 新 run 重新挑出口代理（新出口 IP ⇒ 不再撞同一个额度）。
+        // ESC/abort 是用户主动中断，不进入错误预算。
+        if (!isAbortSignal(msg.error)) {
+          const err = noteErrorStreak(sessionID, msg.id)
+          if (err.added) {
+            const action = errorPolicyAction({ streak: err.streak })
+            await log(
+              "info",
+              `auto-continue: error streak ${err.streak}/${ERR_CONSECUTIVE_LIMIT} across all sessions ` +
+                `(session=${sanitizeLog(sessionID)}, action=${action}, ${exitProxySummary()})`,
+            )
+            if (action === "end") {
+              await log(
+                "info",
+                `auto-continue: error streak ${err.streak} -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run with a fresh exit proxy; ${exitProxySummary()})`,
+              )
+              if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+                endRunNow()
+              }
+              return
+            }
+          }
+        }
         if (isFatal(msg)) {
           const n = errorName(msg)
           // R1548：ESC/宿主中断不再只认精确名 "MessageAbortedError"（host 实测写
@@ -2061,6 +2151,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           } else {
             const streak = (fatalStreak.get(sessionID) ?? 0) + 1
             fatalStreak.set(sessionID, streak)
+            // R942：全局「2 连错 → 结束本轮」已在上层统一处置；这里的单会话 fatal ×3
+            // 兜底保留（全局判定被 abort/去重短路时仍能收手）。
             if (streak >= 3) {
               await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} len=${len} error=${n} -> STOP(fatal x${streak}, giving up)`)
               return
@@ -2103,27 +2195,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         }
         fatalStreak.delete(sessionID)
         await log("info", `auto-continue: eval session=${sessionID} msg=${msg.id} len=${len} error=${errorName(msg)} -> RECOVER`)
-        // 用户指令（2026-10-18）：连续可恢复错误（按 distinct msg.id 计）达阈值 →
-        // 「结束本轮 CI」= 结束本次 run；iterate.yml 的 relay 步随即自动重启新 run（重启 CI）。
-        // 依据：relay 触发条件为 run_opencode.outcome==success（或 cancelled()），故以 exit(0)
-        // 干净退出即会接力重启；非 0 退出则「this run will not relay」（不重启）。
-        {
-          if (errStreakSeen.get(sessionID) !== msg.id) {
-            errStreakSeen.set(sessionID, msg.id)
-            const es = (errStreak.get(sessionID) ?? 0) + 1
-            errStreak.set(sessionID, es)
-            if (es >= ERR_STREAK_LIMIT) {
-              await log(
-                "info",
-                `auto-continue: consecutive recoverable errors x${es} (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run)`,
-              )
-              if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-                endRunNow()
-              }
-              return
-            }
-          }
-        }
+        // R941：错误预算/切 IP/结束本轮已在上方统一处理（fatal 与 recoverable 共用）。
         // R2233：同上——宿主已自行重试（尾部有更新的 in-flight 步）时不往活着的回合插恢复提示。
         if (!(await injectAllowed(sessionID, msg, "recover"))) {
           decided.delete(msg.id)

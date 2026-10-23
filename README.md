@@ -7,7 +7,7 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | 文件 | 说明 |
 |---|---|
 | `src/tg-bridge.ts` | 桥主逻辑：长轮询、注入、发送、看门狗、队列卡、proto 镜像 |
-| `src/auto-continue.ts` | 自动循环：evaluate/注入闸/租约/熔断 |
+| `src/auto-continue.ts` | 自动循环：evaluate/注入闸/租约/熔断；`exit-proxy` 全局 2 连错策略 |
 | `src/tg-bridge-v2.ts` | 插件装载入口（bot 配置与 env 读取） |
 | `src/auto-continue-v2.ts` | 自动循环装载入口（V1 插件经 _v2compat 包成 V2） |
 | `src/_v2compat.ts` | 兼容层 |
@@ -16,7 +16,7 @@ TG↔Opencode 桥接插件源码（脱敏发布版），版本受控。
 | `src/compact-notice.ts` | 「上下文已压缩」通知的文案判据（纯函数） |
 | `src/think-depth.ts` | 「思考深度」选择（宿主 variant / reasoningEffort 的纯函数判据 + 菜单文案） |
 | `src/loop-guard.ts` | 循环「自动停止守卫」（检测到问题 / 网页搜索请求即停） |
-| `src/proxy-switch.ts` | 「切节点锁定」：provider 网络错误时经 mihomo 外部控制接口锁定/解锁节点（含锁定生效确认、质量巡检与**外部手动锁定尊重**） |
+| `src/exit-proxy.ts` | 本轮出口代理状态（direct/relay 汇总，只读；换轮由 CI 的 egress 选择器负责） |
 | `src/tabular.ts` | TG 等宽表格 / 键值列表渲染（纯函数，状态与诊断消息对齐用） |
 | `src/shell-promo.ts` | shell 结果晋升为后台任务卡的判据与文案 |
 | `src/abort-classify.ts` | 中止原因分类（用户中止 / 超时 / 宿主错误）与遥测字段 |
@@ -48,9 +48,18 @@ bash install.sh
   bash add-bots.sh --file /tmp/new-bots.json --reload
   ```
   `add-bots.sh` 会校验 id/username/env/token、按 id 幂等 upsert、原子写入 `tg-bots.json`（mode 600），输出只显示 `token=set(len=N)`，不打印 token；`--reload` 只 touch 插件入口触发重载。`id` 用小写字母/数字/`_`/`-`，env 路径支持 `~`。`username` 缺省时用 `id` 生成内部 id，`label` 自动为 `@username`。
-- **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡新增当前会话、推送状态、外发队列和注入队列。
+  输入条目也可以直接给 `token`（脚本会写 `~/.config/opencode/tg-bot<id>.env`，mode 600）：
+  ```json
+  {"bots":[{"id":"bot8","token":"123456:ABC…","label":"@my_bot8"}]}
+  ```
+- **三种免改代码的接入口**（任选其一，可混用）：
+  1. TG 里发 `/addbots <token1> <token2> …`：一条消息批量登记，逐个回执；token 会自动从聊天里删除（仍建议随后 revoke 旧的）。
+  2. CI secret `TG_BOTS_EXTRA`：JSON 数组（`[{"id","token","label"...}]`），每次启动自动落盘并合并注册表。
+  3. 直接放 `~/.config/opencode/tg-bot<id>.env`：入口的 `readRegistry()` 自动发现，无需注册表。
+- **同一个 token 只能有一个轮询者**：`/addbot`、`add-bots.sh`、restore 与入口 `readRegistry()` 都会按 token 去重；重复 token 会被拒绝/停用并记 `duplicate token`，否则两个实例抢 `getUpdates`（409），后一个 Bot 永远收不到消息。
+- **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡显示当前会话、**会话状态**、推送状态、外发队列和注入队列；卡片每 60s 自动刷新（文案变化才 edit），不再整轮停在旧值。
 - **AI 改标题**：循环页与置顶循环状态卡提供「✍️ AI 改标题」按钮。桥调用宿主 `POST /api/session/{id}/generate` 根据当前会话上下文生成标题，再用 `PATCH /api/session/{id}` 落库；自动保留 `[LOOP]` / `[LOOP:OFF]` 循环标记，模型返回的引号/Markdown/解释行会被清洗。
-- 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。当前 **199 tests 全 PASS**（含 AI 标题清洗与菜单按钮回归）。
+- 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。当前 **204 tests 全 PASS**（含 AI 标题清洗、菜单按钮与 completed-dead 回归）。
 
 ## 运行注意（R617）
 

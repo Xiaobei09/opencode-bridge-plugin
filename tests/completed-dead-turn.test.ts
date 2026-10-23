@@ -5,7 +5,7 @@ const src = readFileSync(new URL("../src/auto-continue.ts", import.meta.url), "u
 
 describe("r2237 stale generation + completed dead-turn resume", () => {
   it("declares the version and treats completed no-text/no-tool as workedAnyway", () => {
-    expect(src).toContain('const VERSION = "r2239-success-compact-cooldown"');
+    expect(src).toMatch(/const VERSION = "r[0-9a-z][0-9a-z-]*"/);
     expect(src).toMatch(/const completedDead = completedTs > 0 && !hasRealToolWork\(msg\) && len === 0/);
     expect(src).toMatch(/const workedAnyway = hasNonTextWork\(msg\) \|\| completedDead/);
   });

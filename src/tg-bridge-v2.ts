@@ -114,16 +114,19 @@ type BotSpec = {
 }
 
 const readRegistry = (): BotSpec[] => {
+  const out: BotSpec[] = []
+  const seen = new Set<string>()
+  const add = (b: BotSpec): void => {
+    if (!b.id || !/^[a-z0-9_-]{1,24}$/i.test(b.id) || seen.has(b.id)) return
+    seen.add(b.id)
+    out.push(b)
+  }
   try {
     const j = JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as any
     const arr = Array.isArray(j?.bots) ? j.bots : []
-    const out: BotSpec[] = []
     for (const b of arr) {
-      const id = String(b?.id ?? "").trim()
-      if (!id || !/^[a-z0-9_-]{1,24}$/i.test(id)) continue
-      if (out.some((x) => x.id === id)) continue
-      out.push({
-        id,
+      add({
+        id: String(b?.id ?? "").trim(),
         label: typeof b?.label === "string" ? b.label : undefined,
         envFile: typeof b?.envFile === "string" && b.envFile ? b.envFile : undefined,
         fallbackEnvFile: typeof b?.fallbackEnvFile === "string" && b.fallbackEnvFile ? b.fallbackEnvFile : undefined,
@@ -131,11 +134,64 @@ const readRegistry = (): BotSpec[] => {
         pushChat: typeof b?.pushChat === "string" && b.pushChat ? b.pushChat : undefined,
       })
     }
-    if (out.length > 0) return out
   } catch {
-    /* 无注册表：退回单实例默认行为 */
+    /* 无注册表：继续走自动发现 / 单实例默认行为 */
   }
-  return [{ id: "primary" }]
+  // 无代码接入：任何 `tg-bot<id>.env`（含 TG_BOT_TOKEN）都会自动成为一个 Bot。
+  // 这样「一次性增加多个 Bot」只需放文件（CI 侧由 tg-bots.extra secret / 批量脚本落盘），
+  // 注册表哪怕被旧模板覆盖也不会让 bot3/bot4 静默消失（2026-10-21 工厂重置实况）。
+  // 注册表显式条目优先（同 id 不重复），发现到的按文件名排序，启动顺序稳定。
+  const home = process.env.HOME ?? "/root"
+  for (const dir of [`${home}/.config/opencode`, `${home}/.opencode`]) {
+    let names: string[] = []
+    try {
+      names = readdirSync(dir).sort()
+    } catch {
+      continue
+    }
+    for (const n of names) {
+      const m = /^tg-bot([a-z0-9_-]{1,24})\.env$/i.exec(n)
+      if (!m) continue
+      // /addbot 的 id 形如 bot3，落盘文件是 tg-bot3.env；这里必须还原成同一个 id，
+      // 否则注册表 bot3 与自动发现的 3 会各起一个实例、抢同一个 token（409）。
+      const sfx = m[1].toLowerCase()
+      const id = sfx.startsWith("bot") ? sfx : `bot${sfx}`
+      if (seen.has(id)) continue
+      const envFile = `${dir}/${n}`
+      const env = readEnvFile(envFile)
+      if (!env.TG_BOT_TOKEN) continue
+      add({ id, label: env.TG_BOT_LABEL || id, envFile, noFallback: true })
+    }
+  }
+  // 主 Bot：注册表缺失时也用 tg.env 自动接回（工厂重置后注册表可能只剩模板）。
+  if (!seen.has("primary")) {
+    for (const p of [`${home}/.opencode/tg.env`, `${home}/.config/opencode/tg.env`]) {
+      if (readEnvFile(p).TG_BOT_TOKEN) {
+        add({ id: "primary", label: "CI", envFile: p })
+        break
+      }
+    }
+  }
+  // 去重：同一个 Telegram token 只能有一个轮询者。两个 Bot 条目用同一 token 会
+  // 互相抢 getUpdates → 409 风暴（2026-10-23 实测：TG_BOT3_TOKEN 与 TG_BOT4_TOKEN
+  // 是同一个 token，bot4 因此永远收不到消息）。保留第一个（primary 优先）。
+  const tokenOwner = new Map<string, string>()
+  const unique: BotSpec[] = []
+  for (const b of out) {
+    const tok = readEnvFile(b.envFile).TG_BOT_TOKEN ?? ""
+    if (!tok) {
+      unique.push(b)
+      continue
+    }
+    const prev = tokenOwner.get(tok)
+    if (prev) {
+      diag(`[tg-bridge-v2] duplicate token: ${b.id} dropped (same token as ${prev})`)
+      continue
+    }
+    tokenOwner.set(tok, b.id)
+    unique.push(b)
+  }
+  return unique.length > 0 ? unique : [{ id: "primary" }]
 }
 
 /** 读 env 文件（只取键，不打印任何值） */
@@ -259,6 +315,19 @@ export default {
     // 否则顶层缓存的 bots 会让新增 bot 永远进不来。诊断行用于验证「确实读到了新注册表」。
     refreshRegistry()
     diag(`[tg-bridge-v2] setup: registry ids=${bots.map((b) => b.id).join(",")}`)
+    // 从注册表移除/去重的 Bot，其旧实例不会因为“新 setup 没遍历到它”而自动停：
+    // 它的代号键不在本轮重置范围内，poll 循环会继续跑并抢同一个 token（实测：bot4
+    // 与 bot3 同 token 被去重后，bot4 旧实例仍在 getUpdates → bot3 永久 409）。
+    // 这里把所有“已不在当前注册表”的代号键 +1，旧实例下一拍即判定自己被换代并退出。
+    {
+      const want = new Set(bots.map((b) => `__tgBridgeGen_${b.id}`))
+      for (const k of Object.keys(globalThis)) {
+        if (!k.startsWith("__tgBridgeGen_") || k.endsWith("__writerGen") || want.has(k)) continue
+        const g = globalThis as Record<string, unknown>
+        g[k] = (typeof g[k] === "number" ? (g[k] as number) : 0) + 1
+        diag(`[tg-bridge-v2] retired stale instance ${k} (bot removed from registry)`)
+      }
+    }
     const disposers: Array<(() => void) | void> = []
     const version = srcVersion()
     // 一次 setup 快照一份，三个 Bot 共用；仍按 ?bot= 分成三个模块实例（见上方注释）。
@@ -318,3 +387,5 @@ export default {
 // addbot reload 2026-10-17T13:32:56Z
 
 // addbot reload 2026-10-17T13:40:39Z (round1 verify)
+
+// reload trigger 2026-10-23T02:40:20Z (repo->live sync)

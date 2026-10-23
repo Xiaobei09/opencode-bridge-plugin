@@ -42,7 +42,9 @@ python3 - "$FILE" "$REGISTRY" "$DRY_RUN" <<'PY'
 import json, os, re, sys, tempfile
 
 src_path, reg_path, dry = sys.argv[1], os.path.expanduser(sys.argv[2]), sys.argv[3] == "1"
-ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+DEFAULT_ALLOWED = os.environ.get("TG_ALLOWED_CHAT", "")
+DEFAULT_PUSH = os.environ.get("TG_PUSH_CHAT", "")
 
 def die(msg):
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -57,16 +59,28 @@ def read_json(path, default):
     except Exception as e:
         die(f"invalid JSON {path}: {e}")
 
-def token_len(path):
+def env_value(path, key):
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
-                if line.startswith("TG_BOT_TOKEN="):
-                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    return len(v)
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError as e:
         die(f"cannot read env file {path}: {e}")
-    return 0
+    return ""
+
+def write_env(path, token, allowed, push, label):
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tg-bot.", dir=parent, text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"TG_BOT_TOKEN={token}\n")
+        f.write(f"TG_ALLOWED_CHAT={allowed}\n")
+        f.write(f"TG_PUSH_CHAT={push}\n")
+        if label:
+            f.write(f"TG_BOT_LABEL={label}\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 def bots_of(data):
     if isinstance(data, list):
@@ -82,33 +96,64 @@ existing = bots_of(read_json(reg_path, {"bots": []}))
 if not isinstance(existing, list):
     die("existing registry has no bots array")
 
+# One Telegram token = one poller. Two registry entries with the same token cause
+# a permanent getUpdates 409 and the later bot silently receives nothing.
+token_owner = {}
+for b in existing:
+    p = os.path.expanduser(str(b.get("envFile", "")))
+    tok = env_value(p, "TG_BOT_TOKEN") if p else ""
+    if tok:
+        token_owner.setdefault(tok, str(b.get("id", "?")))
+
 for b in new:
     if not isinstance(b, dict):
         die("every bot entry must be an object")
-    bid = str(b.get("id", "")).strip()
+    bid = str(b.get("id", "")).strip().lower()
     username = str(b.get("username", "")).strip().lstrip("@")
     if not bid and username:
         bid = username.lower()
-        b["id"] = bid
+    bid = re.sub(r"[^a-z0-9_-]", "", bid)
     if not ID_RE.match(bid):
-        die(f"invalid bot id: {bid!r} (use lowercase letters, digits, _ or -; 2-32 chars; or provide username)")
+        die(f"invalid bot id: {bid!r} (use letters, digits, _ or -; 2-32 chars; or provide username)")
+    b["id"] = bid
+    label = str(b.get("label") or (f"@{username}" if username else bid))
+
     env = str(b.get("envFile", "")).strip()
+    token = str(b.get("token", "")).strip()
+    if not env and not token:
+        die(f"bot {bid}: provide envFile or token")
     if not env:
-        die(f"bot {bid}: envFile is required")
+        # /addbot names the file tg-<id>.env; tg-bot3.env and tg-3.env both work
+        # for auto-discovery. Keep the same convention here.
+        file_id = bid[3:] if bid.startswith("bot") and len(bid) > 3 else bid
+        env = os.path.expanduser(f"~/.config/opencode/tg-bot{file_id}.env")
     env = os.path.expanduser(env)
     if not os.path.isabs(env):
         env = os.path.abspath(env)
-    if not os.path.isfile(env):
+    if token:
+        if len(token) < 20 or ":" not in token:
+            die(f"bot {bid}: token does not look like a BotFather token")
+        if not dry:
+            write_env(
+                env,
+                token,
+                str(b.get("allowedChat") or DEFAULT_ALLOWED),
+                str(b.get("pushChat") or DEFAULT_PUSH),
+                label,
+            )
+    if not os.path.isfile(env) and not (dry and token):
         die(f"bot {bid}: envFile not found: {env}")
-    n = token_len(env)
-    if n < 20:
+    tok = token if (dry and token) else env_value(env, "TG_BOT_TOKEN")
+    if len(tok) < 20:
         die(f"bot {bid}: TG_BOT_TOKEN missing or too short in {env}")
+    prev = token_owner.get(tok)
+    if prev and prev != bid:
+        die(f"bot {bid}: token is already used by {prev}; one token can only have one poller")
+    token_owner[tok] = bid
     b["envFile"] = env
-    if username:
-        b.setdefault("label", f"@{username}")
-    else:
-        b.setdefault("label", bid)
-    print(f"  {'+' if all(x.get('id') != bid for x in existing) else '='} {bid}  label={b['label']}  env={env}  token=set(len={n})")
+    b.setdefault("label", label)
+    existing_ids = {str(x.get("id")) for x in existing}
+    print(f"  {'+' if bid not in existing_ids else '='} {bid}  label={b['label']}  env={env}  token=set(len={len(tok)})")
 
 by_id = {str(b.get("id")): i for i, b in enumerate(existing)}
 for b in new:
