@@ -5300,8 +5300,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const claimed = JSON.parse(readFileSync(STRIP_STATE_PATH, "utf8")) as any
       if (claimed?.owner !== pollInstanceId) return
       const bySess = new Map<string, number>()
+      const isStopKey = (k: string): boolean => k.includes(":message:") || k.includes(":ask:") || k.includes(":thinking:") || k.includes(":tool:") || k.includes(":status")
       for (const [k, v] of [...protoMap.entries()]) {
-        if (!k.includes(":message:") && !k.includes(":ask:")) continue
+        // R2504: thinking/tool/status cards carry the same ⏹ button; the old
+        // backfill only scanned message/ask, so those buttons survived reloads.
+        if (!isStopKey(k)) continue
         const sid = k.split(":")[0] ?? ""
         if (!sid) continue
         const cur = bySess.get(sid) ?? 0
@@ -5309,7 +5312,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       }
       let n = 0
       for (const [k, v] of [...protoMap.entries()]) {
-        if (!k.includes(":message:") && !k.includes(":ask:")) continue
+        if (!isStopKey(k)) continue
         const sid = k.split(":")[0] ?? ""
         if (v.fallback === true) continue
         if ((bySess.get(sid) ?? 0) === v.id) {
@@ -10870,6 +10873,55 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
     void backfillStrip()
   }, 5000)
+  // R2504（用户：有部分停止按钮没有删除）：一轮结束后最后一张思考/工具卡仍
+  // 保留 ⏹，要等下一条带按钮的消息出现才会被 demote；长回合结束后可能永久
+  // 残留。每 30s 检查本 Bot 目标的最后一条 assistant 是否已完成，完成才剥掉
+  // lastReply 的按钮；运行中的回合（completed=0）保持可停止。
+  const stripStopOnCompletedTurn = async (): Promise<void> => {
+    if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+    const sid = fixedTarget ?? frontSessionID ?? persistedFront
+    if (!sid) return
+    const prev = lastReply.get(sid)
+    if (!prev || !prev.id) return
+    const chat = pushChatResolve()
+    if (!chat) return
+    try {
+      const pe = await client.session.messages({ path: { id: sid } })
+      const arr = Array.isArray(pe?.data) ? pe.data : []
+      let lastAssistant: any = null
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const m = arr[i] as any
+        if (String(m?.role ?? m?.info?.role ?? "") === "assistant") {
+          lastAssistant = m
+          break
+        }
+      }
+      if (!lastAssistant) return
+      const completed = Number(lastAssistant?.time?.completed ?? lastAssistant?.info?.time?.completed ?? 0)
+      if (!(completed > 0)) return
+      const r = await tgFetch("editMessageReplyMarkup", {
+        chat_id: Number(prev.chat) || prev.chat,
+        message_id: prev.id,
+        reply_markup: { inline_keyboard: [] },
+      })
+      if (r.ok || (r.status === 400 && /not modified/i.test(String(r.desc ?? "")))) {
+        strippedKb.add(prev.key)
+        lastReply.delete(sid)
+        savePersistedState()
+        await log("info", `stop button stripped after turn (session=${sanitizeLog(sid).slice(0, 12)} msg=${prev.id})`)
+      } else if (r.status === 400 || r.status === 403) {
+        // 旧消息不可编辑：标记完成，避免每 30s 重试同一张卡
+        strippedKb.add(prev.key)
+        lastReply.delete(sid)
+        await log("warn", `stop button strip skipped (msg=${prev.id}, status=${r.status}, desc=${sanitizeLog(String(r.desc ?? "")).slice(0, 80)})`)
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  setInterval(() => {
+    void stripStopOnCompletedTurn()
+  }, 30_000)
   setTimeout(() => {
     if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
     runOffsetCheck("startup")
