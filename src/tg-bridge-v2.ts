@@ -388,4 +388,4 @@ export default {
 
 // addbot reload 2026-10-17T13:40:39Z (round1 verify)
 
-// reload trigger 2026-10-23T03:05:56Z (repo->live sync)
+// reload trigger 2026-10-23T03:15:13Z (repo->live sync)

@@ -10899,16 +10899,28 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       if (!lastAssistant) return
       const completed = Number(lastAssistant?.time?.completed ?? lastAssistant?.info?.time?.completed ?? 0)
       if (!(completed > 0)) return
+      // Only the ⏹ button must go. A truncated final reply also carries a
+      // “看完整版” row; clearing the whole keyboard would make the full text
+      // unreachable. Reuse the same full-key lookup as trackReplyButtons.
+      const pk = prev.key
+      let rows: unknown[][] = []
+      if (pk.includes(":message:")) {
+        let fid = ""
+        for (const [k2, v2] of fullKeyStore.entries()) {
+          if (v2.sid === sid && v2.key === pk) fid = k2
+        }
+        if (fid) rows = [[{ text: "📄 看完整版", callback_data: `full:${fid}` }]]
+      }
       const r = await tgFetch("editMessageReplyMarkup", {
         chat_id: Number(prev.chat) || prev.chat,
         message_id: prev.id,
-        reply_markup: { inline_keyboard: [] },
+        reply_markup: { inline_keyboard: rows },
       })
       if (r.ok || (r.status === 400 && /not modified/i.test(String(r.desc ?? "")))) {
         strippedKb.add(prev.key)
         lastReply.delete(sid)
         savePersistedState()
-        await log("info", `stop button stripped after turn (session=${sanitizeLog(sid).slice(0, 12)} msg=${prev.id})`)
+        await log("info", `stop button stripped after turn (session=${sanitizeLog(sid).slice(0, 12)} msg=${prev.id} keptFull=${rows.length ? 1 : 0})`)
       } else if (r.status === 400 || r.status === 403) {
         // 旧消息不可编辑：标记完成，避免每 30s 重试同一张卡
         strippedKb.add(prev.key)
