@@ -4135,6 +4135,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 自己那次 20 秒长轮询，否则新实例第一次 getUpdates 必然 409（换代抖动）。
   let pollAbort: AbortController | null = null
   let pollAbortTakenOver = false
+  // R2507：offset 自检的 peek 也是一次 getUpdates，且它的 15s 超时可能跨越一次热重载。
+  // 旧实例的 pollAbort 只覆盖长轮询，不覆盖 peek → 新实例首 poll 会被旧 peek 撞 409。
+  // 这里单独持有 peek 的句柄，换代/丢租约时一并中断。
+  let sanityAbort: AbortController | null = null
   // Singleton, two layers (covers both ESM-cache hypotheses + cross-process):
   // 1. globalThis generation: newest instantiation in THIS process wins.
   //    globalThis survives module hot-reload, so stale loops suicide on next tick.
@@ -9926,26 +9930,24 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 自愈：用 `getUpdates?offset=-1&limit=1` 做**只读窥视**（负 offset 不确认、不消费、
   // 不与运行中的 poller 冲突）。若窥视到的最新 id 小于我们存的 offset，说明领先了，
   // 立刻把 offset 拉回该 id（宁可重放最近一条，也不要静默丢弃全部）。
-  const peekLatestUpdateId = async (): Promise<number | null> => {
+  const peekLatestUpdateId = async (outer?: AbortSignal): Promise<number | null> => {
     try {
-      const ctl = new AbortController()
-      const timer = setTimeout(() => ctl.abort(), 15000)
-      try {
-        // ROUND 12：窥视也必须带同一个 allowlist，否则它可能继承**旧的**受限设置、
-        // 看不到编辑类 update，自愈判据随之失真。
-        const r = await fetch(`${apiBase}/getUpdates?offset=-1&limit=1&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D`, {
-          headers: { "content-type": "application/json" },
-          signal: ctl.signal,
-        })
-        if (!r.ok) return null
-        const j: any = await r.json().catch(() => null)
-        const arr = Array.isArray(j?.result) ? j.result : []
-        if (arr.length === 0) return null
-        const id = Number(arr[arr.length - 1]?.update_id)
-        return Number.isFinite(id) ? id : null
-      } finally {
-        clearTimeout(timer)
-      }
+      // 外部信号（换代/丢租约）+ 15s 超时；AbortSignal.any 任一触发即中断。
+      const signal = outer
+        ? AbortSignal.any([outer, AbortSignal.timeout(15_000)])
+        : AbortSignal.timeout(15_000)
+      // ROUND 12：窥视也必须带同一个 allowlist，否则它可能继承**旧的**受限设置、
+      // 看不到编辑类 update，自愈判据随之失真。
+      const r = await fetch(`${apiBase}/getUpdates?offset=-1&limit=1&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D`, {
+        headers: { "content-type": "application/json" },
+        signal,
+      })
+      if (!r.ok) return null
+      const j: any = await r.json().catch(() => null)
+      const arr = Array.isArray(j?.result) ? j.result : []
+      if (arr.length === 0) return null
+      const id = Number(arr[arr.length - 1]?.update_id)
+      return Number.isFinite(id) ? id : null
     } catch {
       return null
     }
@@ -9987,35 +9989,46 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       sanityPendingReason = reason
       return
     }
-    const real = await peekLatestUpdateId()
-    // R1818：判定提成纯函数 offsetRewindTarget（_v2compat），分支互斥且穷举。
-    // 旧实现在这里把**常态** ahead=1 当成「offset 越界」并回退到 real = 已处理过的那条，
-    // 再 seenUpdates.clear() → 重载后那条会被重新投递、重复回复用户。
-    // 02:06:44.950Z 生产实证：stored=530870734 server=530870733 ahead=1; rewinding。
-    const rw = offsetRewindTarget({
-      stored: persistedOffset,
-      real,
-      lastReal: lastRealUpdateId,
-      // 无条件求值是无害的（纯函数只在 real===null 时才读它）；不写成条件求值是为了
-      // 免得「什么时候求值」变成一条隐含契约，日后改纯函数时踩坑。
-      sibling: siblingBaseline(),
-    })
-    if (rw.target === null) return
+    // R2507：`peekLatestUpdateId` 本身也是一次 getUpdates。只检查 polling 再 await
+    // 仍有竞态：检查后、peek 发出前，2s 的 poll 定时器可能刚好进入 poll → 两边并发，
+    // Telegram 对**两边**都回 409（实测每次启动自检都会刷 4–5 条 409）。
+    // 先占住 polling（poll 定时器看到 true 会直接 return），peek 完成/异常后释放。
+    polling = true
+    sanityAbort = new AbortController()
+    try {
+      const real = await peekLatestUpdateId(sanityAbort.signal)
+      // R1818：判定提成纯函数 offsetRewindTarget（_v2compat），分支互斥且穷举。
+      // 旧实现在这里把**常态** ahead=1 当成「offset 越界」并回退到 real = 已处理过的那条，
+      // 再 seenUpdates.clear() → 重载后那条会被重新投递、重复回复用户。
+      // 02:06:44.950Z 生产实证：stored=530870734 server=530870733 ahead=1; rewinding。
+      const rw = offsetRewindTarget({
+        stored: persistedOffset,
+        real,
+        lastReal: lastRealUpdateId,
+        // 无条件求值是无害的（纯函数只在 real===null 时才读它）；不写成条件求值是为了
+        // 免得「什么时候求值」变成一条隐含契约，日后改纯函数时踩坑。
+        sibling: siblingBaseline(),
+      })
+      if (rw.target === null) return
 
-    await log(
-      "error",
-      `${rw.why === "sibling-space" ? "offset implausible vs sibling" : "offset ahead of server"} (${reason}): stored=${persistedOffset} target=${rw.target} server=${real ?? "null"} lastReal=${lastRealUpdateId} ahead=${real === null ? "n/a" : persistedOffset - real} why=${rw.why}; rewinding (入站会被静默丢弃)`,
-    )
-    // ★ 必须同时写**内存态** offset。旧代码只写 persistedOffset，而
-    //   `let offset = persistedOffset` 一辈子只在 setup 跑一次 → 自愈在**当前活实例**
-    //   里完全无效，必须等下次热重载才生效 —— 而那恰好是最坏的时机：重载会把已回退的
-    //   落盘值灌进 offset，使**已处理过的 update 被重新投递**。
-    //   R1818 实测：02:06:44 那次回退当场就是无效的（当时靠 40 秒后的新入站
-    //   把落盘值又推回去而侥幸没出事，不是设计）。
-    offset = rw.target
-    persistedOffset = rw.target
-    seenUpdates.clear()
-    savePersistedState()
+      await log(
+        "error",
+        `${rw.why === "sibling-space" ? "offset implausible vs sibling" : "offset ahead of server"} (${reason}): stored=${persistedOffset} target=${rw.target} server=${real ?? "null"} lastReal=${lastRealUpdateId} ahead=${real === null ? "n/a" : persistedOffset - real} why=${rw.why}; rewinding (入站会被静默丢弃)`,
+      )
+      // ★ 必须同时写**内存态** offset。旧代码只写 persistedOffset，而
+      //   `let offset = persistedOffset` 一辈子只在 setup 跑一次 → 自愈在**当前活实例**
+      //   里完全无效，必须等下次热重载才生效 —— 而那恰好是最坏的时机：重载会把已回退的
+      //   落盘值灌进 offset，使**已处理过的 update 被重新投递**。
+      //   R1818 实测：02:06:44 那次回退当场就是无效的（当时靠 40 秒后的新入站
+      //   把落盘值又推回去而侥幸没出事，不是设计）。
+      offset = rw.target
+      persistedOffset = rw.target
+      seenUpdates.clear()
+      savePersistedState()
+    } finally {
+      sanityAbort = null
+      polling = false
+    }
   }
 
   // 换代宽限：新实例在 setup 里就抢走了 tg 租约，但旧实例可能还挂着 20 秒长轮询，
@@ -10085,16 +10098,34 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             /* already gone */
           }
         }
+        // peek 也可能在飞（它不受 pollAbort 管），一并断掉，避免旧实例继续占着
+        // 同一 token 的 getUpdates 把新实例撞 409。
+        if (sanityAbort) {
+          try {
+            sanityAbort.abort()
+          } catch {
+            /* already gone */
+          }
+        }
         clearInterval(leaseWatch)
         return
       }
-      if (!pollAbort || polling === false) return
+      if (!pollAbort && !sanityAbort) return
       if (ownsPollLease()) return
       pollAbortTakenOver = true
-      try {
-        pollAbort.abort()
-      } catch {
-        /* already gone */
+      if (pollAbort) {
+        try {
+          pollAbort.abort()
+        } catch {
+          /* already gone */
+        }
+      }
+      if (sanityAbort) {
+        try {
+          sanityAbort.abort()
+        } catch {
+          /* already gone */
+        }
       }
     })()
   }, 3000)
