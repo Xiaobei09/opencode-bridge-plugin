@@ -13,4 +13,4 @@ export default v2Bridge("auto-continue", (client) =>
   AutoContinuePlugin({ client } as any)
 )
 
-// reload trigger 2026-10-23T02:40:20Z (repo->live sync)
+// reload trigger 2026-10-23T02:55:48Z (repo->live sync)

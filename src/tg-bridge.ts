@@ -11222,7 +11222,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
     await log("warn", `inject-notice register failed (bot=${BOT_ID}): ${sanitizeLog(err).slice(0, 120)}`)
   }
 
-  // R? (2026-10-23): 置顶循环卡以前只在「注入」时刷新，轮次间隔 5–10 分钟时
+  // R2501 (2026-10-23): 置顶循环卡以前只在「注入」时刷新，轮次间隔 5–10 分钟时
   // 会话状态/队列数字会整轮停在旧值（运营者：状态卡要有会话状态并且记得更新）。
   // 60s 拍：复用 poll 已维护的 cachedSessionList / lastActivity，仅在文案变化时
   // edit（避免无意义编辑触发 TG 限流）；换代后自动停。
@@ -11236,7 +11236,10 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
       if (!chat) return
       const st = readInjectCardState(BOT_ID)
       if (!st.msgID) return
-      const sid = fixedTarget ?? frontSessionID ?? persistedFront
+      // Primary has no fixedTarget/front; fall back to the last injected session
+      // and *always* render the current resolved sid (previously the stale
+      // st.lastSid was preferred, so the card could show a dead session).
+      const sid = fixedTarget ?? frontSessionID ?? persistedFront ?? (st.lastSid || "")
       if (!sid) return
       cardLiveBusy = true
       try {
@@ -11244,7 +11247,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
           bot: BOT_LABEL,
           lastAt: st.lastAt || Date.now(),
           kind: st.lastKind,
-          sid: st.lastSid || sid,
+          sid,
           count: st.count,
           avgGapMs: st.avgGapMs,
           gate: loopGateInfo(),
