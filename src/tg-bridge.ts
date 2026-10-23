@@ -2610,7 +2610,7 @@ export const injectCardText = (o: {
     `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
     `累计: ${o.count} 次 · 平均间隔 ${gap}`,
     gateLine,
-    `更新: 注入即自动编辑本卡（已置顶）`,
+    `更新: 每 60s 自动刷新本卡（已置顶）`,
   ].join("\n")
 }
 
