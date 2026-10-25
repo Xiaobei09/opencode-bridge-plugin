@@ -2575,6 +2575,24 @@ export const writeInjectCardState = (bot: string, st: InjectCardState): void => 
     /* best-effort：落盘失败只影响重载后的卡 id 复用，下次创建会自愈 */
   }
 }
+/**
+ * R2508：插件启动时会把 token 鉴权失败的 Bot 写进 tg-token-invalid.json（不含 token）。
+ * 状态卡把 id 列出来，避免运营者只看到 bot4 沉默却不知道原因。
+ */
+export const readInvalidBotIds = (): string[] => {
+  try {
+    const j = JSON.parse(
+      readFileSync(`REDACTED_ROOT/.config/opencode/tg-token-invalid.json`, "utf8"),
+    ) as any
+    const arr = Array.isArray(j?.bots) ? j.bots : []
+    return arr
+      .map((b: any) => String(b?.id ?? ""))
+      .filter((id: string) => /^[a-z0-9_-]{1,24}$/i.test(id))
+      .slice(0, 8)
+  } catch {
+    return []
+  }
+}
 /** 状态卡文案（纯函数，统一 htmlEsc 动态字段；调用方传原始未转义文本）。 */
 export const injectCardText = (o: {
   bot: string
@@ -2592,10 +2610,16 @@ export const injectCardText = (o: {
   queue?: number
   pinQueue?: number
   paused?: boolean
+  /** R2508：本次实际渲染时间，让“每 60s 刷新”在卡上可见（否则状态没变时看起来像停更）。 */
+  refreshedAt?: number
+  /** R2508：token 无效被跳过的 Bot（仅 id，不含 token）。 */
+  offline?: string
 }): string => {
   const d = new Date(o.lastAt > 0 ? o.lastAt : o.now)
   const pad = (n: number): string => String(n).padStart(2, "0")
   const stamp = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  const rd = new Date(o.refreshedAt && o.refreshedAt > 0 ? o.refreshedAt : o.now)
+  const refreshStamp = `${pad(rd.getMonth() + 1)}-${pad(rd.getDate())} ${pad(rd.getHours())}:${pad(rd.getMinutes())}:${pad(rd.getSeconds())}`
   const short = o.sid.replace(/^ses_/, "").slice(0, 10)
   const gap = o.avgGapMs > 0 ? `${Math.floor(o.avgGapMs / 60000)}分${pad(Math.round((o.avgGapMs % 60000) / 1000))}秒` : "—"
   const g = o.gate
@@ -2610,7 +2634,8 @@ export const injectCardText = (o: {
     `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
     `累计: ${o.count} 次 · 平均间隔 ${gap}`,
     gateLine,
-    `更新: 每 60s 自动刷新本卡（已置顶）`,
+    `更新: ${refreshStamp} · 每 60s 自动刷新本卡（已置顶）`,
+    ...(o.offline ? [`离线: ${htmlEsc(o.offline)}（token 无效，已跳过）`] : []),
   ].join("\n")
 }
 
@@ -11310,6 +11335,8 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         queue: outQueue.length,
         pinQueue: pinQueue.length,
         paused: pausedMode,
+        refreshedAt: now,
+        offline: readInvalidBotIds().join(", "),
       })
       await log(
         "info",
@@ -11391,6 +11418,8 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
           queue: outQueue.length,
           pinQueue: pinQueue.length,
           paused: pausedMode,
+          refreshedAt: Date.now(),
+          offline: readInvalidBotIds().join(", "),
         })
         if (text === lastLiveCardText) return
         const r = await editTextRaw(chat, st.msgID, text, injectCardKeyboard(), false)

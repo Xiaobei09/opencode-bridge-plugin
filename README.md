@@ -57,7 +57,7 @@ bash install.sh
   2. CI secret `TG_BOTS_EXTRA`：JSON 数组（`[{"id","token","label"...}]`），每次启动自动落盘并合并注册表。
   3. 直接放 `~/.config/opencode/tg-bot<id>.env`：入口的 `readRegistry()` 自动发现，无需注册表。
 - **同一个 token 只能有一个轮询者**：`/addbot`、`add-bots.sh`、restore 与入口 `readRegistry()` 都会按 token 去重；重复 token 会被拒绝/停用并记 `duplicate token`，否则两个实例抢 `getUpdates`（409），后一个 Bot 永远收不到消息。
-- **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡显示当前会话、**会话状态**、推送状态、外发队列和注入队列；卡片每 60s 自动刷新（文案变化才 edit），不再整轮停在旧值。
+- **显示名**：桥的菜单、循环命令回执和循环状态卡统一用 `label`（`@username`）；内部状态文件/租约仍用稳定 `id`，因此改名不会丢会话绑定。循环状态卡显示当前会话、**会话状态**、推送状态、外发队列和注入队列；卡片每 60s 自动刷新并显示刷新时间，token 无效被跳过的 Bot 会以「离线」标注，不再整轮停在旧值。
 - **AI 改标题**：循环页与置顶循环状态卡提供「✍️ AI 改标题」按钮。桥调用宿主 `POST /api/session/{id}/generate` 根据当前会话上下文生成标题，再用 `PATCH /api/session/{id}` 落库；自动保留 `[LOOP]` / `[LOOP:OFF]` 循环标记，模型返回的引号/Markdown/解释行会被清洗。
 - 测试：`bun test tests/`（需 [bun](https://bun.sh)；单测面向纯函数/判据，随源码快照）。当前 **204 tests 全 PASS**（含 AI 标题清洗、菜单按钮与 completed-dead 回归）。
 
