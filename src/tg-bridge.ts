@@ -5126,8 +5126,16 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (rows !== null) {
         try {
           const r = await tgFetch("editMessageReplyMarkup", { chat_id: Number(prev.chat) || prev.chat, message_id: prev.id, reply_markup: { inline_keyboard: rows } })
-          await log("info", `demote prev buttons (session=${sanitizeLog(sess)} msg=${prev.id} kind=${kind} ${r.ok ? "ok" : "fail"})`)
-          if (r.ok && pk) {
+          // R2510：400 "message is not modified" = 按钮早已是目标状态（成功），
+          // 旧代码把它记成 fail，正是“部分停止按钮没删除”的假警报来源。
+          // 真失败必须带 Telegram 的 desc，否则无法区分“已清掉”和“永远清不掉”。
+          const why = sanitizeLog(r.desc ?? "").slice(0, 80)
+          const noop = r.status === 400 && /not modified/i.test(why)
+          await log(
+            "info",
+            `demote prev buttons (session=${sanitizeLog(sess)} msg=${prev.id} kind=${kind} ${r.ok || noop ? "ok" : "fail"}${noop ? " (not modified)" : why && !r.ok ? ` desc=${why}` : ""})`,
+          )
+          if ((r.ok || noop) && pk) {
             strippedKb.add(pk)
             if (strippedKb.size > 500) {
               const first = strippedKb.values().next()
