@@ -8832,6 +8832,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const globalStopped = ctl?.stopped === true
       const myGate = (ctl?.bots ?? {})[BOT_ID]?.stopped === true
       // Bot 注册表
+      const invalidBots = new Set(readInvalidBotIds())
       const botRows: string[] = (() => {
         try {
           const j = JSON.parse(readFileSync(`REDACTED_ROOT/.config/opencode/tg-bots.json`, "utf8")) as any
@@ -8840,8 +8841,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             const id = String(b?.id ?? "?")
             const gate = (ctl?.bots ?? {})[id]?.stopped === true ? "停" : "运行"
             const me = id === BOT_ID ? "（本 Bot）" : ""
+            const bad = invalidBots.has(id) ? " · ⛔离线（token 被拒）" : ""
             // R921：label 本身已带 @；旧代码再拼一个 @ 会显示成 @@username。
-            return `· ${botDisplayName(id)}${me} 循环=${gate}`
+            return `· ${botDisplayName(id)}${me} 循环=${gate}${bad}`
           })
         } catch {
           return ["· （读取 tg-bots.json 失败）"]
@@ -8873,6 +8875,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       lines.push("")
       lines.push("【Bot 注册表】")
       lines.push(...botRows)
+      if (invalidBots.size > 0) {
+        lines.push(`· 离线：${[...invalidBots].join(", ")}（token 被 Telegram 拒绝；用 /addbots 换新 token）`)
+      }
       await reply(chatID, lines.join("\n"))
       return
     }
@@ -11423,7 +11428,11 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         })
         if (text === lastLiveCardText) return
         const r = await editTextRaw(chat, st.msgID, text, injectCardKeyboard(), false)
-        if (r.r === "sent") lastLiveCardText = text
+        if (r.r === "sent") {
+          lastLiveCardText = text
+          // R2508：留一行可见证据，确认 60s 拍真的在改卡（运营者曾反馈“像停更”）。
+          await log("info", `inject card refreshed (bot=${BOT_ID}, msg=${st.msgID}, offline=${readInvalidBotIds().join(",") || "-"})`)
+        }
       } catch {
         /* 卡片刷新是附赠，失败下一拍再来 */
       } finally {
