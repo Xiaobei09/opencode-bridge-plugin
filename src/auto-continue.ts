@@ -82,11 +82,14 @@ const RECOVER_PROMPT = `上一轮自动筛查应答因可恢复错误中断，�
 // 记 msg.id 后，只有**新的**助手消息才能再次触发，符合「停一次、等人处理」的语义。
 const guardTripped = new Map<string, string>()
 const VERSION = "r942-exit-proxy-per-round"
-// 错误策略（现行）：「全部会话连续 2 次错误 → 结束本轮」。
+// 错误策略（现行，R2512）：「同一会话连续 3 次错误 → 结束本轮」。
 // 语义：
-//   · 连续 = 中间没有一次成功的正常回合（非错误 assistant 消息 / 成功注入 round）。
-//   · 第 1 次连续错误 → recover（照常恢复/续跑）；第 2 次 → END-ROUND-CI（exit 0），
+//   · 连续 = 该会话中间没有一次成功的正常回合（非错误 assistant 消息）。
+//   · 第 1/2 次连续错误 → recover（照常恢复/续跑）；第 3 次 → END-ROUND-CI（exit 0），
 //     由 workflow relay 起新 run：新 run 会重新挑一个**出口代理**（新出口 IP ⇒ 新额度）。
+//   · R2512 修正：旧实现是**全局** streak，任意其它会话出现正常回合就 reset；
+//     实测另一个空闲会话每分钟把失败会话的 streak 清零（日志恒为 1/2），
+//     连续 quota 失败永远不结束本轮。现改为按会话计数，健康回合只 reset 自己。
 //   · R942 变更：旧实现在本轮内「切 IP」（force-resolve 改 /etc/hosts + mihomo 切节点）
 //     再切最多 5 次。实测那类 DNS/节点级切换**不改变源站看到的客户端 IP**，额度照样被卡；
 //     而 Bun 在进程启动时解析一次代理、运行期改 env 也不换隧道 ⇒ 本轮内本来就没有
@@ -101,11 +104,41 @@ const STALE_CLAIM_MS = (() => {
   return Number.isFinite(v) && v >= 0 ? v : 1800000
 })()
 const ERR_CONSECUTIVE_LIMIT = (() => {
-  const v = Number(process.env.AC_ERR_CONSECUTIVE_LIMIT ?? "2")
-  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 2
+  const v = Number(process.env.AC_ERR_CONSECUTIVE_LIMIT ?? "3")
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 3
 })()
 export type ErrorPolicyAction = "recover" | "end"
-// 纯函数（可单测）：全局连续错误计数。同 key 去重；reset=true 表示一次正常回合。
+// 纯函数（可单测）：按会话的连续错误计数。同一 msg.id 只计一次；健康回合只 reset
+// 该会话，不能被其它空闲会话的“正常消息”清零（R2512 实测 bug）。
+export const nextSessionErrorStreak = (
+  state: { bySession: Readonly<Record<string, number>>; seen: readonly string[] },
+  sessionID: string,
+  key: string,
+): { bySession: Record<string, number>; seen: string[]; added: boolean; streak: number; max: number } => {
+  const maxOf = (m: Record<string, number>): number => Math.max(0, ...Object.values(m))
+  if (state.seen.includes(key)) {
+    const bySession = { ...state.bySession }
+    return {
+      bySession,
+      seen: [...state.seen],
+      added: false,
+      streak: bySession[sessionID] ?? 0,
+      max: maxOf(bySession),
+    }
+  }
+  const seen = [...state.seen, key].slice(-128)
+  const bySession = { ...state.bySession, [sessionID]: (state.bySession[sessionID] ?? 0) + 1 }
+  return { bySession, seen, added: true, streak: bySession[sessionID], max: maxOf(bySession) }
+}
+export const resetSessionErrorStreak = (
+  state: { bySession: Readonly<Record<string, number>>; seen: readonly string[] },
+  sessionID: string,
+): { bySession: Record<string, number>; seen: string[] } => {
+  const bySession = { ...state.bySession }
+  delete bySession[sessionID]
+  return { bySession, seen: [...state.seen] }
+}
+// 旧版全局 streak（保留导出仅为兼容既有调用/测试；运行期已改用按会话计数）。
 export const nextErrorStreak = (
   state: { streak: number; seen: readonly string[] },
   key: string,
@@ -947,20 +980,27 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // 被注入闸拦下的时刻（诊断用：连续拦多久 = 宿主侧回合卡了多久）
   const heldInject = new Map<string, number>()
   const fatalStreak = new Map<string, number>()
-  // R941：全局连续错误计数（跨全部会话）。成功回合 reset；同一 msg.id 只计一次。
-  let errStreak = 0
+  // R2512：按会话的连续错误计数（旧版是全局 streak，任意空闲会话的正常消息
+  // 会把它清零 → 失败会话永远停在 1/2）。同一 msg.id 只计一次；健康回合只 reset 自己。
+  let errBySession: Record<string, number> = {}
   let errSeen: string[] = []
-  const noteErrorStreak = (sessionID: string, msgID: string): { streak: number; added: boolean } => {
-    const next = nextErrorStreak({ streak: errStreak, seen: errSeen }, `${sessionID}:${msgID}`)
-    errStreak = next.streak
+  const noteErrorStreak = (
+    sessionID: string,
+    msgID: string,
+  ): { streak: number; max: number; added: boolean } => {
+    const next = nextSessionErrorStreak(
+      { bySession: errBySession, seen: errSeen },
+      sessionID,
+      `${sessionID}:${msgID}`,
+    )
+    errBySession = next.bySession
     errSeen = next.seen
-    return { streak: next.streak, added: next.added }
+    return { streak: next.streak, max: next.max, added: next.added }
   }
-  const noteHealthyRound = (): void => {
-    if (errStreak !== 0 || errSeen.length !== 0) {
-      errStreak = 0
-      errSeen = []
-    }
+  const noteHealthyRound = (sessionID: string): void => {
+    const next = resetSessionErrorStreak({ bySession: errBySession, seen: errSeen }, sessionID)
+    errBySession = next.bySession
+    errSeen = next.seen
   }
   // R210：错误停滞墙钟表（见 AC_ERR_STALL_MS 注释）。返回 true = 持续错误已超过阈值。
   const errStallSince = new Map<string, number>()
@@ -2059,8 +2099,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
 
       if (!msg.error) {
         errStallSince.delete(sessionID)
-        // R941：正常 assistant 消息 = 一次成功回合，打断「连续错误」链。
-        noteHealthyRound()
+        // R2512：正常 assistant 消息 = 该会话的一次成功回合，只打断**本会话**的连续错误链。
+        noteHealthyRound(sessionID)
       } else if (stallExceeded(sessionID)) {
         // R210（运营者指令）：错误停滞 ≥ 阈值（5 连错的墙钟等价物）→ 结束本轮 CI。
         await log(
@@ -2081,7 +2121,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (isRateLimitError(errorName(msg), errorText(msg), errorStatus(msg))) {
           await log(
             "info",
-            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, ${exitProxySummary()}) -> the round ends on the next consecutive error`,
+            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, ${exitProxySummary()}) -> counted toward the ${ERR_CONSECUTIVE_LIMIT}-consecutive-error limit`,
           )
         }
         // R942：全部会话连续 2 次错误 → END-ROUND-CI（exit 0）→ workflow relay 起新 run
@@ -2090,11 +2130,12 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (!isAbortSignal(msg.error)) {
           const err = noteErrorStreak(sessionID, msg.id)
           if (err.added) {
+            // R2512：按本会话 streak 决策；max 只用于日志（跨会话最高值）。
             const action = errorPolicyAction({ streak: err.streak })
             await log(
               "info",
-              `auto-continue: error streak ${err.streak}/${ERR_CONSECUTIVE_LIMIT} across all sessions ` +
-                `(session=${sanitizeLog(sessionID)}, action=${action}, ${exitProxySummary()})`,
+              `auto-continue: error streak ${err.streak}/${ERR_CONSECUTIVE_LIMIT} for session ` +
+                `(session=${sanitizeLog(sessionID)}, max=${err.max}/${ERR_CONSECUTIVE_LIMIT}, action=${action}, ${exitProxySummary()})`,
             )
             if (action === "end") {
               await log(

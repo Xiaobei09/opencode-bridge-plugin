@@ -2634,7 +2634,7 @@ export const injectCardText = (o: {
     `最后注入: ${stamp} · ${o.kind === "recover" ? "恢复" : "轮次"} · ses_${htmlEsc(short)}`,
     `累计: ${o.count} 次 · 平均间隔 ${gap}`,
     gateLine,
-    `更新: ${refreshStamp} · 每 60s 自动刷新本卡（已置顶）`,
+    `刷新: ${refreshStamp} · 每 60s 自动刷新本卡（已置顶）`,
     ...(o.offline ? [`离线: ${htmlEsc(o.offline)}（token 无效，已跳过）`] : []),
   ].join("\n")
 }
@@ -4527,7 +4527,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   let lastPushedText = ""
 
   // desc/status 只在 "drop" 时有值，供调用方把"为什么丢"写进日志（不必再各自重查一遍）
-  type SendResult = { r: "sent" | "retry" | "drop"; id?: number; fallback?: boolean; desc?: string; status?: number }
+  type SendResult = { r: "sent" | "retry" | "drop"; id?: number; fallback?: boolean; desc?: string; status?: number; retryAfter?: number }
   let floodUntil = 0
   let fallbackUntil = 0
   let lastFloodLogAt = 0
@@ -4607,7 +4607,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     method: string,
     body: Record<string, unknown>,
     preferFallback = false,
-  ): Promise<{ ok: boolean; id?: number; status?: number; desc?: string; viaFallback?: boolean }> => {
+  ): Promise<{ ok: boolean; id?: number; status?: number; desc?: string; retryAfter?: number; viaFallback?: boolean }> => {
     try {
       const canFallback =
         Boolean(fallbackApiBase) &&
@@ -4627,7 +4627,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         if (direct.status === 429) {
           const wait = floodWaitSeconds(direct.retryAfter, ++fallback429Streak)
           fallbackUntil = Date.now() + (wait + 1) * 1000
-          return { ok: false, status: direct.status, desc: direct.desc, viaFallback: true }
+          return { ok: false, status: direct.status, desc: direct.desc, retryAfter: direct.retryAfter, viaFallback: true }
         }
         // 所有权标记不准确时再尝试主 Bot，避免把可编辑消息永久卡住。
       }
@@ -4645,7 +4645,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const wait = floodWaitSeconds(primary.retryAfter, ++fallback429Streak)
           fallbackUntil = Date.now() + (wait + 1) * 1000
         }
-        return { ok: false, status: primary.status, desc: primary.desc, viaFallback: true }
+        return { ok: false, status: primary.status, desc: primary.desc, retryAfter: primary.retryAfter, viaFallback: true }
       }
 
       primary = await callTelegram(apiBase, method, body)
@@ -4682,7 +4682,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           )
         }
       }
-      return { ok: false, status: primary.status, desc: primary.desc }
+      return { ok: false, status: primary.status, desc: primary.desc, retryAfter: primary.retryAfter }
     } catch (err) {
       // ⚠️ 此前这里 `return { ok: false }` —— **把异常整个丢掉**：调用方拿不到 status、
       // 也拿不到原因，只能记成 `status=?`（实测 12 条一模一样的"神秘失败"）。
@@ -4930,7 +4930,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     // status 0 = fetch 抛异常（网络不可达/DNS/超时），**必须可重试**。
     // 此前只判 429/5xx，把网络异常当永久失败 → 00:54 那次网络抖动直接把菜单点击
     // 变成"点了没反应"（用户报告 /menu 打不开的一类成因）。
-    if (status === 0 || status === 429 || status >= 500) return { r: "retry", status, desc: status || "network-exception" }
+    if (status === 0 || status === 429 || status >= 500) return { r: "retry", status, desc: status || "network-exception", retryAfter: r.retryAfter }
     await log("error", `editMessageText failed (chat=${sanitizeLog(chatID)}, msg=${messageID}): ${status} (no retry) desc=${sanitizeLog(r.desc ?? "").slice(0, 160)}`)
     noteDrop("edit", `chat=${sanitizeLog(chatID)} msg=${messageID} status=${status} len=${text.length}`)
     return { r: "drop" }
@@ -5573,7 +5573,26 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         await log("info", `proto edit ok (${sanitizeLog(key)}) msg=${prev.id} len=${text.length} h=${h ? h.slice(0, 8) : "-"}`)
       } else {
         rollback()
-        await log("error", `proto edit failed (${sanitizeLog(key)}) → degrade send`)
+        const rStatus = (r as { status?: number }).status ?? 0
+        const rAfter = (r as { retryAfter?: number }).retryAfter ?? 0
+        if (r.r === "retry") {
+          // R2512（运营者：重复回复/按钮残留）：429/5xx/网络抖动是暂时失败，**不能降级新发**。
+          // 状态卡每 60s 会整体重渲染，另发一张新卡只会让用户看到重复卡片；消息/ask 走
+          // 现有 protoRetry（同一条消息稍后重试），也不新发。
+          if (isStatus) {
+            await log("info", `proto edit deferred (${sanitizeLog(key)}) status=${rStatus}${rAfter ? ` retry_after=${rAfter}` : ""}; status card refreshes on next tick`)
+            return
+          }
+          if (key.includes(":message:") || key.includes(":ask:")) {
+            scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true,
+              rStatus === 429 ? Math.max(5_000, Math.min(900_000, rAfter * 1000)) : PROTO_RETRY_QUICK_MS)
+            await log("info", `proto edit deferred behind retry (${sanitizeLog(key)}) status=${rStatus}${rAfter ? ` retry_after=${rAfter}` : ""}`)
+            return
+          }
+          await log("warn", `proto edit transient failure (${sanitizeLog(key)}) status=${rStatus}; degrade send`)
+        } else {
+          await log("error", `proto edit failed (${sanitizeLog(key)}) → degrade send`)
+        }
         if (pendingProtoRetryForChat(chatID)) {
           scheduleProtoRetry(key, chatID, text, kb, silent, prev.id, prev.fallback === true, PROTO_RETRY_QUICK_MS)
           await log("info", `proto edit-degrade deferred behind pending retry (${sanitizeLog(key)})`)
@@ -5653,7 +5672,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (r.r === "retry") scheduleProtoRetry(key, chatID, text, kb, silent, 0, false, r.status === 429 ? 5_000 : PROTO_RETRY_QUICK_MS)
       // R431：retry 是可自愈的瞬时状态（成功另行 info），error 级会被巡检误读成故障
       // （D8 曾把 26 条正常重试全计成「错误」）；永久失败（drop）仍保持 error。
-      await log(r.r === "retry" ? "warn" : "error", `proto send ${r.r} (${sanitizeLog(key)}) len=${text.length}`)
+      await log(r.r === "retry" ? "warn" : "error", `proto send ${r.r} (${sanitizeLog(key)}) len=${text.length} status=${r.status ?? 0} retry_after=${r.retryAfter ?? 0}s`)
     }
   }
 
@@ -6497,7 +6516,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             lastQPinEdit = now
             lastQPinCount = n
           } else {
-            await log("error", `queue pin edit failed (mid=${mid}, r=${r.r})`)
+            const st = (r as { status?: number }).status ?? 0
+            const transient = st === 0 || st === 429 || st >= 500
+            await log(transient ? "warn" : "error", `queue pin edit failed (mid=${mid}, r=${r.r}, status=${st || "?"})`)
           }
           return
         }
@@ -6523,7 +6544,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             }
             await log("info", `queue pin created (n=${n})`)
           } else {
-            await log("error", `queue pin create failed (status=${r.status ?? "?"})`)
+            const st = r.status ?? 0
+            const transient = st === 0 || st === 429 || st >= 500
+            await log(transient ? "warn" : "error", `queue pin create failed (status=${st || "?"})`)
           }
         } catch {
           /* best-effort */
@@ -6921,7 +6944,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       /* 目录读不到：交给下面正常流程 */
     }
     const targetChat = (args[1] ?? "").trim().replace(/^@/, "") || String(chatID).replace(/^@/, "")
-    const label = (args.slice(2).join(" ") || "").trim() || `Bot ${new Date().toISOString().slice(0, 16).replace("T", " ")}`
+    // R2512：显式标签优先；否则用 getMe 的 @username（运营者要求用户可见名直接用用户名，
+    // 不写“批量 n”/时间戳这类内部代号）。username 要验真后才拿到，故默认值在 verify 之后补。
+    const explicitLabel = (args.slice(2).join(" ") || "").trim()
 
     // 验真：失败就不碰注册表（不留僵尸条目）
     const v = await verifyBotToken(tokenForNewBot)
@@ -6929,6 +6954,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(chatID, `❌ token 无效，Telegram 拒绝：${v.desc ?? "未知错误"}\n（注册表未改动）`)
       return
     }
+    const label = explicitLabel || (v.username ? `@${v.username}` : `Bot ${new Date().toISOString().slice(0, 16).replace("T", " ")}`)
 
     // 取第一个空闲 id（沿用既有的 primary/alt，从 bot3 起）
     let id = ""
@@ -8517,7 +8543,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       let n = 0
       for (const tok of tokens) {
         n += 1
-        await handleAddBot([tok, String(chatID), `批量 ${n}`], chatID)
+        // R2512：不传“批量 n”标签——handleAddBot 会用 getMe 的 @username 作为
+        // 用户可见名（运营者要求“不要 bot 代号，直接用用户名”）。
+        await handleAddBot([tok, String(chatID)], chatID)
       }
       await reply(chatID, `📦 批量登记结束：提交 ${tokens.length} 个 token（逐个结果见上）。`)
       return
@@ -11366,7 +11394,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         if (r.r === "retry") {
           // 网络/429/5xx：卡还在，别重发（越失败越发）；落盘计数，下轮注入继续编辑
           writeInjectCardState(BOT_ID, st)
-          await log("info", `inject card edit deferred (bot=${BOT_ID}, msg=${st.msgID}, status=${r.status ?? 0})`)
+          await log("info", `inject card edit deferred (bot=${BOT_ID}, msg=${st.msgID}, status=${r.status ?? 0}, retry_after=${r.retryAfter ?? 0}s)${r.desc ? `, desc=${sanitizeLog(r.desc).slice(0, 60)}` : ""}`)
           return
         }
         // drop：消息已被删/不可编辑 → 清理卡 id 走重建
