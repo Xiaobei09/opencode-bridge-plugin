@@ -25,6 +25,10 @@ export interface ExitProxyState {
   proxy: string
   /** 目前只有 "http"（Bun 不支持 SOCKS：UnsupportedProxyProtocol） */
   scheme: string
+  /** 出口方式：direct | relay | http（egress-lib.sh 写入） */
+  kind: string
+  /** 上游：direct | relay:ip:port | http:host:port（kind 的具体目标） */
+  upstream: string
   /** 代理的出口 IP（provider 看到的客户端 IP） */
   egress_ip: string
   /** runner 直连出口 IP（额度被耗尽的那一个） */
@@ -50,6 +54,8 @@ export const readExitProxy = (): ExitProxyState | null => {
     return {
       proxy,
       scheme: asStr(j?.scheme, "http") || "http",
+      kind: asStr(j?.kind, "direct") || "direct",
+      upstream: asStr(j?.upstream, "direct") || "direct",
       egress_ip: asStr(j?.egress_ip),
       direct_ip: asStr(j?.direct_ip),
       latency_s: asStr(j?.latency_s),
@@ -77,42 +83,80 @@ export const isExitProxyActive = (): boolean => {
   return env.httpsProxy === want || env.httpProxy === want
 }
 
-/** 一行摘要（写日志/面板用；不含任何密钥）。 */
+/**
+ * R2520：出口方式的人类可读标签。
+ * `127.0.0.1:8089` 是本地代理端口，不是出口 IP；旧文案把它写成“本轮出口”，
+ * 与 CI 通知的 kind/upstream/egress/direct 对不上。
+ */
+export const exitProxyKindLabel = (st: Pick<ExitProxyState, "kind" | "upstream"> | null): string => {
+  const kind = st?.kind || "direct"
+  const up = st?.upstream || "direct"
+  if (kind === "direct") return "直连（direct）"
+  if (kind === "relay") return `中继（relay · ${up}）`
+  if (kind === "http") return `上游代理（http · ${up}）`
+  return `${kind}${up && up !== "direct" ? ` · ${up}` : ""}`
+}
+
+/**
+ * 一行摘要（写日志/面板用；不含任何密钥）。
+ * R2520 统一格式：CI 启动通知与本摘要使用同一组键名
+ * `kind= upstream= local= egress= direct=`。
+ */
 export const exitProxySummary = (): string => {
   const st = readExitProxy()
   if (!st) {
     const env = readExitProxyEnv()
     if (!env.httpsProxy && !env.httpProxy) return "exit proxy: none (direct connection)"
-    return `exit proxy: ${env.httpsProxy || env.httpProxy} (no state file)`
+    return `exit proxy: kind=? upstream=? local=${env.httpsProxy || env.httpProxy} egress=? direct=? (no state file)`
   }
-  const bits = [`exit proxy: ${st.scheme}://${st.proxy}`]
-  if (st.egress_ip) bits.push(`egress=${st.egress_ip}`)
-  if (st.direct_ip) bits.push(`direct=${st.direct_ip}`)
+  const bits = [
+    "exit proxy:",
+    `kind=${st.kind || "?"}`,
+    `upstream=${st.upstream || "?"}`,
+    `local=${st.scheme}://${st.proxy}`,
+    `egress=${st.egress_ip || "?"}`,
+    `direct=${st.direct_ip || "?"}`,
+  ]
   if (st.latency_s) bits.push(`latency=${st.latency_s}s`)
   return bits.join(" ")
+}
+
+/** 面板摘要（多行，菜单/状态命令共用）。字段顺序与摘要一致。 */
+export const exitProxyBrief = (): string[] => {
+  const st = readExitProxy()
+  const env = readExitProxyEnv()
+  if (!st) {
+    const lines = ["出口方式：无状态（直连 runner）"]
+    if (env.httpsProxy || env.httpProxy) {
+      lines.push(`本地代理：${env.httpsProxy || env.httpProxy}（状态文件缺失）`)
+    }
+    lines.push("出口 IP：?（provider 看到的客户端 IP）")
+    lines.push("直连 IP：?（runner 自身出口）")
+    return lines
+  }
+  return [
+    `出口方式：${exitProxyKindLabel(st)} · kind=${st.kind || "?"} upstream=${st.upstream || "?"}`,
+    `本地代理：${st.scheme}://${st.proxy}（opencode 进程连接；不是出口 IP）`,
+    `出口 IP：${st.egress_ip || "?"}（provider 看到的客户端 IP）`,
+    `直连 IP：${st.direct_ip || "?"}（额度被耗尽的那一个）`,
+  ]
 }
 
 /** 面板（多行，给 TG 的 /proxy 用）。 */
 export const exitProxyPanel = (): string[] => {
   const st = readExitProxy()
-  const env = readExitProxyEnv()
   const lines: string[] = []
   if (!st) {
-    lines.push("出口代理：无（直连）")
-    if (env.httpsProxy || env.httpProxy) {
-      lines.push(`进程代理变量：${env.httpsProxy || env.httpProxy}（状态文件缺失）`)
-    }
+    lines.push(...exitProxyBrief())
     lines.push("说明：本轮 CI 没有挑到可用代理，provider 流量走 runner 自身出口 IP。")
     lines.push("提示：额度耗尽时下一轮会重新挑选（见 select-proxy.sh）。")
     return lines
   }
-  lines.push(`出口代理：${st.scheme}://${st.proxy}`)
-  lines.push(`出口 IP：${st.egress_ip || "?"}（provider 看到的客户端 IP）`)
-  lines.push(`直连 IP：${st.direct_ip || "?"}（额度被耗尽的那个）`)
+  lines.push(...exitProxyBrief())
+  lines.push(`生效中：${isExitProxyActive() ? "是" : "否（状态与进程环境不一致）"}`)
   if (st.latency_s) lines.push(`探测时延：${st.latency_s}s`)
   if (st.picked_at) lines.push(`挑选时间：${st.picked_at}`)
   if (st.source) lines.push(`来源：${st.source}`)
-  lines.push(`生效中：${isExitProxyActive() ? "是" : "否（状态与进程环境不一致）"}`)
   lines.push("")
   lines.push("说明：出口代理**按轮换**——本轮内不能换（Bun 在进程启动时解析一次代理）。")
   lines.push("额度耗尽或代理失效时，本轮会结束并由 workflow relay 起新 run，新 run 重新挑选出口 IP。")

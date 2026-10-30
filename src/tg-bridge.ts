@@ -29,7 +29,7 @@ import { appendShellBgHint, hasShellBgHint, isFreshRunningCard, HINT_FRESH_MS_DE
 // 旧的「切 mihomo 节点」方案已下线：节点/DNS 级切换不改变源站看到的客户端 IP，
 // 额度照样被卡；且 Bun 启动时解析一次代理，运行期换不了隧道 ⇒ 出口只能**按轮换**。
 // 本模块只读状态（exit-proxy.json + 进程代理环境），供 /proxy 面板与状态页展示。
-import { readExitProxy, exitProxySummary, exitProxyPanel, isExitProxyActive, EXIT_PROXY_STATE_PATH } from "./exit-proxy"
+import { readExitProxy, exitProxySummary, exitProxyPanel, exitProxyBrief, isExitProxyActive, EXIT_PROXY_STATE_PATH } from "./exit-proxy"
 
 // R208（D7 根因）：宿主跨进程重启后，会话消息 seq 可能从 0 重计（实测 bot4 目标：新消息
 // seq=6..40、旧行 935..1035）⇒ 宿主 API 行序 ≠ 会话时序，新消息被排到旧消息之前。
@@ -6108,7 +6108,9 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       const quotaHit = /free usage limit|usage limit reached|connect a provider|switch models|\b429\b|rate[\s_-]?limit|provider\.quota|\bquota\b/i.test(
         `${eType} ${eText}`,
       )
-      const epLine = ep.includes("none") ? "" : `（本轮出口：${ep}）`
+      // R2520：与 CI 启动通知使用同一个 `exit proxy:` 格式（kind/upstream/local/egress/direct），
+      // 不再把本地代理写成“本轮出口”。
+      const epLine = ep.includes("none") ? "" : `（${ep}）`
       const quotaLine = quotaHit
         ? "\n↻ 免费额度/限流：本轮结束后由 workflow 起新 run，新 run 重挑出口代理（新出口 IP ⇒ 新额度）"
         : ""
@@ -7308,22 +7310,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       ].join("\n")
     }
     if (view === "proxy") {
-      const ep = readExitProxy()
       const env = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? ""
       return [
         head,
-        ep
-          ? `本轮出口：${htmlEsc(ep.scheme)}://${htmlEsc(ep.proxy)}`
-          : "本轮出口：无（直连 runner）",
-        ep?.egress_ip ? `出口 IP：${htmlEsc(ep.egress_ip)}（provider 看到的客户端 IP）` : "出口 IP：?",
-        ep?.direct_ip ? `直连 IP：${htmlEsc(ep.direct_ip)}` : "",
+        ...exitProxyBrief().map((l) => htmlEsc(l)),
         `生效中：${isExitProxyActive() ? "是" : "否"}${env ? "" : "（进程无代理变量）"}`,
         "",
         "出口代理**按轮换**：额度耗尽或代理失效 → 本轮结束 → 新一轮重新挑代理（新出口 IP）。",
         "♻️ 换出口 = 立刻结束本轮并由 workflow relay 起新 run。",
-      ]
-        .filter(Boolean)
-        .join("\n")
+      ].join("\n")
     }
     return [
       head,
@@ -8814,16 +8809,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (!arg || lower === "status") {
         const st = readExitProxy()
         const lines: string[] = [`[tg-bridge] 🌐 出口代理 · bot=${sanitizeLog(BOT_LABEL)}`]
-        if (st) {
-          lines.push(`本轮出口：${st.scheme}://${st.proxy}`)
-          lines.push(`出口 IP：${st.egress_ip || "?"}（provider 看到的客户端 IP）`)
-          lines.push(`直连 IP：${st.direct_ip || "?"}（额度被耗尽的那一个）`)
-          if (st.latency_s) lines.push(`探测时延：${st.latency_s}s`)
-          if (st.picked_at) lines.push(`挑选时间：${st.picked_at}`)
-          lines.push(`生效中：${isExitProxyActive() ? "是" : "否（状态与进程环境不一致）"}`)
-        } else {
-          lines.push("本轮出口：无（provider 流量走 runner 直连 IP）")
-        }
+        // R2520：与菜单页/CI 通知同一组字段（出口方式/本地代理/出口 IP/直连 IP）。
+        lines.push(...exitProxyBrief())
+        lines.push(`生效中：${isExitProxyActive() ? "是" : "否（状态与进程环境不一致）"}`)
+        if (st?.latency_s) lines.push(`探测时延：${st.latency_s}s`)
+        if (st?.picked_at) lines.push(`挑选时间：${st.picked_at}`)
         lines.push("")
         lines.push("出口按轮换：额度耗尽/代理失效 → 本轮结束 → workflow relay 起新 run → 新 run 重挑出口（新 IP ⇒ 新额度）。")
         lines.push("命令：/proxy next 换出口（重启本轮） · /proxy list 出口详情")
@@ -8899,14 +8889,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       lines.push(`· 后台：自动转后台=${bg.enabled ? "开" : "关"} · shell 自动后台=${bg.shellPromo !== false ? "开" : "关"} · 阈值=${Math.round(bg.promoteMs / 1000)}s`)
       lines.push("")
       lines.push("【出口代理】")
+      // R2520：统一字段，避免 /config 与 /proxy、CI 通知各用一套说法。
+      for (const l of exitProxyBrief()) lines.push(`· ${l}`)
+      lines.push(`· 生效中：${isExitProxyActive() ? "是" : "否"}`)
       const ep = readExitProxy()
-      if (ep) {
-        lines.push(`· 本轮出口：${ep.scheme}://${ep.proxy} · 生效中=${isExitProxyActive() ? "是" : "否"}`)
-        lines.push(`· 出口 IP：${ep.egress_ip || "?"} · 直连 IP：${ep.direct_ip || "?"}`)
-        if (ep.latency_s) lines.push(`· 时延：${ep.latency_s}s · 挑选：${ep.picked_at || "?"}`)
-      } else {
-        lines.push("· 本轮出口：无（直连）")
-      }
+      if (ep?.latency_s) lines.push(`· 时延：${ep.latency_s}s · 挑选：${ep.picked_at || "?"}`)
       lines.push(`· 状态文件：${EXIT_PROXY_STATE_PATH}`)
       lines.push("")
       lines.push("【Bot 注册表】")
