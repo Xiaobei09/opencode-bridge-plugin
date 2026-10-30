@@ -63,7 +63,7 @@ bash install.sh
 
 ## 运行注意（R617）
 
-- **网页搜索**：宿主 `websearch` 工具可能被取消（R619 实测仍返回 `Web search cancelled`）；fallback 用 `webfetch https://www.bing.com/search?q=<urlencoded>`（R619 实测 200/真实结果）。`lite.duckduckgo.com` 可能返回 202 challenge，不能作为唯一 fallback。桥本身不代理 websearch，不要把它当搜索 provider。
+- **网页搜索**：宿主 `websearch` 工具**可能可用也可能被取消**（R619 曾实测 `Web search cancelled`；R2517/2026-10-30 实测可用并返回真实结果）。被取消时 fallback 用 `webfetch https://www.bing.com/search?q=<urlencoded>`；`lite.duckduckgo.com` 可能返回 202 challenge，不能作为唯一 fallback。桥本身不代理 websearch，不要把它当搜索 provider。
 - **出站图片**：桥当前只有入站 `msg.photo` 分支，没有 `sendPhoto` / `sendDocument`；agent 生成的图不会自动发到 TG。若需要，显式文件发送是 backlog。
 - **菜单/乱码**：文本截断走 UTF-16 安全路径；根菜单 4×2，sys 页 9×2+返回（R619 移除与“我是谁”重叠的“属主记录”菜单按钮，`/owner` 命令仍保留）；回调完整性有 `tests/menu-root.test.ts`；R623 用 bun 1.4.3 跑 **194 tests 全 PASS**（新增 r2236 completed dead-turn 回归 2 条）。
 - **R619 脱敏修复**：`src/tg-bridge.ts` 的 inject-card 路径和 `src/tg-bridge-v2.ts` 的 `tg-chats${sfx}` 状态路径曾因脱敏把反引号改成双引号，导致语法错误/字面量路径；已修为模板字面量，并新增 `tests/sanitized-template.test.ts`。

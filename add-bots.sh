@@ -152,6 +152,18 @@ for b in new:
     token_owner[tok] = bid
     b["envFile"] = env
     b.setdefault("label", label)
+    # 注册表是索引，env 才是凭据内容：token 已写入 0600 env 文件，绝不能
+    # 再复制进 tg-bots.json（该文件会随 env 快照跨 run 持久化）。username
+    # 只用于生成 label，同样不落注册表。
+    b.pop("token", None)
+    b.pop("username", None)
+    # 与 /addbot 的 registerBot 保持同一默认：非主 Bot 不继承备用发送通道
+    # （否则同一回复可能经 fallback 再发一次），也不争抢队列置顶卡
+    # （同一 chat 里多个 owner 会互相 400 / 出现两条队列卡）。
+    # 输入里显式给了 false/true 的，尊重运营者意图。
+    if bid != "primary":
+        b.setdefault("noFallback", True)
+        b.setdefault("queueCardOwner", False)
     existing_ids = {str(x.get("id")) for x in existing}
     print(f"  {'+' if bid not in existing_ids else '='} {bid}  label={b['label']}  env={env}  token=set(len={len(tok)})")
 
