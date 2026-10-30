@@ -103,6 +103,34 @@ describe("根菜单整理", () => {
   })
 })
 
+// R2519：同一页内 callback_data 不得重复 —— 重复 = 两个入口改同一设置/同一动作，
+// 正是运营者反复说的「菜单混杂/重复功能」。callback_data 另有 Telegram 64 字节硬限制，
+// 超限会导致整张键盘 400 发不出去。
+describe("菜单无重复入口（R2519）", () => {
+  const VIEWS = ["root", "sess", "push", "loop", "bg", "proxy", "sys"]
+
+  it("每个视图内 callback_data 唯一", () => {
+    for (const view of VIEWS) {
+      const seen = new Map<string, string>()
+      for (const btn of flat(view)) {
+        const data = String((btn as Btn).callback_data ?? "")
+        if (!data) continue
+        expect(seen.has(data), `${view} 重复入口：${data}（${seen.get(data)} / ${btn.text}）`).toBe(false)
+        seen.set(data, btn.text)
+      }
+    }
+  })
+
+  it("所有 callback_data ≤ 64 字节（Telegram 硬限制）", () => {
+    for (const view of VIEWS) {
+      for (const btn of flat(view)) {
+        const data = String((btn as Btn).callback_data ?? "")
+        expect(Buffer.byteLength(data), `${view} 超长：${data}`).toBeLessThanOrEqual(64)
+      }
+    }
+  })
+})
+
 // R1908：菜单回调完整性 —— 防止未来新增按钮用了没有分派分支的前缀、或跳到
 // 不存在的视图（点下去只回"未知动作/无反应"）。这是对**真实菜单枚举**的钉死，
 // 而不是抄一份前缀白名单。

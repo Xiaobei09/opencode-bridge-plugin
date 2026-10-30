@@ -7329,7 +7329,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       head,
       `目标会话：<b>${htmlEsc(nm)}</b>`,
       "",
-      "按主题分页：会话 / 推送 / 循环 / 后台 / 代理 / 系统。",
+      "按主题分页：会话 / 推送 / 循环 / 后台 / 系统 / 出口代理；模型与思考深度为直接设置。",
     ].join("\n")
   }
   // 薄包装：把运行期状态喂给模块级的真定义（测试直接调 buildMenuKeyboard）
