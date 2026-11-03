@@ -1187,6 +1187,8 @@ export const readRecentUserTexts = async (sessionID: string, limit = 60): Promis
 // 跳过：合成注入（循环/恢复/自动恢复首行）、空文本；剥掉 TG 注入标记 `[TG …]` 头。
 export const LAST_USER_EXCERPT_MAX = 2000
 const SYNTHETIC_USER_PREFIXES = ["继续自动筛查循环", "上一轮自动筛查应答因可恢复错误中断", "自动恢复：上一轮 run"]
+export const isSyntheticUserText = (text: string): boolean =>
+  SYNTHETIC_USER_PREFIXES.some((prefix) => String(text ?? "").trimStart().startsWith(prefix))
 const TG_PREFIX_RE = /^\[TG [^\]]*\]\s*/
 export const lastRealUserExcerpt = (rows: unknown[]): string => {
   const list = Array.isArray(rows) ? rows : []

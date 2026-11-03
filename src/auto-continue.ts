@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage } from "@opencode-ai/sdk"
 import { statSync, readFileSync, writeFileSync, appendFileSync, renameSync, unlinkSync, readdirSync } from "node:fs"
-import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn, lastRealUserExcerpt } from "./_v2compat"
+import { readSessionUsage, resetSessionTokens, sessionTokens, compactUnavailableNow, readRecentUserTexts, fireInjectNotices, idleVerdict, preBootOrphan, preBootDeadTurn, lastRealUserExcerpt, isSyntheticUserText } from "./_v2compat"
 // 自动停止守卫的判据与配置读写放在共享模块（tg-bridge 的菜单也要用同一份，避免两边漂移）。
 import { readGuard, detectGuardSignals, guardVerdict, noteGuardTrip, loopPauseDecl, alreadyTripped, readGuardLastTrip } from "./loop-guard"
 // R1548：中止事件分类 + 遥测（ESC 停不住问题的修复判据所在，纯函数可单测）。
@@ -26,6 +26,23 @@ const ABORT_STALE_MS = 3 * 60 * 1000
 // R1910：本插件实例启动时刻。用于 classifyAbort 区分「进程重启打断的在途回合」（created
 // 早于本实例启动 → recover）与「用户按 ESC」（created 晚于启动 → pause）。见 abort-classify。
 const AC_BOOT_AT = Date.now()
+// R2521: whether this run produced at least one healthy assistant turn.
+let AC_ROUND_HAD_SUCCESS = false
+// R2535：egress watcher 在 **进程外** 结束本轮时也必须知道本轮是否出现过正常回合。
+// 旧行为固定写 round_success=false ⇒ 有 200 的轮次也被算作"无成功"，
+// 连续 3 轮后误停循环（运营者规则：只有连续 3 轮没有任何 200 才停）。
+// 这里在首个正常回合落一个标记，workflow 的 watcher_stop 分支据此判定。
+let AC_ROUND_SUCCESS_MARKED = false
+const markRoundHadSuccess = (): void => {
+  if (AC_ROUND_SUCCESS_MARKED) return
+  AC_ROUND_SUCCESS_MARKED = true
+  try {
+    const dir = String(process.env.RUNNER_TEMP ?? "")
+    if (dir) writeFileSync(`${dir}/round-had-success`, `${new Date().toISOString()}\n`)
+  } catch {
+    /* best-effort marker */
+  }
+}
 const STALL_SESSION_MSGS = 600
 
 // R208（D7 根因）：宿主跨进程重启后，会话消息 seq 可能从 0 重计（实测 bot4 目标：新消息
@@ -799,6 +816,49 @@ const textOf = (m: any): string => {
     .join("")
 }
 
+const rowRoleOf = (r: any): string => String(r?.info?.role ?? r?.role ?? r?.type ?? "")
+const rowPartsOf = (r: any): any[] =>
+  Array.isArray(r?.parts) ? r.parts : Array.isArray(r?.info?.parts) ? r.info.parts : []
+const rowTextOf = (r: any): string => {
+  const direct = typeof r?.text === "string" ? r.text : ""
+  if (direct) return direct
+  return rowPartsOf(r)
+    .filter((p: any) => p?.type === "text")
+    .map((p: any) => String(p?.text ?? ""))
+    .join("")
+}
+const rowHasNormalOutput = (r: any): boolean => {
+  if (r?.info?.error || r?.error) return false
+  if (rowTextOf(r).trim().length > 0) return true
+  return rowPartsOf(r).some((p: any) => String(p?.type ?? "") === "tool")
+}
+export const revertableSyntheticPrompt = (rows: unknown[]): string | null => {
+  const list = Array.isArray(rows) ? rows : []
+  let candidate: string | null = null
+  let assistantAfterCandidate = false
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r: any = list[i]
+    const role = rowRoleOf(r)
+    if (role === "assistant") {
+      if (rowHasNormalOutput(r)) {
+        if (candidate) break
+        return null
+      }
+      assistantAfterCandidate = true
+      continue
+    }
+    if (role === "user" || role === "synthetic") {
+      if (!isSyntheticUserText(rowTextOf(r))) break
+      const id = String(r?.info?.id ?? r?.id ?? "")
+      if (id) candidate = id
+      continue
+    }
+    if (role === "idle") continue
+    break
+  }
+  return candidate && assistantAfterCandidate ? candidate : null
+}
+
 const errorName = (m: AssistantMessage): string => {
   const e = m?.error as any
   if (!e || typeof e !== "object") return "unknown"
@@ -997,7 +1057,23 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
     errSeen = next.seen
     return { streak: next.streak, max: next.max, added: next.added }
   }
+  // R2535：恢复会话的尾部 assistant 可能在本次进程启动前就已完成；decided/skipState
+  // 都是进程内状态，重启后首次 eval 会重新看到它。只有本进程启动后 created/completed
+  // 的回合才算"本轮成功"，否则每轮启动都会凭上一轮旧消息误清零 streak。
+  const messageCompletedThisRun = (m: any): boolean => {
+    const t = m?.time ?? {}
+    const created = Number(t.created ?? 0)
+    const completed = Number(t.completed ?? 0)
+    return (created > 0 && created >= AC_BOOT_AT) || (completed > 0 && completed >= AC_BOOT_AT)
+  }
   const noteHealthyRound = (sessionID: string): void => {
+    AC_ROUND_HAD_SUCCESS = true
+    markRoundHadSuccess()
+    // R2536：egress watcher 需要一条**结构化**的健康信号。此前它把
+    // `injected round prompt` 当成健康回合，但那只是注入动作，不代表上游可用：
+    // 实测 03:24:32 注入后同一 upstream 立即 provider.free-limit，误报了
+    // "healthy turn after rotation"。这里只在真实正常回合写日志。
+    void log("info", `auto-continue: healthy turn (session=${sanitizeLog(sessionID)})`)
     const next = resetSessionErrorStreak({ bySession: errBySession, seen: errSeen }, sessionID)
     errBySession = next.bySession
     errSeen = next.seen
@@ -1442,7 +1518,18 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
   // 新实现：先给**其他** opencode 进程（客户端）发 SIGKILL ⇒ 外层 `timeout` 以 137 返回，
   // 而 iterate.yml 把 124/137 视为「时间预算到期=成功」⇒ 步骤 success ⇒ relay 自动重启；
   // 再自我 exit(0)。非生产（无 TG_BRIDGE_FORCE_SERVE=1）保持旧行为，绝不误杀。
-  const endRunNow = (): void => {
+  const endRunNow = (reason: string): void => {
+    try {
+      const dir = String(process.env.RUNNER_TEMP ?? "")
+      if (dir) {
+        writeFileSync(
+          `${dir}/round-end.json`,
+          JSON.stringify({ reason: reason.slice(0, 300), success: AC_ROUND_HAD_SUCCESS, at: new Date().toISOString() }),
+        )
+      }
+    } catch {
+      /* best-effort marker */
+    }
     if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
       try {
         for (const name of readdirSync("/proc")) {
@@ -1538,6 +1625,51 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
     return true
   }
 
+  const coalescedRecoveryAt = new Map<string, number>()
+  const coalesceFailedRecovery = async (sessionID: string): Promise<void> => {
+    const sdk = client.session as any
+    if (!sdk?.revert?.stage || !sdk?.revert?.commit) return
+    try {
+      const res = await withTimeout(client.session.messages({ path: { id: sessionID } }), "session.messages(coalesce)")
+      const rows = (res as any)?.data
+      if (!Array.isArray(rows)) return
+      sortRowsByCreatedTime(rows)
+      const target = revertableSyntheticPrompt(rows)
+      if (!target) return
+      const last = coalescedRecoveryAt.get(sessionID) ?? 0
+      if (Date.now() - last < 30_000) return
+      coalescedRecoveryAt.set(sessionID, Date.now())
+      const stage = async (): Promise<void> => {
+        try {
+          await withTimeout(sdk.revert.stage({ path: { id: sessionID }, body: { messageID: target, files: false } }), "session.revert.stage")
+        } catch {
+          await withTimeout(sdk.revert.stage({ params: { sessionID }, payload: { messageID: target, files: false } }), "session.revert.stage(v2)")
+        }
+      }
+      const commit = async (): Promise<void> => {
+        try {
+          await withTimeout(sdk.revert.commit({ path: { id: sessionID } }), "session.revert.commit")
+        } catch {
+          await withTimeout(sdk.revert.commit({ params: { sessionID } }), "session.revert.commit(v2)")
+        }
+      }
+      await stage()
+      await commit()
+      await log("info", `auto-continue: recover coalesced (session=${sanitizeLog(sessionID)}, reverted failed auto-injection at msg=${sanitizeLog(target)})`)
+    } catch (err) {
+      try {
+        await sdk.revert.clear({ path: { id: sessionID } })
+      } catch {
+        try {
+          await sdk.revert.clear({ params: { sessionID } })
+        } catch {
+          /* best-effort */
+        }
+      }
+      await log("warn", `auto-continue: recover coalesce skipped (session=${sanitizeLog(sessionID)}): ${sanitizeLog(err).slice(0, 160)}`)
+    }
+  }
+
   const inject = async (
     sessionID: string,
     msg: AssistantMessage,
@@ -1550,6 +1682,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       await log("info", `auto-continue: ${kind}-inject suppressed before claim (session=${sanitizeLog(sessionID)})`)
       return "stopped"
     }
+    if (kind === "recover") await coalesceFailedRecovery(sessionID)
     // 用户消息优先：Telegram 注入队列里还有待注入的用户消息时，本轮不抢跑。
     // 旧行为直连 promptAsync 绕过 pinQueue，导致循环轮次插到用户消息前面，
     // 用户消息反复延后（“注入时机不对 / 队列里有过早的消息”）。
@@ -1903,7 +2036,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               `auto-continue: dead-loop trip (pre-latch; session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(String(la?.id ?? ""))}, err=${errorName(la)}, idle=${Math.round((Date.now() - activity) / 1000)}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
             )
             if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-              endRunNow()
+              endRunNow(`dead-loop trip: ${errorName(la)} idle=${Math.round((Date.now() - activity) / 1000)}s`)
             }
             return
           }
@@ -2100,7 +2233,8 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
       if (!msg.error) {
         errStallSince.delete(sessionID)
         // R2512：正常 assistant 消息 = 该会话的一次成功回合，只打断**本会话**的连续错误链。
-        noteHealthyRound(sessionID)
+        // R2535：必须是本进程启动后创建/完成的回合；恢复的旧尾部不算本轮成功。
+        if (messageCompletedThisRun(msg)) noteHealthyRound(sessionID)
       } else if (stallExceeded(sessionID)) {
         // R210（运营者指令）：错误停滞 ≥ 阈值（5 连错的墙钟等价物）→ 结束本轮 CI。
         await log(
@@ -2108,7 +2242,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           `auto-continue: error stall ≥${Math.round(AC_ERR_STALL_MS / 60000)}min (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
         )
         if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-          endRunNow()
+          endRunNow(`error stall >= ${Math.round(AC_ERR_STALL_MS / 60000)}min (${errorName(msg)})`)
         }
         return
       }
@@ -2140,10 +2274,10 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             if (action === "end") {
               await log(
                 "info",
-                `auto-continue: error streak ${err.streak} -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run with a fresh exit proxy; ${exitProxySummary()})`,
+                `auto-continue: error streak ${err.streak} -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run; free quota may be account-wide, so a new exit proxy may not restore it; ${exitProxySummary()})`,
               )
               if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-                endRunNow()
+                endRunNow(`${err.streak} consecutive errors (last=${errorName(msg)}); free quota may be account-wide, so a new exit proxy may not restore it; relaying a fresh round`)
               }
               return
             }
@@ -2665,7 +2799,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
               "info",
               `auto-continue: SIM err-restart drill (run=${simRaw}, age=${simAgeS}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
             )
-            endRunNow()
+            endRunNow(`simulated error-restart drill (run=${simRaw})`)
             return
           }
         }
