@@ -6888,7 +6888,11 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
    * `/addbot <token> [chatId] [标签…]`
    * chatId 省略时用**当前会话**。
    */
-  const handleAddBot = async (args: string[], chatID: string): Promise<void> => {
+  const handleAddBot = async (
+    args: string[],
+    chatID: string,
+    opts?: { deferReload?: boolean },
+  ): Promise<void> => {
     const tokenForNewBot = (args[0] ?? "").trim()
     if (!tokenForNewBot) {
       await reply(
@@ -6982,7 +6986,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       await reply(chatID, `❌ 登记失败：${reg.desc ?? ""}`)
       return
     }
-    const entry = triggerBridgeReload()
+    // R2539: /addbots registers N bots in one message. Reloading per bot makes the
+    // entry re-import N times (generation churn, repeated plugin loads, and N
+    // overlapping polls). Batch mode defers and triggers exactly one reload.
+    const entry = opts?.deferReload ? "" : triggerBridgeReload()
     // ⚠️ 这一段**不含 token**：回执只给 id / @username / 后续步骤。
     await reply(
       chatID,
@@ -6990,7 +6997,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         `✅ 已登记 ${id}${v.username ? `（@${v.username}）` : ""}`,
         `· 标签：${label}`,
         `· 允许会话：${targetChat}`,
-        `· 已触发桥侧重载：${entry.split("/").pop() ?? entry}`,
+        `· ${opts?.deferReload ? "批次结束后统一触发桥侧重载" : `已触发桥侧重载：${entry.split("/").pop() ?? entry}`}`,
         "",
         "还差一步（我做不了）：请把这个新机器人拉进目标会话，它才能收到消息。",
         `若 1–2 分钟内没看到它的 plugin loaded (bot=${id}…，说明没起来，把 /info 发我看。`,
@@ -8540,9 +8547,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         n += 1
         // R2512：不传“批量 n”标签——handleAddBot 会用 getMe 的 @username 作为
         // 用户可见名（运营者要求“不要 bot 代号，直接用用户名”）。
-        await handleAddBot([tok, String(chatID)], chatID)
+        // R2539：deferReload ⇒ 整批只重载一次，避免 N 个 bot 触发 N 次插件重载。
+        await handleAddBot([tok, String(chatID)], chatID, { deferReload: true })
       }
-      await reply(chatID, `📦 批量登记结束：提交 ${tokens.length} 个 token（逐个结果见上）。`)
+      const batchEntry = triggerBridgeReload()
+      await reply(
+        chatID,
+        `📦 批量登记结束：提交 ${tokens.length} 个 token（逐个结果见上）。\n` +
+          `· 已统一触发桥侧重载：${batchEntry.split("/").pop() ?? batchEntry}`,
+      )
       return
     }
     if (text === "/addbot" || text.startsWith("/addbot ") || cmd === "addbot") {
