@@ -2593,6 +2593,12 @@ export const readInvalidBotIds = (): string[] => {
     return []
   }
 }
+/**
+ * R2542（D7）：状态卡面向运营者，离线 Bot 与菜单一样用注册表显示名，不暴露内部 id。
+ * 日志仍保留原始 id，便于与 tg-token-invalid.json / 注册表对照。
+ */
+export const invalidBotDisplayNames = (ids: string[] = readInvalidBotIds()): string =>
+  ids.map((id) => botDisplayName(id)).join(", ")
 /** 状态卡文案（纯函数，统一 htmlEsc 动态字段；调用方传原始未转义文本）。 */
 export const injectCardText = (o: {
   bot: string
@@ -4750,6 +4756,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   // 而循环期卡片以**编辑重渲染**为主（proto edit ok）、另有队列/命令回执/菜单等 7 类
   // 成功送达路径各自不刷新 → 基线长期停滞 → `proto silent 15/30/45min` 误报
   //（2026-10-06 实测，同时段日志里 send/edit 全部 ok）。源头一处修，未来新路径不再漏。
+  // R2543：回复锚点消息可能已被删除（桥重载后旧消息 id 失效、用户删消息）。
+  // Telegram 会返回 400 "message to be replied not found" —— 这不是正文/键盘
+  // 非法，**降级重发时必须丢掉 reply_to_message_id**，否则会拿同一个坏锚点
+  // 再失败一次，最终整条回执被丢（生产实证：`✅ 已登记 bot5` 回执丢失）。
+  const replyTargetMissing = (desc: string | undefined): boolean =>
+    /message to be replied not found/i.test(desc ?? "")
   const sendTextRaw = async (chatID: string, text: string, kb?: unknown, silent?: boolean, replyTo?: number): Promise<SendResult> => {
     // R1064：超长消息分段发送，不再 truncateAt 截断丢弃（用户报"消息发送不完整"）。
     if (text.length > PUSH_MAX) {
@@ -4788,6 +4800,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           await log("info", `sendMessage chunk ${i + 1}/${chunks.length} failed (chat=${sanitizeLog(chatID)}): ${status || "network-exception"} (will retry whole)`)
           return { r: "retry", status, desc: status || "network-exception" }
         }
+        if (status === 400 && i === 0 && replyTo && replyTargetMissing(r.desc)) {
+          // 先只丢锚点、保留正文/键盘重试：多数情况正文完全合法，只是被回复的消息没了。
+          const body2: Record<string, unknown> = { ...body }
+          delete body2.reply_to_message_id
+          const rr = await tgFetch("sendMessage", body2)
+          if (rr.ok) {
+            firstId = rr.id as number
+            await log("info", `sendMessage chunk ${i + 1}/${chunks.length} sent without stale reply anchor (chat=${sanitizeLog(chatID)})`)
+            continue
+          }
+          await log("warn", `sendMessage chunk ${i + 1}/${chunks.length} still failed without reply anchor (chat=${sanitizeLog(chatID)}): ${rr.status ?? 0} desc=${sanitizeLog(rr.desc ?? "").slice(0, 160)}`)
+        }
         if (status === 400 && chunks[i].includes("<")) {
           // R1888：**先解码、后剥标签**。text 是已 htmlEsc 的 HTML（随后按 parse_mode=HTML
           // 发出），所以旧顺序 `.replace(/<[^>]*>/g,"")` 打在转义文本上**是空操作** ——
@@ -4806,7 +4830,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           const fb: Record<string, unknown> = { chat_id: Number(chatID) || chatID, text: plain.slice(0, PUSH_MAX) }
           if (i === 0 && kb) fb.reply_markup = { inline_keyboard: kb }
           if (silent) fb.disable_notification = true
-          if (i === 0 && replyTo) fb.reply_to_message_id = replyTo
+          if (i === 0 && replyTo && !replyTargetMissing(r.desc)) fb.reply_to_message_id = replyTo
           const r2 = await tgFetch("sendMessage", fb)
           if (r2.ok) {
             // 同 R1806：r2.id 可能是 undefined，容错在调用点（protoDeliveryVerdict 判 degraded）。
@@ -4860,6 +4884,18 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       return { r: "retry", status, desc: status || "network-exception" }
     }
     if (status === 400) {
+      if (replyTo && replyTargetMissing(r.desc)) {
+        // 只丢坏锚点、保留原正文/键盘重试一次（正文本身通常没问题）。
+        const body2: Record<string, unknown> = { ...body }
+        delete body2.reply_to_message_id
+        const rr = await tgFetch("sendMessage", body2)
+        if (rr.ok) {
+          await log("info", `sendMessage sent without stale reply anchor (chat=${sanitizeLog(chatID)})`)
+          lastProtoSendAt = Date.now()
+          return { r: "sent", id: rr.id, fallback: rr.viaFallback }
+        }
+        await log("warn", `sendMessage still failed without reply anchor (chat=${sanitizeLog(chatID)}): ${rr.status ?? 0} desc=${sanitizeLog(rr.desc ?? "").slice(0, 160)}`)
+      }
       // HTML 非法（如标签错位）：剥标签纯文本降级重发一次，保证送达；键保留（400 错在正文不在 markup）。
       // R1888：同分段路径 —— **先解码、后剥标签**，否则剥标签打在转义文本上是空操作，
       // 解码又把标签还原成字面文本，降级反而把 `<b>`/`<pre>` 送到用户面前。
@@ -4870,7 +4906,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // R1880 的注释把"非分段路径"当基准来对齐，实则它自己也没带这两个字段：静默的
       // 思考/状态卡一旦 HTML 非法走降级就会**变响铃**，replyTo 也会丢。这里补上。
       if (silent) fb.disable_notification = true
-      if (replyTo) fb.reply_to_message_id = replyTo
+      if (replyTo && !replyTargetMissing(r.desc)) fb.reply_to_message_id = replyTo
       const r2 = await tgFetch("sendMessage", fb)
       if (r2.ok) {
         await log("info", `sendMessage plain-fallback ok (chat=${sanitizeLog(chatID)})`)
@@ -11377,7 +11413,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
         pinQueue: pinQueue.length,
         paused: pausedMode,
         refreshedAt: now,
-        offline: readInvalidBotIds().join(", "),
+        offline: invalidBotDisplayNames(),
       })
       await log(
         "info",
@@ -11460,7 +11496,7 @@ ${protoBlock(`⚠️ ${sessionTag(sess)}`, `${still}${bgHint}`)}`, undefined, fb
           pinQueue: pinQueue.length,
           paused: pausedMode,
           refreshedAt: Date.now(),
-          offline: readInvalidBotIds().join(", "),
+          offline: invalidBotDisplayNames(),
         })
         if (text === lastLiveCardText) return
         const r = await editTextRaw(chat, st.msgID, text, injectCardKeyboard(), false)
