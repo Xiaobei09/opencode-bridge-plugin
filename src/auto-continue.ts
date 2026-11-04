@@ -2255,7 +2255,7 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         if (isRateLimitError(errorName(msg), errorText(msg), errorStatus(msg))) {
           await log(
             "info",
-            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, ${exitProxySummary()}) -> counted toward the ${ERR_CONSECUTIVE_LIMIT}-consecutive-error limit`,
+            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, name=${sanitizeLog(errorName(msg))}, status=${errorStatus(msg)}, text=${sanitizeLog(errorText(msg)).slice(0, 240)}, ${exitProxySummary()}) -> counted toward the ${ERR_CONSECUTIVE_LIMIT}-consecutive-error limit`,
           )
         }
         // R942：全部会话连续 2 次错误 → END-ROUND-CI（exit 0）→ workflow relay 起新 run
