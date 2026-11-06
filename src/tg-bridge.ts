@@ -977,6 +977,11 @@ const PROTO_RETRY_MAX_ATTEMPTS = Number(process.env.TG_PROTO_RETRY_MAX_ATTEMPTS 
 // 0.6s —— 迟到窗口越小，期间新消息抢先送达造成的时钟倒挂越少。429 仍用原 5s 首拍（尊重
 // flood gate / retry_after）；后续退避不变（5s×attempt）。可用 TG_PROTO_RETRY_QUICK_MS 覆盖。
 const PROTO_RETRY_QUICK_MS = Number(process.env.TG_PROTO_RETRY_QUICK_MS ?? "") || 600
+// R2558（D3/D4，429 循环）：冷却期内新消息会全部堆进 protoRetry（实测一次积压 42 条）。
+// 冷却结束后若仍按 1.2s/条 集中补发（≈50/min），会立刻再次触发 Telegram 限流，
+// 形成 900s→174s→… 的循环。给同一 chat 的补发加最小间隔：默认 3.2s（≈18/min，
+// 低于群聊 20/min 上限），可用 TG_PROTO_RETRY_GAP_MS 调整。
+const PROTO_RETRY_GAP_MS = Math.max(1_000, Number(process.env.TG_PROTO_RETRY_GAP_MS ?? "") || 3_200)
 // R-2026-10-19 补发标注降噪（运营者实报「补发也太多了」）：catchup 补推常见迟到仅数秒~25s，
 // R276 的「（补发 …）」括注在高频补推时刷屏。现仅当迟到 ≥ LATE_NOTE_MIN_MS 才显示括注；
 // 阈值内补推**仍改写标题时钟**（发送顺序单调不变，R276 初衷保留）。可用 TG_LATE_NOTE_MIN_MS 调整。
@@ -4200,6 +4205,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     firstTryAt: number
     timer?: ReturnType<typeof setTimeout>
   }>()
+  // R2558：每个 chat 最近一次补发尝试的时间（含失败）。冷却结束/多次失败后，
+  // 队列里的条目会各自到期；仅靠“比谁更老”的屏障仍可能背靠背发送。用这个
+  // 时间戳把同 chat 的补发尝试强制拉开 PROTO_RETRY_GAP_MS，匀速排空积压。
+  const protoRetryLastAttempt = new Map<string, number>()
   const pollInstanceId = `pid-${process.pid}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`
   const ownsPollLease = (): boolean => {
     try {
@@ -5258,6 +5267,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         return
       }
       item.timer = undefined
+      // R2558：同 chat 最小补发间隔。冷却期积压的条目会在结束后同时到期，
+      // 只靠“最老优先”屏障仍可能背靠背触网（实测 42 条积压 → 二次 429）。
+      // 这里先按上次尝试时间匀速放行；失败尝试也计入，避免失败风暴。
+      const lastRetryAt = protoRetryLastAttempt.get(item.chatID) ?? 0
+      const retryWaitMs = PROTO_RETRY_GAP_MS - (Date.now() - lastRetryAt)
+      if (lastRetryAt > 0 && retryWaitMs > 0) {
+        item.timer = setTimeout(run, retryWaitMs)
+        return
+      }
       // R568：同 chat 串行重发——若还有 firstTryAt 更早的待重发项，先等它落地，
       // 避免后发先到造成倒挂（顺序由屏障保证，不再改写表面时间）。
       for (const [k2, it2] of protoRetry) {
@@ -5266,7 +5284,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         const olderTs = it2.firstTryAt || 0
         const myTs = item.firstTryAt || 0
         if (olderTs < myTs || (olderTs === myTs && k2 < key)) {
-          item.timer = setTimeout(run, 1200)
+          item.timer = setTimeout(run, PROTO_RETRY_GAP_MS)
           return
         }
       }
@@ -5274,6 +5292,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       // 同 chat 屏障保证；item.text 保持原文，标题时钟即生成时刻，不再改动表面时间。
       // R568：顺序由同 chat 屏障保证（更早的待重发未落地前本条不发、新消息也排队），
       // 因此保留**原始标题时钟**，不再改写表面时间。
+      // R2558：无论本次成功/失败都占用一个补发窗口，防止失败风暴。
+      protoRetryLastAttempt.set(item.chatID, Date.now())
       const sendText = item.text
       const r = item.editId > 0
         ? await editTextRaw(item.chatID, item.editId, sendText, item.kb, item.fallback)
