@@ -2274,10 +2274,10 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
             if (action === "end") {
               await log(
                 "info",
-                `auto-continue: error streak ${err.streak} -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run; free quota may be account-wide, so a new exit proxy may not restore it; ${exitProxySummary()})`,
+                `auto-continue: error streak ${err.streak} -> END-ROUND-CI (exit 0; workflow relay restarts a fresh run; anonymous free quota is egress-IP-scoped, so the new run re-selects egress for a fresh IP; ${exitProxySummary()})`,
               )
               if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-                endRunNow(`${err.streak} consecutive errors (last=${errorName(msg)}); free quota may be account-wide, so a new exit proxy may not restore it; relaying a fresh round`)
+                endRunNow(`${err.streak} consecutive errors (last=${errorName(msg)}); anonymous free quota is egress-IP-scoped; relaying a fresh round with a new egress`)
               }
               return
             }

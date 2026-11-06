@@ -9779,7 +9779,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     if (!amPollOwner(pollInstanceId, "tg")) {
       if (!pollLostLogged) {
         pollLostLogged = true
-        await log("error", "poll loop not owner, waiting (keep timer for takeover)")
+        // R2548：多实例/换代期间租约短暂非本实例是**正常交接**，不是故障。
+        // 旧实现记 error，roll 后 restore-monitor 的 "plugin lower-case ERROR == 0"
+        // 必挂；实测 05:17:01 记 error、05:18:01 即 took ownership，纯噪声。
+        await log("info", "poll loop not owner, waiting for lease takeover (normal handover)")
       }
       return
     }
