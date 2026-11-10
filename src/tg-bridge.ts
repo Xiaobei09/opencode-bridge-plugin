@@ -5,6 +5,9 @@ import { readSessionUsage, takeCompacted, readSessionListSync, compactUnavailabl
 // 自动停止守卫的判据与配置（auto-continue 侧用同一份，避免两侧判据漂移）。
 import { readGuard, writeGuard, readGuardLastTrip, parseGuardArg, DEFAULT_GUARD, type GuardCfg } from "./loop-guard"
 import { inboundSilenceVerdict } from "./inbound-silence"
+// 停机解除表（R2572 抽出）：tg-bridge 与 auto-continue 共用同一读/写实现。
+import { readHaltRelease, noteHaltRelease, noteHaltArm, loadHaltedInto } from "./halt-release"
+export { readHaltRelease, noteHaltRelease, noteHaltArm, loadHaltedInto } from "./halt-release"
 // 「转后台」：原生后台子代理的能力探测 + 整体自动配置（bg-mode 里有纯函数判据与单测）。
 import { readBg, writeBg, parseBgArg, bgApiShape, bgApiLabel, bgEnvOn, shouldAutoPromote, BG_ENV_VAR, bgThNext } from "./bg-mode"
 // TG 等宽表格绘制（纯函数 + 单测）：状态/诊断类消息用表格对齐（代码块强制等宽）。
@@ -1851,61 +1854,13 @@ const haltedSet = new Set<string>()
  * 直接测会污染跨文件共享状态（`haltedSet` 是模块级，10 个测试文件都 import 本模块）。
  * 体积不是问题：每 sid ≈ 40 B，即便 2000 条也仅 ≈ 80 KB。
  */
-// ── 跨实例停机解除表（R2500）────────────────────────────────────────────
-// R1107 的 halted 逐 Bot 落盘，但 auto-continue 的判据取**各 Bot 状态文件的并集**，
-// 而清除只清本 Bot 自己那份 → 一个 Bot 写入的停机，别的 Bot 永远清不掉。
-// 2026-10-18 实测实证：`tg-chats-bot4.json` 里 `halted=["ses_sanitized01…"]`（bot4 的
-// front 早已是别的会话），而本会话由 primary 驱动 → primary 侧「用户发新消息」与
-// 「/loop start」都只清 primary 自己的集合 → auto-continue 的并集永远含该 sid →
-// **该会话自动循环被永久卡死**（用户报「循环不能正常进行」）。
-// 解法：加一张**共享解除表**，谁解除谁登记；所有消费方（各 Bot 桥实例 + auto-continue）
-// 读 halted 时都按它做差集。
+// ── 跨实例停机解除表（R2500 引入；R2572 抽到 ./halt-release）──────────────
+// 读/写/解除/重新停机的契约集中在 halt-release.ts，tg-bridge 与 auto-continue
+// 共用同一实现（此前 auto-continue 自己解析同一文件，格式漂移时两边会得出
+// 不同结论）。doStop 里 `noteHaltArm` 必须先于 `savePersistedState`。
 //   * 解除（新消息投递成功 / /loop start）→ 写入 sid
 //   * 重新停机（doStop）→ **抹除** sid 条目（否则新停机会被旧解除吃掉，时序错乱）
-const HALT_RELEASE_PATH = `REDACTED_ROOT/.config/opencode/halt-release.json`
-export const readHaltRelease = (): Record<string, number> => {
-  try {
-    const j = JSON.parse(readFileSync(HALT_RELEASE_PATH, "utf8")) as unknown
-    return j && typeof j === "object" ? (j as Record<string, number>) : {}
-  } catch {
-    return {} // 无解除表 = 无解除（保持原语义）
-  }
-}
-const writeHaltRelease = (rel: Record<string, number>): void => {
-  try {
-    writeFileSync(HALT_RELEASE_PATH, JSON.stringify(rel), { mode: 0o600 })
-  } catch {
-    /* 只读/并发：忽略（这是尽力而为的跨实例通道） */
-  }
-}
-/** 登记「已解除停机」。各 Bot 实例与 auto-continue 都据此把 sid 从 halted 里剔除。 */
-export const noteHaltRelease = (sids: Iterable<string>): void => {
-  const rel = readHaltRelease()
-  let dirty = false
-  for (const s of sids) {
-    if (typeof s === "string" && s) {
-      rel[s] = Date.now()
-      dirty = true
-    }
-  }
-  if (dirty) writeHaltRelease(rel)
-}
-/** 重新停机：抹除解除表条目，保证「停机 → 解除 → 再停机」时序正确。 */
-export const noteHaltArm = (sid: string): void => {
-  const rel = readHaltRelease()
-  if (sid in rel) {
-    delete rel[sid]
-    writeHaltRelease(rel)
-  }
-}
 
-export const loadHaltedInto = (hl: unknown, into: Set<string>): number => {
-  if (!Array.isArray(hl)) return 0
-  const rel = readHaltRelease()
-  let n = 0
-  for (const s of hl) if (typeof s === "string" && s && !(s in rel)) { into.add(s); n++ }
-  return n
-}
 const pendingSelect = new Map<string, { gen: number; ids: string[]; ts: number }>()
 let selectGen = 0
 const lastInject = new Map<string, string>()

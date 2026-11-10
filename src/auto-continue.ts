@@ -10,6 +10,9 @@ import { classifyAbort, noteAbortEvent } from "./abort-classify"
 import { AUTO_INJECT_HINT } from "./turn-end-note"
 // R942：出口代理状态（只读）——本轮 provider 流量走哪个出口，坏了要靠换轮解决。
 import { exitProxySummary } from "./exit-proxy"
+// R2572：与 tg-bridge 共用停机解除表的读写实现（此前两边各解析一次同一文件，
+// 格式漂移会让「已取消」的会话在一边被恢复、另一边仍停着）。
+import { readHaltRelease } from "./halt-release"
 
 const MAX_TRACKED = 1024
 const RETRY_MS = [3000, 6000]
@@ -678,15 +681,8 @@ const haltedSessions = (): string[] => {
   // R2500：先读**共享解除表**。halted 是各 Bot 状态文件的并集，而清除只由「当前那个 Bot」
   // 写自己的文件 → 跨 Bot 的停机**永远解不掉**（2026-10-18 实测：bot4 文件里的本会话停机
   // 让 primary 的循环永久跳过）。解除表是唯一能跨实例生效的通道，故并集必须先减它。
-  let rel: Record<string, unknown> = {}
-  try {
-    const rj = JSON.parse(
-      readFileSync(`REDACTED_ROOT/.config/opencode/halt-release.json`, "utf8"),
-    ) as unknown
-    if (rj && typeof rj === "object") rel = rj as Record<string, unknown>
-  } catch {
-    /* 无解除表：保持原语义（该 sid 仍算停机） */
-  }
+  // R2572：统一走 halt-release.ts；文件缺失/损坏时返回 {}（停机保持有效）。
+  const rel = readHaltRelease()
   const out: string[] = []
   for (const p of [TG_STATE_PATH, ...EXTRA_TARGET_PATHS]) {
     try {
