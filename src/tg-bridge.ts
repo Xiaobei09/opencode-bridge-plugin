@@ -855,7 +855,7 @@ normalizePrivateConfigPerms()
 
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r2570-strip-retry-lastreply"
+const VERSION = "r2574-menu-dedupe-qpin-ttl"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
