@@ -98,12 +98,27 @@ if not isinstance(existing, list):
 
 # One Telegram token = one poller. Two registry entries with the same token cause
 # a permanent getUpdates 409 and the later bot silently receives nothing.
+def token_bot_id(tok):
+    head = tok.split(":", 1)[0].strip()
+    return head if head.isdigit() else ""
+
 token_owner = {}
+# R2571: the numeric token prefix is the Telegram bot id. A revoked token can be
+# replaced by a *different* secret for the same bot; two entries pointing at the
+# same bot id would still fight over getUpdates (bot4/bot5 share 8964069383).
+# Rule: an existing registry id may rotate its own token, but a NEW id must not
+# claim a bot id already owned by a different id.
+existing_ids = {str(x.get("id")) for x in existing}
+bot_owner = {}
 for b in existing:
     p = os.path.expanduser(str(b.get("envFile", "")))
     tok = env_value(p, "TG_BOT_TOKEN") if p else ""
+    bid = str(b.get("id", "?"))
     if tok:
-        token_owner.setdefault(tok, str(b.get("id", "?")))
+        token_owner.setdefault(tok, bid)
+        tid = token_bot_id(tok)
+        if tid:
+            bot_owner.setdefault(tid, set()).add(bid)
 
 for b in new:
     if not isinstance(b, dict):
@@ -130,26 +145,38 @@ for b in new:
     env = os.path.expanduser(env)
     if not os.path.isabs(env):
         env = os.path.abspath(env)
-    if token:
-        if len(token) < 20 or ":" not in token:
-            die(f"bot {bid}: token does not look like a BotFather token")
-        if not dry:
-            write_env(
-                env,
-                token,
-                str(b.get("allowedChat") or DEFAULT_ALLOWED),
-                str(b.get("pushChat") or DEFAULT_PUSH),
-                label,
-            )
-    if not os.path.isfile(env) and not (dry and token):
+    if token and (len(token) < 20 or ":" not in token):
+        die(f"bot {bid}: token does not look like a BotFather token")
+    if not os.path.isfile(env) and not token:
         die(f"bot {bid}: envFile not found: {env}")
-    tok = token if (dry and token) else env_value(env, "TG_BOT_TOKEN")
+    tok = token or env_value(env, "TG_BOT_TOKEN")
     if len(tok) < 20:
         die(f"bot {bid}: TG_BOT_TOKEN missing or too short in {env}")
     prev = token_owner.get(tok)
     if prev and prev != bid:
         die(f"bot {bid}: token is already used by {prev}; one token can only have one poller")
     token_owner[tok] = bid
+    tid = token_bot_id(tok)
+    if tid:
+        others = bot_owner.get(tid, set()) - {bid}
+        # 新 id 不得抢占别人已注册的 Telegram bot。已有 id 的换 token（轮换）
+        # 必须放行，否则吊销后无法在不动代码的情况下恢复。
+        if others and bid not in existing_ids:
+            die(
+                f"bot {bid}: token belongs to Telegram bot {tid}, already registered as "
+                f"{','.join(sorted(others))}; one Telegram bot can only have one poller "
+                f"(rotate the token under {sorted(others)[0]} instead)"
+            )
+        bot_owner.setdefault(tid, set()).add(bid)
+    # 校验全部通过才落盘 env：被拒绝的条目不能留下会被自动发现的 tg-bot*.env。
+    if token and not dry:
+        write_env(
+            env,
+            token,
+            str(b.get("allowedChat") or DEFAULT_ALLOWED),
+            str(b.get("pushChat") or DEFAULT_PUSH),
+            label,
+        )
     b["envFile"] = env
     b.setdefault("label", label)
     # 注册表是索引，env 才是凭据内容：token 已写入 0600 env 文件，绝不能

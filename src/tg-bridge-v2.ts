@@ -213,6 +213,17 @@ const readEnvFile = (path?: string): Record<string, string> => {
 }
 
 /**
+ * R2571（D4）：Telegram token 的数字前缀就是 bot id（`<bot_id>:<secret>`）。
+ * 同一个 bot 即使换了 token，前缀也不变；两个**不同** token 指向同一个 bot 时
+ * 只能有一个 getUpdates 轮询者，否则必然 409/重复回复。注册表里 bot4/bot5
+ * 就是这样一对（8964069383）。这里只用于去重，不记录完整 token。
+ */
+export const tokenBotId = (token: string): string => {
+  const m = /^(\d{5,}):/.exec(token.trim())
+  return m ? m[1] : ""
+}
+
+/**
  * 启动前 token 鉴权（R2507）。
  *
  * 只按形状校验会放过“格式合法但已被 Telegram 吊销”的 token：桥会启动，然后每 2 秒
@@ -252,6 +263,64 @@ const checkBotToken = async (token: string): Promise<TokenCheck> => {
     const out: TokenCheck = { ok: true, definitive: false, desc: String(err).slice(0, 120), at: now }
     tokenCheckCache.set(token, out)
     return out
+  }
+}
+
+/**
+ * R2571（D4）：同一个 Telegram bot（token 数字前缀）只能有一个 getUpdates 轮询者。
+ * 注册表里可能出现两条不同 token（secret 不同但前缀相同）指向同一个 bot —— bot4/bot5
+ * 实测共用 8964069383。这种情况不会触发上面的“同 token”去重，两个实例却仍会抢同一
+ * 份更新：409 风暴、随机丢消息、同一消息被两个实例各回一次。实例化前按 bot id 分组：
+ *   1) primary 永远保留（通知 / 修复入口，不能因为重复条目消失）；
+ *   2) 其余优先选 getMe 明确可用的 token —— 否则先出现的已吊销 token 会把可用 token 挤掉
+ *      （bot4 在 bot5 之前且已 401，按顺序保留就会让 bot5 下线）；
+ *   3) 都不确定时优先非“确定吊销”的条目（网络抖动仍有恢复希望），最后才按注册表顺序。
+ * 被丢弃的条目交给调用方写入 tg-token-invalid.json，状态卡仍能看到它离线及原因。
+ */
+export const selectPollerPerBotId = async (
+  list: BotSpec[],
+): Promise<{ kept: BotSpec[]; dropped: Array<{ id: string; desc: string }> }> => {
+  const order: string[] = []
+  const groups = new Map<string, BotSpec[]>()
+  for (const b of list) {
+    const bid = tokenBotId(readEnvFile(b.envFile).TG_BOT_TOKEN ?? "")
+    if (!bid) continue
+    const g = groups.get(bid)
+    if (g) g.push(b)
+    else {
+      groups.set(bid, [b])
+      order.push(bid)
+    }
+  }
+  const dropped = new Map<string, string>()
+  for (const bid of order) {
+    const g = groups.get(bid) ?? []
+    if (g.length < 2) continue
+    let winner = g.find((b) => b.id === "primary")
+    if (!winner) {
+      let fallback: BotSpec | undefined
+      for (const b of g) {
+        const chk = await checkBotToken(readEnvFile(b.envFile).TG_BOT_TOKEN ?? "")
+        // 只认“明确可用”；transient（断网/429）不参与优先级，避免一次抖动改变选择。
+        if (chk.ok && chk.definitive) {
+          winner = b
+          break
+        }
+        // 已知被吊销的条目最不该保留；transient 至少还有恢复可能，留作次选。
+        if (!fallback && !(chk.definitive && !chk.ok)) fallback = b
+      }
+      winner ??= fallback
+    }
+    winner ??= g[0]
+    for (const b of g) {
+      if (b === winner) continue
+      dropped.set(b.id, `duplicate bot id ${bid} (same Telegram bot as ${winner.id})`)
+      diag(`[tg-bridge-v2] duplicate bot id ${bid}: ${b.id} dropped (keeping ${winner.id})`)
+    }
+  }
+  return {
+    kept: list.filter((b) => !dropped.has(b.id)),
+    dropped: [...dropped].map(([id, desc]) => ({ id, desc })),
   }
 }
 
@@ -382,6 +451,15 @@ export default {
     // 否则顶层缓存的 bots 会让新增 bot 永远进不来。诊断行用于验证「确实读到了新注册表」。
     refreshRegistry()
     diag(`[tg-bridge-v2] setup: registry ids=${bots.map((b) => b.id).join(",")}`)
+    // R2571：同 bot id（token 前缀）只留一个轮询者；primary 与可用 token 优先。
+    // 必须在启动实例前完成 —— 一旦两个实例都开始 getUpdates，409/重复回复已经发生。
+    const selection = await selectPollerPerBotId(bots)
+    bots = selection.kept
+    const invalidBots: Array<{ id: string; desc: string }> = selection.dropped
+    diag(
+      `[tg-bridge-v2] setup: active ids=${bots.map((b) => b.id).join(",")}` +
+        (invalidBots.length ? ` dropped=${invalidBots.map((b) => b.id).join(",")}` : ""),
+    )
     // 从注册表移除/去重的 Bot，其旧实例不会因为“新 setup 没遍历到它”而自动停：
     // 它的代号键不在本轮重置范围内，poll 循环会继续跑并抢同一个 token（实测：bot4
     // 与 bot3 同 token 被去重后，bot4 旧实例仍在 getUpdates → bot3 永久 409）。
@@ -418,7 +496,6 @@ export default {
       // 保全失败绝不能挡住启动：日志是诊断材料，不是命脉
       diag(`[tg-bridge-v2] 启动日志保全失败（不影响启动）: ${String(e).slice(0, 140)}`)
     }
-    const invalidBots: Array<{ id: string; desc: string }> = []
     for (const [idx, bot] of bots.entries()) {
       diag(`[tg-bridge:${bot.id}] loading (idx=${idx})`)
       try {
