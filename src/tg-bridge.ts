@@ -6631,6 +6631,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
           // R2574（D7）：原先这里按条数去重（n === lastQPinCount → return），队列条数
           // 不变时连状态行都不重算 → 卡上「进行中/完成/错误」永久停在旧值。现在条数
           // 不变也按 TTL 重算状态；是否真正触网编辑交给文案比较 + 5s 节流。
+          const countChanged = n !== lastQPinCount
           if (
             !queuePinStatusDue({
               count: n,
@@ -6669,6 +6670,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             lastQPinCount = n
             lastQPinStatusAt = now
             lastQPinText = nextText
+            // 条数没变却发生了编辑 = 只有状态行变化（进行中→完成/错误）。留一行证据，
+            // 否则运营者只能看到卡变了、日志里却查不到是谁在刷新。
+            if (!countChanged) {
+              await log(
+                "info",
+                `queue pin status refreshed (mid=${mid}, n=${n}, status=${sanitizeLog(statusLine).slice(0, 24)})`,
+              )
+            }
           } else {
             const st = (r as { status?: number }).status ?? 0
             const transient = st === 0 || st === 429 || st >= 500
