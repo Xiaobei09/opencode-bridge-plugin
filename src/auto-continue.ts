@@ -878,6 +878,20 @@ const errorStatus = (m: AssistantMessage): number => {
   return Number(e.statusCode ?? e.status ?? e.data?.statusCode ?? e.data?.status ?? 0) || 0
 }
 
+// R2565: free-tier 429 carries retryAfterMs (observed ~12.9h, longer than the
+// operator's 6h blacklist). Log the provider's reset hint so egress-watch can
+// keep that egress out of selection until its quota actually resets.
+const errorRetryAfterSec = (m: AssistantMessage): number => {
+  const e = m?.error as any
+  if (!e || typeof e !== "object") return 0
+  const ms = Number(e.retryAfterMs ?? e.data?.retryAfterMs ?? 0)
+  if (Number.isFinite(ms) && ms > 0) return Math.ceil(ms / 1000)
+  const h = e.response?.headers ?? e.data?.response?.headers ?? e.headers ?? {}
+  const raw = Number(h["retry-after"] ?? h["Retry-After"] ?? 0)
+  if (Number.isFinite(raw) && raw > 0) return Math.ceil(raw)
+  return 0
+}
+
 const isAbortSignal = (e: any): boolean => {
   if (!e) return false
   if (typeof e === "string") return /aborted|interrupt|step interrupted/i.test(e)
@@ -1060,11 +1074,13 @@ export const AutoContinuePlugin: Plugin = async ({ client }) => {
   // R2535：恢复会话的尾部 assistant 可能在本次进程启动前就已完成；decided/skipState
   // 都是进程内状态，重启后首次 eval 会重新看到它。只有本进程启动后 created/completed
   // 的回合才算"本轮成功"，否则每轮启动都会凭上一轮旧消息误清零 streak。
+  // R2566（运营者最高优先级：200 预检后仍普遍 429）：只看 `time.created`。
+  // `time.completed` 可能在恢复/结算时被刷新成启动时刻，旧错误就会伪装成本轮
+  // 新错误，把健康出口误判成 200→quota。created 缺失时保守返回 false。
   const messageCompletedThisRun = (m: any): boolean => {
     const t = m?.time ?? {}
     const created = Number(t.created ?? 0)
-    const completed = Number(t.completed ?? 0)
-    return (created > 0 && created >= AC_BOOT_AT) || (completed > 0 && completed >= AC_BOOT_AT)
+    return created > 0 && created >= AC_BOOT_AT
   }
   const noteHealthyRound = (sessionID: string): void => {
     AC_ROUND_HAD_SUCCESS = true
@@ -2026,19 +2042,30 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
           errStallSince.delete(sessionID)
         } else if ((lastAssistant!.info as any)?.error) {
           const la: any = lastAssistant!.info
-          const t = la?.time ?? {}
-          const activity = Math.max(Number(t.updated ?? 0), Number(t.completed ?? 0), Number(t.created ?? 0))
-          if (errStallSince.get(sessionID) === undefined) errStallSince.set(sessionID, Date.now())
-          const quiet = activity > 0 && Date.now() - activity >= ROUND_SETTLE_MS
-          if (quiet && stallExceeded(sessionID) && (await injectAllowed(sessionID, la, "stall-trip"))) {
-            await log(
-              "info",
-              `auto-continue: dead-loop trip (pre-latch; session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(String(la?.id ?? ""))}, err=${errorName(la)}, idle=${Math.round((Date.now() - activity) / 1000)}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
-            )
-            if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
-              endRunNow(`dead-loop trip: ${errorName(la)} idle=${Math.round((Date.now() - activity) / 1000)}s`)
+          // R2568 (operator: "怎么一直死循环？"): a restored pre-run error used to
+          // satisfy `quiet` immediately because its created/updated/completed was
+          // ~24h old. After AC_ERR_STALL_MS the pre-latch trip ended every fresh
+          // run before it could do any work (observed: 8 runs relayed every
+          // ~7.8min with `dead-loop trip ... idle=87241s`). Only an error created
+          // by this process may trip; a restored one is handled by the normal
+          // preboot recovery path.
+          if (!messageCompletedThisRun(la)) {
+            errStallSince.delete(sessionID)
+          } else {
+            const t = la?.time ?? {}
+            const activity = Math.max(Number(t.updated ?? 0), Number(t.completed ?? 0), Number(t.created ?? 0))
+            if (errStallSince.get(sessionID) === undefined) errStallSince.set(sessionID, Date.now())
+            const quiet = activity > 0 && Date.now() - activity >= ROUND_SETTLE_MS
+            if (quiet && stallExceeded(sessionID) && (await injectAllowed(sessionID, la, "stall-trip"))) {
+              await log(
+                "info",
+                `auto-continue: dead-loop trip (pre-latch; session=${sanitizeLog(sessionID)}, msg=${sanitizeLog(String(la?.id ?? ""))}, err=${errorName(la)}, idle=${Math.round((Date.now() - activity) / 1000)}s) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
+              )
+              if (String(process.env.TG_BRIDGE_FORCE_SERVE ?? "") === "1") {
+                endRunNow(`dead-loop trip: ${errorName(la)} idle=${Math.round((Date.now() - activity) / 1000)}s`)
+              }
+              return
             }
-            return
           }
         } else {
           errStallSince.delete(sessionID)
@@ -2235,8 +2262,11 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         // R2512：正常 assistant 消息 = 该会话的一次成功回合，只打断**本会话**的连续错误链。
         // R2535：必须是本进程启动后创建/完成的回合；恢复的旧尾部不算本轮成功。
         if (messageCompletedThisRun(msg)) noteHealthyRound(sessionID)
-      } else if (stallExceeded(sessionID)) {
+      } else if (messageCompletedThisRun(msg) && stallExceeded(sessionID)) {
         // R210（运营者指令）：错误停滞 ≥ 阈值（5 连错的墙钟等价物）→ 结束本轮 CI。
+        // R2568：恢复的旧错误（created < 本进程 boot）不得触发；否则每个新 run
+        // 都会在 5 分钟后凭 24h 前的 aborted 尾条自我结束，形成 ~8 分钟一次的
+        // “死循环”接力（实测 8 个 run）。旧错误交给 preboot 恢复路径处理。
         await log(
           "info",
           `auto-continue: error stall ≥${Math.round(AC_ERR_STALL_MS / 60000)}min (session=${sanitizeLog(sessionID)}) -> END-ROUND-CI (exit 0; workflow relay restarts CI)`,
@@ -2252,16 +2282,40 @@ const CLAIM_PATH = "/tmp/opencode/round-claims.json"
         // Bun 启动时解析一次代理，运行期改 env 也不换隧道（实测）。
         // 429/配额类错误的正解是**换一轮**（新代理 ⇒ 新出口 IP ⇒ 新额度），
         // 这里只做记录，处置交给下面的"连续错误 → END-ROUND-CI"。
+        // R2564（运营者最高优先级：zengate 200 后仍 429）：恢复的旧会话尾条也会
+        // 走这里。旧实现把“上一轮遗留的 quota 错误”按**当前时刻**打印成
+        // `provider.free-limit` 日志；egress-watch 只认日志墙钟时间，于是在新 run
+        // 选中健康出口后 ~60s 内误判“200→quota”，停轮并把健康出口拉黑 6h。
+        // 实测 2026-11-07 11:19/11:20/11:22 三个不同 relay 全部 64s 误杀，TUI
+        // 日志里 provider.free-limit=0 且无健康回合。现在日志带 this_run/msg_at，
+        // watcher 双重过滤；恢复的旧错误不计入连续失败。
+        const quotaThisRun = messageCompletedThisRun(msg)
+        const quotaMsgAt = Number((msg as any)?.time?.created ?? 0)
+        const quotaMsgAtIso = quotaMsgAt > 0 ? new Date(quotaMsgAt).toISOString() : "?"
+        const quotaRetryAfterSec = errorRetryAfterSec(msg)
         if (isRateLimitError(errorName(msg), errorText(msg), errorStatus(msg))) {
+          const quotaCreated = Number((msg as any)?.time?.created ?? 0)
+          const quotaCompleted = Number((msg as any)?.time?.completed ?? 0)
+          // R2566: `src=auto-continue` is the watcher's positive marker. Only
+          // this line may trigger the 200->quota stop; generic eval/tg-bridge
+          // lines that merely mention the error name are not evidence.
           await log(
             "info",
-            `auto-continue: rate-limit/quota error (session=${sanitizeLog(sessionID)}, name=${sanitizeLog(errorName(msg))}, status=${errorStatus(msg)}, text=${sanitizeLog(errorText(msg)).slice(0, 240)}, ${exitProxySummary()}) -> counted toward the ${ERR_CONSECUTIVE_LIMIT}-consecutive-error limit`,
+            `auto-continue: rate-limit/quota error (src=auto-continue, session=${sanitizeLog(sessionID)}, this_run=${quotaThisRun}, msg_at=${quotaMsgAtIso}, msg_created=${quotaCreated || "?"}, msg_completed=${quotaCompleted || "?"}, boot_at=${new Date(AC_BOOT_AT).toISOString()}, retry_after_s=${quotaRetryAfterSec || "?"}, name=${sanitizeLog(errorName(msg))}, status=${errorStatus(msg)}, text=${sanitizeLog(errorText(msg)).slice(0, 240)}, ${exitProxySummary()}) -> ${quotaThisRun ? `counted toward the ${ERR_CONSECUTIVE_LIMIT}-consecutive-error limit` : "restored pre-run error; watcher must ignore"}`,
           )
         }
         // R942：全部会话连续 2 次错误 → END-ROUND-CI（exit 0）→ workflow relay 起新 run
         // → 新 run 重新挑出口代理（新出口 IP ⇒ 不再撞同一个额度）。
         // ESC/abort 是用户主动中断，不进入错误预算。
-        if (!isAbortSignal(msg.error)) {
+        // R2564：恢复的旧错误也不进入本轮的连续失败计数（否则 3 次旧错误即可
+        // 结束一个尚未真正失败的 run）。
+        if (!isAbortSignal(msg.error) && !quotaThisRun) {
+          await log(
+            "info",
+            `auto-continue: restored pre-run error not counted (this_run=false, msg_at=${quotaMsgAtIso}, session=${sanitizeLog(sessionID)}, name=${sanitizeLog(errorName(msg))}, ${exitProxySummary()})`,
+          )
+        }
+        if (!isAbortSignal(msg.error) && quotaThisRun) {
           const err = noteErrorStreak(sessionID, msg.id)
           if (err.added) {
             // R2512：按本会话 streak 决策；max 只用于日志（跨会话最高值）。

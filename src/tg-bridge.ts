@@ -852,7 +852,7 @@ normalizePrivateConfigPerms()
 
 const STRIP_RUN_INTERVAL_MS = 10 * 60_000
 const COMMAND_CACHE_MAX_AGE_MS = 6 * 60 * 60_000
-const VERSION = "r1121-flood-cross-notice"
+const VERSION = "r2570-strip-retry-lastreply"
 
 // ---------------------------------------------------------------------------
 // 每实例配置（多 Bot 隔离的核心）
@@ -908,6 +908,12 @@ let OWNER_PATH = "/tmp/opencode/tg-poll-owner.json"
 let COMMAND_CACHE_PATH = "/tmp/opencode/tg-command-cache.json"
 let STRIP_STATE_PATH = "/tmp/opencode/strip-run.json"
 let STRIPFAIL_PATH = "/tmp/opencode/stripfail.json"
+// R2570（D3）：backfillStrip 只在本实例启动 5s 后跑一次，扫描前就写入了 10 分钟
+// 冷却时间戳。若这一跑撞上 429 限流，旧实现会 `break` 后把时间戳留在原地 ——
+// 本进程不再重试（热重载后的新实例也会因 <10 分钟冷却直接跳过）⇒ 旧卡片的 ⏹
+// 按钮可以一直清不掉（用户实报「有部分停止按钮没有删除」）。defer 时回收时间戳
+// 并在限流结束后重试，冷却才不会吞掉这一次。
+let stripRetryTimer: ReturnType<typeof setTimeout> | undefined
 let TAP_PATH = "/tmp/opencode/v2plugin.log"
 let GEN_KEY = "__tgBridgeGen"
 let TOKEN = ""
@@ -2538,6 +2544,29 @@ const isHarnessNoise = (s: unknown): boolean => {
 }
 
 const htmlEsc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+/**
+ * R2561（D7）：宿主的 `outcome` 是英文枚举（succeeded/failed/cancelled…），而状态卡与
+ * `/info` 是中文界面；旧实现直接拼接，运营者看到「状态=succeeded（空闲 1m）」。
+ * 统一映射为中文；不认识的取值原样返回（宁可显示原值，也不吞掉诊断信息）。
+ */
+export const outcomeLabel = (raw: unknown): string => {
+  const s = String(raw ?? "").trim()
+  if (!s) return "未知"
+  const map: Record<string, string> = {
+    succeeded: "完成",
+    success: "完成",
+    failed: "失败",
+    failure: "失败",
+    cancelled: "已取消",
+    canceled: "已取消",
+    interrupted: "已中断",
+    running: "运行中",
+    busy: "运行中",
+    idle: "空闲",
+    unknown: "未知",
+  }
+  return map[s.toLowerCase()] ?? s
+}
 
 // ---------------------------------------------------------------------------
 // R2228 循环注入状态卡（用户需求演进：逐条提醒刷屏 → 单张可编辑状态卡 + 置顶）。
@@ -4239,7 +4268,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     const mins = act ? Math.max(0, Math.round((Date.now() - act) / 60000)) : -1
     const idleMin = info?.idle ? Math.max(0, Math.round((Date.now() - info.idle) / 60000)) : -1
     const running = mins >= 0 && mins <= 2
-    return running ? "运行中" : `${info?.outcome ?? "未知"}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
+    return running ? "运行中" : `${outcomeLabel(info?.outcome)}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
   }
   // R1884：上次记进日志的条数（-1 = 还没记过）。仅用于"变化才记"，避免刷屏。
   let lastLoggedSessionCount = -1
@@ -5397,6 +5426,27 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       writeFileSync(STRIP_STATE_PATH, JSON.stringify({ owner: pollInstanceId, ts: now }), { encoding: "utf8", mode: PRIVATE_FILE_MODE })
       const claimed = JSON.parse(readFileSync(STRIP_STATE_PATH, "utf8")) as any
       if (claimed?.owner !== pollInstanceId) return
+      // R2570：本次扫描没跑完（429/5xx/网络层）时不能保留"刚扫过"的冷却时间戳，
+      // 否则同一进程内的热重载/后续调用会跳过、旧按钮继续残留。归零让下一次
+      // 调用立即可重试；本进程若还活着，则在限流闸结束后再补一次。
+      const deferStrip = (why: string): void => {
+        try {
+          writeFileSync(STRIP_STATE_PATH, JSON.stringify({ owner: pollInstanceId, ts: 0 }), {
+            encoding: "utf8",
+            mode: PRIVATE_FILE_MODE,
+          })
+        } catch {
+          /* best-effort */
+        }
+        if (stripRetryTimer) return
+        const delay = Math.max(60_000, Math.max(floodUntil, fallbackUntil) - Date.now() + 5_000)
+        stripRetryTimer = setTimeout(() => {
+          stripRetryTimer = undefined
+          if (G[GEN_KEY] !== myGen) return
+          void backfillStrip()
+        }, delay)
+        void log("info", `backfill strip retry scheduled in ${Math.ceil(delay / 1000)}s (${why})`)
+      }
       const bySess = new Map<string, number>()
       const isStopKey = (k: string): boolean => k.includes(":message:") || k.includes(":ask:") || k.includes(":thinking:") || k.includes(":tool:") || k.includes(":status")
       for (const [k, v] of [...protoMap.entries()]) {
@@ -5422,6 +5472,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         // 旧键清理是低优先级；限流闸开启时立即让路给实时回复/工具消息。
         if (Date.now() < floodUntil) {
           await log("info", "backfill strip deferred (flood gate active)")
+          deferStrip("flood gate active")
           break
         }
         if (G[GEN_KEY] !== myGen || !ownsPollLease()) return
@@ -5468,11 +5519,13 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
                 // R434（R433 backlog 微项）：瞬时 defer 不该用 error（语义=闸内延迟、非放弃；
                 // error 只留给确定性失败/放弃），与 R431 retry 降噪同旨。
                 await log("warn", `backfill strip deferred (mid=${v.id}, status=429; flood gate, 瞬时失败不计入放弃)`)
+                deferStrip(`mid=${v.id} status=429`)
                 break
               }
               const kind = status === 0 ? `network/no-response${r.desc ? ` (${r.desc})` : ""}` : `status=${status}`
               const why = status === 0 ? "网络层失败可重试" : "服务端瞬时失败可重试"
               await log("warn", `backfill strip failed (mid=${v.id}, ${kind}; ${why}，不计入放弃)`)
+              deferStrip(`mid=${v.id} ${kind}`)
               continue
             }
             // 到此为**非瞬时**且非 400/403（例如 404 message not found）：确定性失败，累计用于放弃。
@@ -5626,6 +5679,12 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         protoMap.set(key, { id: prev.id, text, fallback: r.fallback === true || prev.fallback === true })
         noteHash()
         savePersistedState()
+        // R2570（D3）：编辑路径此前不更新 lastReply —— 状态卡在回合结束时被
+        // `onIdle` 重新编辑并带上 ⏹，但 lastReply 仍指向更早的回复卡；30s 的
+        // `stripStopOnCompletedTurn` 清掉回复卡后，状态卡上的 ⏹ 就永久残留
+        //（用户实报「有部分停止按钮没有删除」）。与发送路径同口径登记最新卡，
+        // 同一 id 的流式编辑不会额外触网，只有跨卡时才会 demote 旧卡。
+        if (kb && r.fallback !== true) await trackReplyButtons(sess, chatID, prev.id, kb, key)
         await log("info", `proto edit ok (${sanitizeLog(key)}) msg=${prev.id} len=${text.length} h=${h ? h.slice(0, 8) : "-"}`)
       } else {
         rollback()
@@ -7341,9 +7400,15 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       ].join("\n")
     }
     if (view === "loop") {
+      // R2561（D7）：菜单与状态卡口径一致——停止时把触发方/原因也显示出来，
+      // 否则运营者只知道"停了"，还得去翻状态卡或 loop-ctl.json 才知道为什么停。
+      const gate = loopGateInfo()
+      const gateText = gate.stopped
+        ? `⏹ 自动循环：本 Bot 已停止${gate.by ? `（by:${htmlEsc(gate.by)}）` : ""}${gate.reason ? ` · ${htmlEsc(gate.reason.slice(0, 48))}` : ""}（点“继续循环”恢复；其它 Bot 不受影响）`
+        : "🔁 自动循环：本 Bot 运行中（ESC 或点“停止循环”仅停本 Bot）"
       return [
         head,
-        loopStopped() ? "⏹ 自动循环：本 Bot 已停止（点“继续循环”恢复；其它 Bot 不受影响）" : "🔁 自动循环：本 Bot 运行中（ESC 或点“停止循环”仅停本 Bot）",
+        gateText,
         `会话：<b>${htmlEsc(nm)}</b>${t ? ` · 状态 ${htmlEsc(sessionStateLabel(t))}` : ""} · ${pausedMode ? "推送暂停" : "推送中"} · 注入队列 ${pinQueue.length} · 外发队列 ${outQueue.length}`,
         "",
         "只放循环/回合/守卫。后台相关在「后台」页。",
@@ -8852,7 +8917,7 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             const running = mins >= 0 && mins <= 2
             const state = running
               ? "运行中"
-              : `${info?.outcome ?? "未知"}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
+              : `${outcomeLabel(info?.outcome)}${idleMin >= 0 ? `（空闲 ${idleMin}m）` : ""}`
             lines.push(
               `· ${tag} ${sid.slice(0, 12)}${mine} 状态=${state} 循环=${sticky.has(sid) ? "是" : "未登记"}` +
                 ` 最近轮次=${rnd ?? "?"} 活动=${mins >= 0 ? `${mins} 分钟前` : "未知"}`,
