@@ -1483,6 +1483,12 @@ const queuePinHist: number[] = []
 const queuePinOn = new Map<string, boolean>()
 let lastQPinCount = -1
 let lastQPinEdit = 0
+// R2574（D7）：置顶队列卡的去重键从「条数」改为「完整文案」。
+// 旧实现只比条数，队列条数不变时状态行（进行中/完成/错误）永远不重算 → 卡面长期停在旧状态。
+let lastQPinText = ""
+let lastQPinStatusAt = 0
+// 条数不变时也至少每 30s 重算一次状态行；refreshQueuePin 自带 3s 工作间隔与 5s 编辑节流。
+const QPIN_STATUS_TTL_MS = 30_000
 // 长轮询超时的日志节流（超时常态，不该每秒刷一条）
 let pollTimeoutLogAt = 0
 // R1740：入站静默判据的状态。放模块级（不是 pollOnce 闭包内）—— 闭包内的变量
@@ -2669,6 +2675,51 @@ export const sanitizeAiTitle = (raw: unknown, max = 48): string => {
 export const injectCardKeyboard = (): unknown[][] => [
   [{ text: "✍️ AI 改标题", callback_data: "title:ai" }],
 ]
+
+/**
+ * R2574（D7）：置顶队列卡的文案（纯函数）。
+ * 状态行 + 两条队列计数由同一函数生成，edit/create 两条路径不再各写一份字面量。
+ */
+export const queuePinCardText = (statusLine: string, nPin: number, nOut: number): string =>
+  `${statusLine}\n📥 队列中：共 ${nPin + nOut} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`
+
+/**
+ * R2574（D7）：置顶队列卡是否需要重算状态行。
+ *
+ * 旧实现只在 `n !== lastQPinCount` 时重算 → 队列条数不变时，会话从「进行中」
+ * 变成「完成/错误」也不会写回卡面（用户看到状态卡停在旧状态）。现在：
+ *   ① 条数变化立即重算；
+ *   ② 条数不变时也至少每 ttlMs 重算一次（由 30s tick 驱动）。
+ */
+export const queuePinStatusDue = (o: {
+  count: number
+  lastCount: number
+  now: number
+  lastStatusAt: number
+  ttlMs: number
+}): boolean => {
+  if (o.count !== o.lastCount) return true
+  if (!(o.lastStatusAt > 0)) return true
+  return o.now - o.lastStatusAt >= Math.max(0, o.ttlMs)
+}
+
+/**
+ * R2574（D7）：编辑置顶队列卡的决策。
+ *   - 文案没变 → skip（Telegram 也不接受同文编辑，省一次 API）；
+ *   - 距上次编辑不足 minEditMs → defer（调用方置 qpinDirty，3s 后重试，绝不丢更新）；
+ *   - 否则 edit。
+ */
+export const queuePinEditDecision = (o: {
+  text: string
+  lastText: string
+  now: number
+  lastEditAt: number
+  minEditMs: number
+}): "skip" | "defer" | "edit" => {
+  if (o.text === o.lastText) return "skip"
+  if (o.lastEditAt > 0 && o.now - o.lastEditAt < Math.max(0, o.minEditMs)) return "defer"
+  return "edit"
+}
 
 // 纯函数：HTML 消息卡片渲染（可单测，2026-09-29 抽出）。
 // 约定 = **调用方必须传未转义的原始文本**（title 与 body 都别预转义），本函数统一 htmlEsc 一次。
@@ -6441,6 +6492,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
       if (cleared) queuePinHist.splice(i, 1)
     }
     lastQPinCount = 0
+    lastQPinText = ""
+    lastQPinStatusAt = 0
     savePersistedState()
     await log("info", `queue pin cleared (${reason}, msgs=${ids.length}, deleted)`)
     return true
@@ -6574,19 +6627,48 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
               await log("error", `queue pin FAILED (mid=${mid}): ${sanitizeLog(err).slice(0, 120)} — 下一轮重试`)
             }
           }
-          if (n === lastQPinCount) return
           const now = Date.now()
-          // ⚠️ 与 R988 的限流分支同一类缺陷：5 秒节流早退不置 qpinDirty → 计数更新被丢弃
-          // （lastQPinCount 只在成功时写，故下次刷新能自愈；没有下次刷新就一直停在旧数字）。
-          if (now - lastQPinEdit < 5000) {
+          // R2574（D7）：原先这里按条数去重（n === lastQPinCount → return），队列条数
+          // 不变时连状态行都不重算 → 卡上「进行中/完成/错误」永久停在旧值。现在条数
+          // 不变也按 TTL 重算状态；是否真正触网编辑交给文案比较 + 5s 节流。
+          if (
+            !queuePinStatusDue({
+              count: n,
+              lastCount: lastQPinCount,
+              now,
+              lastStatusAt: lastQPinStatusAt,
+              ttlMs: QPIN_STATUS_TTL_MS,
+            })
+          )
+            return
+          const statusLine = await qpinStatusFor((fixedTarget ?? frontSessionID ?? persistedFront) ?? "")
+          const nextText = queuePinCardText(statusLine, nPin, nOut)
+          const decision = queuePinEditDecision({
+            text: nextText,
+            lastText: lastQPinText,
+            now,
+            lastEditAt: lastQPinEdit,
+            minEditMs: 5000,
+          })
+          if (decision === "skip") {
+            // 文案一字不差：屏上已是最新，记录状态采样时间即可（避免每拍重复算）。
+            lastQPinCount = n
+            lastQPinStatusAt = now
+            return
+          }
+          // ⚠️ 与 R988 的限流分支同一类缺陷：节流早退不置 qpinDirty → 更新被丢弃
+          // （lastQPinText/lastQPinStatusAt 只在成功时写，故下次刷新能自愈；没有下次刷新
+          // 就一直停在旧状态）。defer 必须显式安排下一拍。
+          if (decision === "defer") {
             qpinDirty = true
             return
           }
-          const statusLine = await qpinStatusFor((fixedTarget ?? frontSessionID ?? persistedFront) ?? "")
-          const r = await editTextRaw(chat, mid, `${statusLine}\n📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`)
+          const r = await editTextRaw(chat, mid, nextText)
           if (r.r === "sent") {
             lastQPinEdit = now
             lastQPinCount = n
+            lastQPinStatusAt = now
+            lastQPinText = nextText
           } else {
             const st = (r as { status?: number }).status ?? 0
             const transient = st === 0 || st === 429 || st >= 500
@@ -6596,9 +6678,10 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
         }
         try {
           const statusLine = await qpinStatusFor((fixedTarget ?? frontSessionID ?? persistedFront) ?? "")
+          const text = queuePinCardText(statusLine, nPin, nOut)
           const r = await tgFetch("sendMessage", {
             chat_id: Number(chat) || chat,
-            text: `${statusLine}\n📥 队列中：共 ${n} 条（注入 ${nPin} · 外发 ${nOut}，/queue 查看）`,
+            text,
             disable_notification: true,
           })
           if (r.ok && r.id) {
@@ -6608,6 +6691,8 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
             while (queuePinHist.length > 12) queuePinHist.shift()
             lastQPinCount = n
             lastQPinEdit = Date.now()
+            lastQPinStatusAt = lastQPinEdit
+            lastQPinText = text
             savePersistedState()
             try {
               await tgFetch("pinChatMessage", { chat_id: Number(chat) || chat, message_id: r.id, disable_notification: true })
@@ -6639,6 +6724,14 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
   queuePinRequest = () => {
     void refreshQueuePin()
   }
+  // R2574（D7）：置顶队列卡以前只在 save/队列变化时刷新；条数不变时状态行会长期不更新。
+  // 30s 拍让「进行中→完成/错误」在不改条数的窗口里也能落到卡上（refreshQueuePin 自带
+  // 3s 最小工作间隔 + 5s 编辑节流，不会因此打爆 Telegram）。
+  setInterval(() => {
+    if ((globalThis as Record<string, unknown>)[GEN_KEY] !== myGen) return
+    if (queuePin.size === 0 && pinQueue.length === 0 && outQueue.length === 0) return
+    void refreshQueuePin()
+  }, QPIN_STATUS_TTL_MS)
   // 置顶注入队列泵：同会话串行，逐条提示；失败停泵队首保留（/flush 重试 /dropq 清掉）
   // 空闲判定的静默期：AI 可能**长时间不输出**，或正处于"两轮输出之间"（上一轮已
   // completed、下一轮还没落盘/还没开始流式）。只看"最后一条 assistant 是否 completed"
@@ -8581,7 +8674,33 @@ export const TgBridgePlugin: Plugin = async ({ client }) => {
     if (text === "/menu" || cmd === "menu" || text === "/菜单" || text === "菜单") {
       const c = pushChatResolve() || chatID
       const body = menuText("root")
-      const r = await sendTextRaw(c, body, menuKeyboard("root"), false)
+      const kb = menuKeyboard("root")
+      // R2574（D7）：/menu 以前每次 sendMessage 新发一张；protoMap 里的 `menu:<chat>`
+      // 只写不读 → 重复敲 /menu 会在聊天里堆多张互相独立的菜单卡（旧卡按钮仍可点，
+      // 但 menuViewNow 只记最后一张，旧卡的暂停/循环状态会与真实状态漂移）。
+      // 现在优先原地编辑已锚定的菜单卡；只有消息被删/不可编辑（drop）才新发。
+      const anchor = protoMap.get(`menu:${c}`)
+      if (anchor?.id) {
+        const e = await editTextRaw(c, anchor.id, body, kb, false)
+        if (e.r === "sent") {
+          protoMap.set(`menu:${c}`, { id: anchor.id, text: body, fallback: e.fallback === true })
+          menuViewNow.set(c, "root")
+          await log("info", `menu refreshed in place (chat=${sanitizeLog(c)}, msg=${anchor.id})`)
+          return
+        }
+        if (e.r === "retry") {
+          // 429/5xx/网络：旧菜单仍在屏上；此时新发一张就是在限流时制造重复卡。
+          menuViewNow.set(c, "root")
+          await log(
+            "info",
+            `menu refresh deferred (chat=${sanitizeLog(c)}, msg=${anchor.id}, status=${e.status ?? 0}); 保留原卡，避免重复菜单`,
+          )
+          return
+        }
+        protoMap.delete(`menu:${c}`)
+        await log("info", `menu anchor dropped (chat=${sanitizeLog(c)}, msg=${anchor.id}) → send a new card`)
+      }
+      const r = await sendTextRaw(c, body, kb, false)
       // R1802：判据与主投递路径同源。缺 message_id 时菜单**已送达**（用户看得见），
       // 只是无法锚定这张卡 → 后续切页会改为新发一张。仅记 warn，不 rollback。
       const mdv = protoDeliveryVerdict(r)
