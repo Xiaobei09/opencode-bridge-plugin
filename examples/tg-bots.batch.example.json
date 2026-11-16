@@ -1,0 +1,15 @@
+{
+  "bots": [
+    {
+      "username": "alpha_bot",
+      "envFile": "~/.config/opencode/tg-alpha.env",
+      "noFallback": true
+    },
+    {
+      "id": "stable_beta",
+      "username": "Beta_Bot",
+      "envFile": "~/.config/opencode/tg-beta.env",
+      "noFallback": true
+    }
+  ]
+}
