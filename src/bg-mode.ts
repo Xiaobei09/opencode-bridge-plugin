@@ -1,0 +1,218 @@
+/**
+ * 「转后台」能力（bg-mode）—— 原生后台子代理的**提升**（promote）与**整体自动配置**。
+ *
+ * 需求（用户 2026-09-28 原话）：
+ *   「shell 增加一个按钮为后台，另外增加一个整体配置自动转换后台，注意，这是 v2」
+ *
+ * 资料来源与**本地查证**（v1=opencode 1.18.32 二进制：/experimental 前缀；v2=opencode v2.0.10：
+ *   /openapi.json 顶层 `POST /api/session/{sessionID}/background`，operationId `session.background`）：
+ *   · v1 入口 `client.experimental.session.background(...)`，v2.0.10 入口 `client.session.background(...)`
+ *     —— 语义同为“把当前正在阻塞主会话的同步子代理提升为后台”，**探测双路兼容、不写死版本**。
+ *   · `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` —— ✅ 变量名存在；TUI 的
+ *     `session.background` 命令是 hidden 且 `enabled: <开关非空>`（必须开关打开才可用）。
+ *   · v2 的 `session.subagent`（直接创建后台子代理）—— ❌ 本 build 内检索不到
+ *     （`subagent(`/`/subagent`/`SessionSubagent` 全无）。**不因此写死**：下面按能力探测，
+ *     将来换到带该 API 的版本会自动优先走 subagent，无需再改代码。
+ *
+ * 为什么不"按版本号"选路：build 会换，方法在不在只能问运行时。按版本假设写死，
+ * 换版本后要么静默走错路、要么直接崩 —— 这类"想当然"是最贵的省事。
+ */
+import { readFileSync, writeFileSync, renameSync } from "node:fs"
+
+export const BG_PATH = process.env.AC_BG_PATH ?? `REDACTED_ROOT/.config/opencode/background-mode.json`
+const PRIVATE_FILE_MODE = 0o600
+export const BG_ENV_VAR = "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+
+export type BgCfg = {
+  /** 整体自动转后台（"整体配置"）。默认**关**：它是行为改变，且没开关时调用注定失败。 */
+  enabled: boolean
+  /** 自动模式的冷却（同一次阻塞不该被反复提升）。 */
+  cooldownMs: number
+  /**
+   * shell 自动后台（用户 2026-09-28 追加）：循环里的 shell 调用是否默认转后台。
+   * 与 enabled（子代理提升）**互不依赖**：shell 是 agent 自检文件里的偏好，桥侧不旁路执行。
+   * 默认**关**：后台化会改变响应时序（命令立即返回、输出后台收集），开关才改行为。
+   */
+  shellAuto: boolean
+  /**
+   * 插件层强制：shell 跑超 N 秒由**插件**转后台（用户 2026-09-28：「我说的不是模型判断，
+   * 是插件判断」）。由桥的 Hooks.tool 同名覆盖 shell 实现，execute 由插件掌控才能中途计时提升。
+   * 默认**开**=用户既定口径；置 false 即整体熔断（覆盖立即退出、回退宿主行为）。
+   */
+  shellPromo: boolean
+  /**
+   * 插件层转后台的时间阈值 ms（R1505 起可调，用户新增需求）。默认 60_000=60s
+   * （用户口径「跑超 1 分钟」）。范围 5s~600s，归一化时钳制。
+   */
+  promoteMs: number
+}
+
+export const DEFAULT_BG: BgCfg = { enabled: false, cooldownMs: 120_000, shellAuto: false, shellPromo: true, promoteMs: 60_000 }
+
+/** 阈值可选档位（菜单按钮轮切用；命令亦可直接写任意秒数）。 */
+export const BG_TH_STEPS: number[] = [30_000, 60_000, 90_000, 120_000, 180_000]
+
+/** 阈值合法区间（5s~600s）。 */
+export const BG_TH_MIN = 5_000
+export const BG_TH_MAX = 600_000
+
+/**
+ * R2380：阈值「轮切到下一档」的**唯一**定义（单一真源）。
+ * 此前桥内有本地 `bgThNext`、本模块 `parseBgArg` 各写一份，且**离档分支不一致**：
+ *   本地版 `indexOf` 得 -1 → `(-1+1)%len=0` → 返回 BG_TH_STEPS[0]=30s；
+ *   本模块版离档 → DEFAULT_BG.promoteMs=60s。
+ * 于是用户 `/background th 45`（离档 45s）后，菜单按钮文案显示「45s › 30s」，
+ * 但按下（裸 `th`）实际设成 60s —— 文案与动作不符。
+ * 统一按**文档化意图**（parseBgArg 注释）：档内 → 轮切下一档；离档 → 回默认 60s。
+ */
+export const bgThNext = (ms: number): number => {
+  const i = BG_TH_STEPS.indexOf(ms)
+  if (i >= 0) return BG_TH_STEPS[(i + 1) % BG_TH_STEPS.length] ?? DEFAULT_BG.promoteMs
+  return DEFAULT_BG.promoteMs
+}
+
+export const normalizeBg = (j: any): BgCfg => ({
+  enabled: typeof j?.enabled === "boolean" ? j.enabled : DEFAULT_BG.enabled,
+  cooldownMs:
+    Number.isFinite(Number(j?.cooldownMs)) && Number(j.cooldownMs) >= 0 ? Number(j.cooldownMs) : DEFAULT_BG.cooldownMs,
+  shellAuto: typeof j?.shellAuto === "boolean" ? j.shellAuto : DEFAULT_BG.shellAuto,
+  shellPromo: typeof j?.shellPromo === "boolean" ? j.shellPromo : DEFAULT_BG.shellPromo,
+  promoteMs:
+    Number.isFinite(Number(j?.promoteMs)) && Number(j.promoteMs) >= BG_TH_MIN && Number(j.promoteMs) <= BG_TH_MAX
+      ? Math.round(Number(j.promoteMs))
+      : DEFAULT_BG.promoteMs,
+})
+
+export const readBg = (path: string = BG_PATH): BgCfg => {
+  try {
+    return normalizeBg(JSON.parse(readFileSync(path, "utf8")))
+  } catch {
+    return { ...DEFAULT_BG }
+  }
+}
+
+export const writeBg = (cfg: BgCfg, extra?: Record<string, unknown>, path: string = BG_PATH): void => {
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, JSON.stringify({ ...cfg, ...(extra ?? {}), ts: Date.now() }), {
+    encoding: "utf8",
+    mode: PRIVATE_FILE_MODE,
+  })
+  renameSync(tmp, path)
+} // reload(bg-mode) 1792040953
+
+// ── 能力探测（纯函数：只看 client 上有没有那两个方法）──────────────────────
+
+export type BgApiShape = { subagent: boolean; promote: boolean }
+
+export const bgApiShape = (client: any): BgApiShape => ({
+  subagent: typeof client?.session?.subagent === "function",
+  // 双路兼容（R1394 实证）：v2.0.10 OpenAPI=顶层 session.background；v1.18.32=experimental 前缀。
+  promote:
+    typeof client?.session?.background === "function" ||
+    typeof client?.experimental?.session?.background === "function",
+})
+
+/** 实验开关是否已开。**必须**由启动 opencode 时就带上**，事后设 process.env 无效。 */
+export const bgEnvOn = (env: Record<string, string | undefined> = process.env): boolean => {
+  const v = env[BG_ENV_VAR]
+  return typeof v === "string" && v !== "" && v !== "0" && v.toLowerCase() !== "false"
+}
+
+/** 本 build 实际提供哪条路（回显给用户，别让人对着文档猜）。 */
+export const bgApiLabel = (shape: BgApiShape): string =>
+  shape.subagent && shape.promote ? "subagent(创建) + background(提升)" : shape.subagent ? "subagent(创建)" : shape.promote ? "background(提升)" : "无（不支持）"
+
+// ── 自动模式的判据（纯函数）────────────────────────────────────────────────
+
+/**
+ * 正在**同步阻塞**的子代理工具名白名单。
+ * 刻意只收 task/agent/subagent：把"任意运行中的工具"当子代理去提升，会对
+ * 读文件/跑 grep 这类工具调后台端点 —— 端点无 body 参数，提错了也没法表达意图。
+ */
+const SYNC_AGENT_TOOLS: ReadonlySet<string> = new Set(["task", "agent", "subagent", "subagent_task"])
+
+export const hasBlockingSubagent = (parts: unknown[]): boolean => {
+  const arr = Array.isArray(parts) ? parts : []
+  return arr.some((p) => {
+    const anyP = p as any
+    if (String(anyP?.type ?? "") !== "tool") return false
+    if (!SYNC_AGENT_TOOLS.has(String(anyP?.tool ?? "").toLowerCase())) return false
+    return ["running", "pending"].includes(String(anyP?.state?.status ?? ""))
+  })
+}
+
+export type AutoDecision = { go: boolean; why: string }
+
+/**
+ * 自动转后台的判据。**逐条如实给 why** —— 菜单/状态回显里"为什么没动"比"动了不说"重要得多：
+ * 用户点了开关却什么都没发生时，没说清原因就只能靠猜。
+ */
+export const shouldAutoPromote = (
+  parts: unknown[],
+  cfg: BgCfg,
+  nowMs: number,
+  lastAtMs: number,
+  envOn: boolean,
+  shape?: BgApiShape,
+): AutoDecision => {
+  if (!cfg.enabled) return { go: false, why: "整体自动转后台=关" }
+  if (shape && !shape.promote && !shape.subagent) return { go: false, why: "本 build client 无后台 API" }
+  if (!envOn) return { go: false, why: `实验开关未开启（需启动时带 ${BG_ENV_VAR}=1）` }
+  const since = Math.round((nowMs - (lastAtMs || 0)) / 1000)
+  if (lastAtMs > 0 && since < Math.round(cfg.cooldownMs / 1000)) return { go: false, why: `冷却中（${since}s/${Math.round(cfg.cooldownMs / 1000)}s）` }
+  if (!hasBlockingSubagent(parts)) return { go: false, why: "没有阻塞中的同步子代理" }
+  return { go: true, why: "检测到阻塞中的同步子代理" }
+}
+
+// ── /background 参数解析（纯函数；菜单按钮投送的正是「头 + 值」）────────────
+
+export type BgAction =
+  | { kind: "promote" }
+  | { kind: "status" }
+  | { kind: "help" }
+  | { kind: "set"; enabled: boolean }
+  | { kind: "setshell"; enabled: boolean }
+  | { kind: "setth"; ms: number }
+
+export const parseBgArg = (arg: string, cur: BgCfg): BgAction => {
+  const toks = String(arg ?? "")
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+  const head = toks[0] ?? ""
+  const val = toks[1] ?? ""
+  if (toks.length === 0) return { kind: "promote" } // 裸 /background = 立刻转后台（菜单按钮）
+  if (head === "status" || head === "st" || head === "info") return { kind: "status" }
+  if (head === "help" || head === "?") return { kind: "help" }
+  if (head === "auto") {
+    if (val === "on" || val === "开" || val === "1" || val === "true") return { kind: "set", enabled: true }
+    if (val === "off" || val === "关" || val === "0" || val === "false") return { kind: "set", enabled: false }
+    if (val === "toggle" || val === "") return { kind: "set", enabled: !cur.enabled }
+    return { kind: "help" }
+  }
+  if (head === "shell") {
+    // shell 自动后台（单独偏好，与子代理提升 enabled 互不依赖）。
+    if (val === "on" || val === "开" || val === "1" || val === "true") return { kind: "setshell", enabled: true }
+    if (val === "off" || val === "关" || val === "0" || val === "false") return { kind: "setshell", enabled: false }
+    if (val === "toggle" || val === "") return { kind: "setshell", enabled: !cur.shellAuto }
+    return { kind: "help" }
+  }
+  if (head === "th" || head === "threshold" || head === "time" || head === "阈值") {
+    // 插件层 shell>N 秒转后台阈值。裸 `th` = 轮切到下一档；`th <秒>` = 直接设（范围钳制）。
+    if (val === "") {
+      // R2380：轮切逻辑收敛到 bgThNext（单一真源，与菜单按钮文案同源，离档一律回默认 60s）。
+      return { kind: "setth", ms: bgThNext(cur.promoteMs) }
+    }
+    const n = Number(val)
+    if (Number.isFinite(n) && n >= BG_TH_MIN / 1000 && n <= BG_TH_MAX / 1000) {
+      return { kind: "setth", ms: Math.round(n * 1000) }
+    }
+    return { kind: "help" }
+  }
+  if (head === "on" || head === "开") return { kind: "set", enabled: true }
+  if (head === "off" || head === "关") return { kind: "set", enabled: false }
+  if (head === "toggle" || head === "flip") return { kind: "set", enabled: !cur.enabled }
+  if (head === "go" || head === "run" || head === "promote") return { kind: "promote" }
+  return { kind: "help" }
+}
